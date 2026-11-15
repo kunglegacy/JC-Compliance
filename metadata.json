@@ -1,0 +1,6 @@
+{
+  "name": "JCBest Compliance",
+  "description": "Directorate School Compliance, Staff Accountability and Academic Quality Assurance Management System for JCBest Schools International",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
