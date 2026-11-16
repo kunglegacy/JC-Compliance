@@ -28,12 +28,37 @@ jobs:
       - name: Decode Keystore File
         run: echo "${{ secrets.SIGNING_KEY }}" | base64 -d > my-upload-key.jks
 
+      - name: Create .env Configuration File from Secrets
+        env:
+          ENV_RAW: ${{ secrets.ENV || secrets.DOTENV || secrets.ENV_FILE || '' }}
+          S_URL: ${{ secrets.VITE_SUPABASE_URL || secrets.SUPABASE_URL || '' }}
+          S_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY || secrets.SUPABASE_PUBLISHABLE_KEY || secrets.SUPABASE_ANON_KEY || secrets.SUPABASE_KEY || '' }}
+          S_SECRET: ${{ secrets.SUPABASE_SECRET_KEY || '' }}
+        run: |
+          if [ -n "$ENV_RAW" ]; then
+            echo "$ENV_RAW" > .env
+          else
+            cat << EOF > .env
+          VITE_SUPABASE_URL=$S_URL
+          SUPABASE_URL=$S_URL
+          VITE_SUPABASE_PUBLISHABLE_KEY=$S_KEY
+          SUPABASE_PUBLISHABLE_KEY=$S_KEY
+          SUPABASE_SECRET_KEY=$S_SECRET
+          EOF
+          fi
+          echo "Created .env successfully with variables:"
+          grep -o '^[A-Z_]*' .env || true
+
       - name: Build Signed Release APK
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
           STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL || secrets.SUPABASE_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL || secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY || secrets.SUPABASE_PUBLISHABLE_KEY || secrets.SUPABASE_ANON_KEY || secrets.SUPABASE_KEY }}
+          SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY || secrets.VITE_SUPABASE_PUBLISHABLE_KEY || secrets.SUPABASE_ANON_KEY || secrets.SUPABASE_KEY }}
         run: gradle assembleRelease
 
       - name: Auto-Publish to Permanent Release Link

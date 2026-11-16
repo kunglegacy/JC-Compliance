@@ -123,47 +123,23 @@ fun OverviewScreen(
         AnalysisEngine.calculateStaffAggregates(termReports, staffList).size
     }
 
-    val reviewRatio = remember(summary.totalExceptions, summary.seenCount) {
-        if (summary.totalExceptions > 0) summary.seenCount.toFloat() / summary.totalExceptions.toFloat() else 0f
+    val actualTotal = termReports.size
+    val actualSeen = remember(termReports) { termReports.count { it.isSeen } }
+    val actualUnseen = remember(termReports) { termReports.count { !it.isSeen } }
+
+    val reviewRatio = remember(actualTotal, actualSeen) {
+        if (actualTotal > 0) actualSeen.toFloat() / actualTotal.toFloat() else 0f
     }
     val reviewPct = (reviewRatio * 100).toInt()
-    val pendingRatio = remember(summary.totalExceptions, summary.unseenCount) {
-        if (summary.totalExceptions > 0) summary.unseenCount.toFloat() / summary.totalExceptions.toFloat() else 0f
+    val pendingRatio = remember(actualTotal, actualUnseen) {
+        if (actualTotal > 0) actualUnseen.toFloat() / actualTotal.toFloat() else 0f
     }
-    val activeRatio = remember(summary.totalExceptions, summary.activeCases) {
-        if (summary.totalExceptions > 0) summary.activeCases.toFloat() / summary.totalExceptions.toFloat() else 0f
+    val activeRatio = remember(actualTotal, summary.activeCases) {
+        if (actualTotal > 0) summary.activeCases.toFloat() / actualTotal.toFloat() else 0f
     }
     val staffRatio = remember(staffList.size, staffAffectedCount) {
         if (staffList.isNotEmpty()) (staffAffectedCount.toFloat() / staffList.size.toFloat()).coerceIn(0f, 1f) else 0.25f
     }
-
-    val evidenceReports = remember(termReports) {
-        termReports.filter { !it.evidenceUrl.isNullOrBlank() && it.evidenceType != "none" }.take(10)
-    }
-    val evidenceThumbs = remember(evidenceReports) {
-        evidenceReports.map { report ->
-            EvidenceThumbItem(
-                id = report.id,
-                title = report.evidenceName?.ifBlank { report.complianceCheck } ?: report.complianceCheck,
-                mediaType = report.evidenceType,
-                previewModel = null
-            )
-        }
-    }
-    val evidencePreviewItems = remember(evidenceReports) {
-        evidenceReports.map { report ->
-            EvidencePreviewItem(
-                id = report.id,
-                storedPath = report.evidenceUrl.orEmpty(),
-                mediaType = report.evidenceType,
-                title = report.evidenceName?.ifBlank { report.complianceCheck } ?: report.complianceCheck,
-                inspectorName = report.reporterName.ifBlank { "Compliance Officer" }
-            )
-        }
-    }
-
-    var showEvidencePreviewer by remember { mutableStateOf(false) }
-    var selectedEvidenceIndex by remember { mutableIntStateOf(0) }
 
     LivingAtmosphericBackground {
         LazyColumn(
@@ -224,8 +200,8 @@ fun OverviewScreen(
                 AuditScoreHeroCard(
                     siteName = termLabel,
                     scorePercent = reviewPct,
-                    passed = summary.seenCount,
-                    flagged = summary.unseenCount,
+                    passed = actualSeen,
+                    flagged = actualUnseen,
                     eyebrow = if (isAdmin) "AUDIT COMPLIANCE SCORE" else "MY ACCOUNT EXCEPTION SCORE"
                 )
             }
@@ -323,7 +299,7 @@ fun OverviewScreen(
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
                         CircularRingMetricTile(
                             title = "Reviewed",
-                            value = "${summary.seenCount}",
+                            value = "$actualSeen",
                             subtitle = "$reviewPct% verified",
                             progress = reviewRatio,
                             icon = Icons.Default.CheckCircle,
@@ -332,8 +308,8 @@ fun OverviewScreen(
                         )
                         CircularRingMetricTile(
                             title = "Pending",
-                            value = "${summary.unseenCount}",
-                            subtitle = "Awaiting sign-off",
+                            value = "$actualUnseen",
+                            subtitle = "Unseen exceptions",
                             progress = pendingRatio,
                             icon = Icons.Default.HourglassTop,
                             ringColor = p.rose,
@@ -342,71 +318,7 @@ fun OverviewScreen(
                     }
                 }
             }
-
-            // Site Evidence Map & Horizontal Media Thumbnail Strip
-            item {
-                SiteMapEvidenceCard(
-                    address = if (isAdmin) {
-                        "JC-Best Schools International Campus • Directorate Site"
-                    } else {
-                        "My Submitted Evidence Vault"
-                    },
-                    evidenceCount = evidenceThumbs.size,
-                    thumbnails = evidenceThumbs,
-                    onThumbClick = { idx ->
-                        if (onResolveSignedUrl != null && evidencePreviewItems.isNotEmpty()) {
-                            selectedEvidenceIndex = idx
-                            showEvidencePreviewer = true
-                        } else {
-                            evidenceReports.getOrNull(idx)?.let(onSelectReport)
-                        }
-                    }
-                )
-            }
-
-            // Recent Exceptions
-            item {
-                MicroLabel(
-                    text = if (isAdmin) "Recent Exceptions" else "My Recent Exceptions",
-                    modifier = Modifier.padding(top = 4.dp)
-                )
-            }
-
-            if (termReports.isEmpty()) {
-                item {
-                    EmptyStatePanel(
-                        title = "No Exceptions Yet",
-                        subtitle = "No compliance exceptions logged for ${if (selectedTerm == "ALL") "any term" else selectedTerm}."
-                    )
-                }
-            } else {
-                items(termReports.take(15), key = { it.id }) { report ->
-                    RecentReportCard(
-                        report = report,
-                        resolvedDivision = AnalysisEngine.resolveDivision(report, staffMap[report.staffId?.lowercase()]),
-                        onClick = { onSelectReport(report) }
-                    )
-                }
-            }
         }
-    }
-
-    if (showEvidencePreviewer && onResolveSignedUrl != null && evidencePreviewItems.isNotEmpty()) {
-        val currentPreview = evidencePreviewItems.getOrElse(selectedEvidenceIndex) { evidencePreviewItems.first() }
-        EvidenceViewerDialog(
-            storedPath = currentPreview.storedPath,
-            evidenceType = currentPreview.mediaType,
-            evidenceName = currentPreview.title,
-            inspectorName = currentPreview.inspectorName,
-            items = evidencePreviewItems,
-            initialIndex = selectedEvidenceIndex,
-            onResolveSignedUrl = onResolveSignedUrl,
-            onVerdict = { item, _, _ ->
-                evidenceReports.firstOrNull { it.id == item.id }?.let(onSelectReport)
-                showEvidencePreviewer = false
-            },
-            onDismiss = { showEvidencePreviewer = false }
-        )
     }
 }
 

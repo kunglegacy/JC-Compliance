@@ -2,18 +2,24 @@ package com.example.ui.screens.reports
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.app.DatePickerDialog
 import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
@@ -28,11 +34,13 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -58,12 +66,17 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import coil.compose.AsyncImage
+import java.util.Calendar
+import java.util.Locale
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
@@ -503,23 +516,67 @@ fun ReportFormSheet(
                 }
             }
 
+            fun openIncidentDatePicker() {
+                val cal = Calendar.getInstance()
+                try {
+                    if (incidentDate.length == 10) {
+                        val parts = incidentDate.split("-")
+                        cal.set(parts[0].toInt(), parts[1].toInt() - 1, parts[2].toInt())
+                    }
+                } catch (_: Exception) {}
+                DatePickerDialog(
+                    context,
+                    { _, y, m, d ->
+                        incidentDate = String.format(Locale.US, "%04d-%02d-%02d", y, m + 1, d)
+                    },
+                    cal.get(Calendar.YEAR),
+                    cal.get(Calendar.MONTH),
+                    cal.get(Calendar.DAY_OF_MONTH)
+                ).show()
+            }
+
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(
-                    value = incidentDate,
-                    onValueChange = { incidentDate = it },
-                    label = { Text("Incident Date") },
-                    singleLine = true,
-                    colors = glassFieldColors(),
-                    shape = RoundedCornerShape(16.dp),
-                    modifier = Modifier.weight(1f)
-                )
-                OutlinedButton(
-                    onClick = { runAutoFill(true) },
-                    modifier = Modifier.testTag("autofill_narrative_button")
+                Row(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(ext.glassBottom)
+                        .border(1.dp, ext.glassRimEnd, RoundedCornerShape(16.dp))
+                        .clickable { openIncidentDatePicker() }
+                        .padding(horizontal = 14.dp, vertical = 12.dp)
+                        .testTag("form_incident_date_picker"),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("Auto-Fill")
+                    Column {
+                        Text(
+                            text = "INCIDENT DATE (CALENDAR)",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            text = incidentDate,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                    Icon(
+                        imageVector = Icons.Default.CalendarMonth,
+                        contentDescription = "Pick Incident Date",
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
+
+                if (autoFillEnabled) {
+                    OutlinedButton(
+                        onClick = { runAutoFill(true) },
+                        modifier = Modifier.testTag("autofill_narrative_button")
+                    ) {
+                        Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Auto-Fill")
+                    }
                 }
             }
 
@@ -543,7 +600,7 @@ fun ReportFormSheet(
                 modifier = Modifier.fillMaxWidth().testTag("form_effect_text")
             )
 
-            MicroLabel("Evidence Attachment")
+            MicroLabel("Evidence Attachment (Max 1 for Direct Report)")
             Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = {
                     if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
@@ -581,20 +638,100 @@ fun ReportFormSheet(
                 }
             }
 
-            if (evidenceType != "none" && !evidenceName.isNullOrBlank()) {
+            // Small Instant Upload Preview Thumbnail (Image preview / Video frame + Play badge)
+            if (evidenceType != "none" && (!evidenceName.isNullOrBlank() || localMediaFile != null || pickedMediaUri != null)) {
                 Surface(
                     color = ext.emeraldContainer,
-                    contentColor = ext.emerald,
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth()
+                    shape = RoundedCornerShape(16.dp),
+                    border = BorderStroke(1.dp, ext.emerald.copy(alpha = 0.35f)),
+                    modifier = Modifier.fillMaxWidth().testTag("evidence_preview_card")
                 ) {
-                    Text(
-                        text = "Attached (${evidenceType.uppercase()}): $evidenceName",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = ext.emerald,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.padding(10.dp)
-                    )
+                    Row(
+                        modifier = Modifier.padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        // Visual thumbnail box
+                        Box(
+                            modifier = Modifier
+                                .size(56.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color.Black.copy(alpha = 0.35f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            if (evidenceType == "image" || evidenceType == "video") {
+                                AsyncImage(
+                                    model = localMediaFile ?: pickedMediaUri ?: editingReport?.evidenceUrl,
+                                    contentDescription = "Evidence Thumbnail",
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            }
+                            if (evidenceType == "video") {
+                                Box(
+                                    modifier = Modifier
+                                        .size(24.dp)
+                                        .clip(CircleShape)
+                                        .background(Color.Black.copy(alpha = 0.70f)),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.PlayArrow,
+                                        contentDescription = "Play badge",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            } else if (evidenceType == "audio") {
+                                Icon(
+                                    imageVector = Icons.Default.Mic,
+                                    contentDescription = "Audio Evidence",
+                                    tint = ext.emerald,
+                                    modifier = Modifier.size(24.dp)
+                                )
+                            } else if (evidenceType == "document") {
+                                Icon(
+                                    imageVector = Icons.Default.Description,
+                                    contentDescription = "Document Evidence",
+                                    tint = ext.emerald,
+                                    modifier = Modifier.size(24.dp)
+                                )
+                            }
+                        }
+
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = evidenceName ?: "Attached Evidence",
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.Bold,
+                                color = ext.emerald,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = "${evidenceType.uppercase()} • 1 evidence attached (Strict limit)",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = ext.emerald.copy(alpha = 0.85f)
+                            )
+                        }
+
+                        IconButton(
+                            onClick = {
+                                localMediaFile = null
+                                pickedMediaUri = null
+                                evidenceType = "none"
+                                evidenceName = null
+                            },
+                            modifier = Modifier.size(32.dp).testTag("remove_attached_evidence_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Remove evidence",
+                                tint = ext.rose,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
                 }
             }
 

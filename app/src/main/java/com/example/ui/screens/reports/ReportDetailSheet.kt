@@ -17,6 +17,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Attachment
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -170,18 +171,20 @@ fun ReportDetailSheet(
             }
 
             // Action Controls
+            val canEdit = userRole.isAdminOrAbove || !report.isSeen
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedButton(
-                    onClick = { onEdit(report) },
+                    onClick = { if (canEdit) onEdit(report) },
+                    enabled = canEdit,
                     shape = CircleShape,
                     modifier = Modifier
                         .weight(1f)
                         .height(48.dp)
                         .testTag("edit_report_button")
                 ) {
-                    Icon(Icons.Default.Edit, contentDescription = null)
+                    Icon(if (canEdit) Icons.Default.Edit else Icons.Default.Lock, contentDescription = null)
                     Spacer(Modifier.width(6.dp))
-                    Text("Edit")
+                    Text(if (canEdit) "Edit" else "Reviewed (Locked)")
                 }
 
                 if (userRole.isAdminOrAbove) {

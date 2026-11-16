@@ -39,7 +39,10 @@ data class AppPreferencesState(
     val biometricsUserEmail: String = "",
     val lastActiveMillis: Long = 0L,
     val isManuallyLocked: Boolean = false,
-    val customChecks: List<ComplianceCheck> = emptyList()
+    val customChecks: List<ComplianceCheck> = emptyList(),
+    val rememberedEmail: String = "",
+    val rememberedDisplayName: String = "",
+    val rememberedAvatarUri: String = ""
 )
 
 class SecurePreferences(private val context: Context) {
@@ -60,6 +63,10 @@ class SecurePreferences(private val context: Context) {
         val USER_VERIFIED = booleanPreferencesKey("user_verified")
         val USER_OWNER = booleanPreferencesKey("user_owner")
 
+        val REMEMBERED_EMAIL = stringPreferencesKey("remembered_email")
+        val REMEMBERED_DISPLAY_NAME = stringPreferencesKey("remembered_display_name")
+        val REMEMBERED_AVATAR_URI = stringPreferencesKey("remembered_avatar_uri")
+
         val THEME_PREF = stringPreferencesKey("theme_pref")
         val ACCENT_PALETTE = stringPreferencesKey("accent_palette")
         val AUTOFILL_ENABLED = booleanPreferencesKey("autofill_enabled")
@@ -76,15 +83,23 @@ class SecurePreferences(private val context: Context) {
     }
 
     val state: Flow<AppPreferencesState> = context.dataStore.data.map { prefs ->
+        val envUrl = (System.getenv("SUPABASE_URL") ?: System.getenv("VITE_SUPABASE_URL")).orEmpty()
+        val envKey = (System.getenv("SUPABASE_PUBLISHABLE_KEY")
+            ?: System.getenv("VITE_SUPABASE_PUBLISHABLE_KEY")
+            ?: System.getenv("SUPABASE_ANON_KEY")
+            ?: System.getenv("SUPABASE_KEY")).orEmpty()
+
         val buildUrl = readBuildConfig("VITE_SUPABASE_URL")
             .ifBlank { readBuildConfig("SUPABASE_URL") }
+            .ifBlank { envUrl }
         val buildKey = readBuildConfig("VITE_SUPABASE_PUBLISHABLE_KEY")
             .ifBlank { readBuildConfig("SUPABASE_PUBLISHABLE_KEY") }
+            .ifBlank { envKey }
 
         val storedUrl = prefs[Keys.SUPABASE_URL].orEmpty()
         val storedKey = prefs[Keys.SUPABASE_ANON_KEY].orEmpty()
-        val effectiveUrl = storedUrl.ifBlank { buildUrl }.trim()
-        val effectiveKey = storedKey.ifBlank { buildKey }.trim()
+        val effectiveUrl = storedUrl.ifBlank { buildUrl }.trim().trim('"', '\'').trimEnd('/')
+        val effectiveKey = storedKey.ifBlank { buildKey }.trim().trim('"', '\'')
 
         val userId = prefs[Keys.USER_ID].orEmpty()
         val email = prefs[Keys.USER_EMAIL].orEmpty()
@@ -123,7 +138,10 @@ class SecurePreferences(private val context: Context) {
             biometricsUserEmail = prefs[Keys.BIOMETRICS_EMAIL].orEmpty(),
             lastActiveMillis = prefs[Keys.LAST_ACTIVE_MILLIS] ?: 0L,
             isManuallyLocked = prefs[Keys.MANUALLY_LOCKED] ?: false,
-            customChecks = parseCustomChecks(prefs[Keys.CUSTOM_CHECKS_JSON].orEmpty())
+            customChecks = parseCustomChecks(prefs[Keys.CUSTOM_CHECKS_JSON].orEmpty()),
+            rememberedEmail = prefs[Keys.REMEMBERED_EMAIL] ?: prefs[Keys.USER_EMAIL].orEmpty(),
+            rememberedDisplayName = prefs[Keys.REMEMBERED_DISPLAY_NAME] ?: prefs[Keys.DISPLAY_NAME].orEmpty(),
+            rememberedAvatarUri = prefs[Keys.REMEMBERED_AVATAR_URI] ?: prefs[Keys.AVATAR_URI].orEmpty()
         )
     }
 
@@ -156,6 +174,11 @@ class SecurePreferences(private val context: Context) {
             it[Keys.USER_OWNER] = session.isOwner
             it[Keys.LAST_ACTIVE_MILLIS] = System.currentTimeMillis()
             it[Keys.MANUALLY_LOCKED] = false
+            // Persist remembered credentials across sign-out
+            if (session.email.isNotBlank()) it[Keys.REMEMBERED_EMAIL] = session.email
+            if (session.displayName.isNotBlank()) it[Keys.REMEMBERED_DISPLAY_NAME] = session.displayName
+            val currentAvatar = it[Keys.AVATAR_URI]
+            if (!currentAvatar.isNullOrBlank()) it[Keys.REMEMBERED_AVATAR_URI] = currentAvatar
         }
     }
 
@@ -172,6 +195,7 @@ class SecurePreferences(private val context: Context) {
             it.remove(Keys.USER_VERIFIED)
             it.remove(Keys.USER_OWNER)
             it[Keys.MANUALLY_LOCKED] = false
+            // Note: Keys.REMEMBERED_EMAIL, REMEMBERED_DISPLAY_NAME, and REMEMBERED_AVATAR_URI are intentionally preserved
         }
     }
 
@@ -189,8 +213,14 @@ class SecurePreferences(private val context: Context) {
 
     suspend fun saveProfileCustomization(displayName: String?, avatarUri: String?) {
         context.dataStore.edit {
-            if (displayName != null) it[Keys.CUSTOM_DISPLAY_NAME] = displayName.trim()
-            if (avatarUri != null) it[Keys.AVATAR_URI] = avatarUri
+            if (displayName != null) {
+                it[Keys.CUSTOM_DISPLAY_NAME] = displayName.trim()
+                it[Keys.REMEMBERED_DISPLAY_NAME] = displayName.trim()
+            }
+            if (avatarUri != null) {
+                it[Keys.AVATAR_URI] = avatarUri
+                it[Keys.REMEMBERED_AVATAR_URI] = avatarUri
+            }
         }
     }
 

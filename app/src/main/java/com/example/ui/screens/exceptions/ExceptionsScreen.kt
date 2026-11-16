@@ -46,7 +46,7 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Feedback
-import androidx.compose.material.icons.rounded.Image
+import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.PlayCircle
 import androidx.compose.material.icons.rounded.Schedule
@@ -745,36 +745,62 @@ fun ExceptionsScreen(
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
                                         Text(
-                                            text = "Tap card to inspect • Edit your report anytime",
+                                            text = if (report.isSeen) "Reviewed by Directorate • Changes locked" else "Tap card to inspect • Edit before review",
                                             color = p.textSecondary,
                                             fontSize = 11.sp,
                                             modifier = Modifier.weight(1f),
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis
                                         )
-                                        Row(
-                                            modifier = Modifier
-                                                .clip(CircleShape)
-                                                .background(p.tangerine.copy(alpha = 0.15f))
-                                                .border(1.dp, p.tangerine.copy(alpha = 0.35f), CircleShape)
-                                                .clickable { editingReport = report }
-                                                .padding(horizontal = 12.dp, vertical = 6.dp)
-                                                .testTag("user_edit_exception_${report.id}"),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(5.dp)
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Rounded.Edit,
-                                                contentDescription = null,
-                                                tint = p.tangerine,
-                                                modifier = Modifier.size(14.dp)
-                                            )
-                                            Text(
-                                                text = "Edit Exception",
-                                                color = p.tangerine,
-                                                fontSize = 12.sp,
-                                                fontWeight = FontWeight.SemiBold
-                                            )
+                                        if (report.isSeen) {
+                                            Row(
+                                                modifier = Modifier
+                                                    .clip(CircleShape)
+                                                    .background(p.emerald.copy(alpha = 0.14f))
+                                                    .border(1.dp, p.emerald.copy(alpha = 0.35f), CircleShape)
+                                                    .padding(horizontal = 10.dp, vertical = 5.dp)
+                                                    .testTag("exception_locked_badge_${report.id}"),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Rounded.Lock,
+                                                    contentDescription = "Reviewed and Locked",
+                                                    tint = p.emerald,
+                                                    modifier = Modifier.size(13.dp)
+                                                )
+                                                Text(
+                                                    text = "Reviewed",
+                                                    color = p.emerald,
+                                                    fontSize = 11.sp,
+                                                    fontWeight = FontWeight.SemiBold
+                                                )
+                                            }
+                                        } else {
+                                            Row(
+                                                modifier = Modifier
+                                                    .clip(CircleShape)
+                                                    .background(p.tangerine.copy(alpha = 0.15f))
+                                                    .border(1.dp, p.tangerine.copy(alpha = 0.35f), CircleShape)
+                                                    .clickable { editingReport = report }
+                                                    .padding(horizontal = 12.dp, vertical = 6.dp)
+                                                    .testTag("user_edit_exception_${report.id}"),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Rounded.Edit,
+                                                    contentDescription = null,
+                                                    tint = p.tangerine,
+                                                    modifier = Modifier.size(14.dp)
+                                                )
+                                                Text(
+                                                    text = "Edit Exception",
+                                                    color = p.tangerine,
+                                                    fontSize = 12.sp,
+                                                    fontWeight = FontWeight.SemiBold
+                                                )
+                                            }
                                         }
                                     }
                                 }

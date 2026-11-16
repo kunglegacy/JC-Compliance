@@ -37,11 +37,21 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import android.app.DatePickerDialog
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.material.icons.filled.CalendarMonth
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import java.util.Calendar
+import java.util.Locale
 import com.example.data.local.AcademicWeekEngine
 import com.example.data.model.SystemSettings
 import com.example.data.model.UserRole
@@ -145,15 +155,58 @@ fun SystemConfigScreen(
                         }
 
                         Spacer(Modifier.height(12.dp))
-                        OutlinedTextField(
-                            value = termStartDate,
-                            onValueChange = { termStartDate = it },
-                            label = { Text("Term Resumption Start Date (YYYY-MM-DD)") },
-                            singleLine = true,
-                            colors = glassFieldColors(),
-                            shape = RoundedCornerShape(16.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        )
+
+                        val context = LocalContext.current
+                        fun openTermStartDatePicker() {
+                            val cal = Calendar.getInstance()
+                            try {
+                                if (termStartDate.length == 10) {
+                                    val parts = termStartDate.split("-")
+                                    cal.set(parts[0].toInt(), parts[1].toInt() - 1, parts[2].toInt())
+                                }
+                            } catch (_: Exception) {}
+                            DatePickerDialog(
+                                context,
+                                { _, y, m, d ->
+                                    termStartDate = String.format(Locale.US, "%04d-%02d-%02d", y, m + 1, d)
+                                },
+                                cal.get(Calendar.YEAR),
+                                cal.get(Calendar.MONTH),
+                                cal.get(Calendar.DAY_OF_MONTH)
+                            ).show()
+                        }
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(16.dp))
+                                .background(ext.glassBottom)
+                                .border(1.dp, ext.glassRimEnd, RoundedCornerShape(16.dp))
+                                .clickable { openTermStartDatePicker() }
+                                .padding(horizontal = 14.dp, vertical = 12.dp)
+                                .testTag("term_start_date_picker"),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column {
+                                Text(
+                                    text = "TERM RESUMPTION START DATE (CALENDAR)",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Text(
+                                    text = termStartDate,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                            Icon(
+                                imageVector = Icons.Default.CalendarMonth,
+                                contentDescription = "Pick Resumption Date",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
                     }
                 }
 

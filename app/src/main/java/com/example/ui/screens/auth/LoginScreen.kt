@@ -24,14 +24,21 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.filled.CloudSync
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PersonOutline
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.WarningAmber
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -58,11 +65,13 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import com.example.data.model.SupabaseConfig
 import com.example.ui.components.AtmosphericGlassBackground
 import com.example.ui.components.GlassCard
 import com.example.ui.components.GlowingPrimaryButton
 import com.example.ui.components.MicroLabel
 import com.example.ui.components.SchoolCrestBadge
+import com.example.ui.components.SupabaseConnectionDialog
 import com.example.ui.components.glassFieldColors
 import com.example.ui.theme.ComplianceTheme
 
@@ -72,11 +81,17 @@ fun LoginScreen(
     authError: String?,
     onClearError: () -> Unit,
     onSignIn: (String, String) -> Unit,
-    onForgotPassword: (String) -> Unit
+    onForgotPassword: (String) -> Unit,
+    supabaseConfig: SupabaseConfig = SupabaseConfig("", ""),
+    rememberedEmail: String = "",
+    rememberedDisplayName: String = "",
+    rememberedAvatarUri: String = "",
+    onSaveSupabaseConfig: (String, String) -> Unit = { _, _ -> }
 ) {
-    var email by remember { mutableStateOf("") }
+    var email by remember(rememberedEmail) { mutableStateOf(rememberedEmail) }
     var password by remember { mutableStateOf("") }
     var showPassword by remember { mutableStateOf(false) }
+    var showConfigDialog by remember { mutableStateOf(false) }
 
     val ext = ComplianceTheme.extended
     val haloColor = MaterialTheme.colorScheme.primary
@@ -97,6 +112,31 @@ fun LoginScreen(
                 modifier = Modifier.widthIn(max = 460.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
+                // Top Action: Backend Connection Config Pill
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    TextButton(
+                        onClick = { showConfigDialog = true },
+                        modifier = Modifier.testTag("login_configure_backend_button")
+                    ) {
+                        Icon(
+                            imageVector = if (supabaseConfig.isConfigured) Icons.Default.CloudSync else Icons.Default.Settings,
+                            contentDescription = "Backend Settings",
+                            tint = if (supabaseConfig.isConfigured) ext.emerald else ext.amber,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = if (supabaseConfig.isConfigured) "Backend Connected" else "Configure Backend",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (supabaseConfig.isConfigured) ext.emerald else ext.amber,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
                 // Glowing ambient crest halo emblem
                 Box(
                     modifier = Modifier
@@ -131,7 +171,67 @@ fun LoginScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
-                Spacer(Modifier.height(22.dp))
+                if (rememberedDisplayName.isNotBlank()) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = "Welcome back, $rememberedDisplayName",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                Spacer(Modifier.height(18.dp))
+
+                // Prominent banner if backend is not configured yet
+                if (!supabaseConfig.isConfigured) {
+                    Surface(
+                        color = ext.amberContainer,
+                        shape = RoundedCornerShape(18.dp),
+                        border = BorderStroke(1.dp, ext.amber.copy(alpha = 0.55f)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 14.dp)
+                            .clickable { showConfigDialog = true }
+                            .testTag("backend_not_configured_banner")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.WarningAmber,
+                                contentDescription = null,
+                                tint = ext.amber
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Institutional Data Not Configured",
+                                    fontWeight = FontWeight.Bold,
+                                    color = ext.amber,
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                                Text(
+                                    text = "Tap here to connect this APK to your Directorate Supabase project URL & key.",
+                                    color = ext.amber.copy(alpha = 0.9f),
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                            }
+                            Button(
+                                onClick = { showConfigDialog = true },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = ext.amber,
+                                    contentColor = Color.Black
+                                ),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Text("Setup", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                }
 
                 // Single unified error banner (prevents duplicated banners)
                 AnimatedVisibility(visible = !authError.isNullOrBlank()) {
@@ -142,6 +242,11 @@ fun LoginScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(bottom = 16.dp)
+                            .clickable {
+                                if (authError?.contains("configured", ignoreCase = true) == true) {
+                                    showConfigDialog = true
+                                }
+                            }
                             .testTag("login_error_banner")
                     ) {
                         Row(
@@ -154,12 +259,22 @@ fun LoginScreen(
                                 contentDescription = "Error",
                                 tint = ext.rose
                             )
-                            Text(
-                                text = authError.orEmpty(),
-                                color = ext.rose,
-                                style = MaterialTheme.typography.bodySmall,
-                                fontWeight = FontWeight.SemiBold
-                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = authError.orEmpty(),
+                                    color = ext.rose,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                if (authError?.contains("configured", ignoreCase = true) == true) {
+                                    Text(
+                                        text = "Tap here to open Connection Settings",
+                                        color = ext.rose,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -295,5 +410,16 @@ fun LoginScreen(
                 }
             }
         }
+    }
+
+    if (showConfigDialog) {
+        SupabaseConnectionDialog(
+            current = supabaseConfig,
+            onDismiss = { showConfigDialog = false },
+            onSave = { url, key ->
+                onSaveSupabaseConfig(url, key)
+                showConfigDialog = false
+            }
+        )
     }
 }

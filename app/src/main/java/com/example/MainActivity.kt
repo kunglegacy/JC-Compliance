@@ -234,7 +234,12 @@ private fun JCBestComplianceRoot(
                         onForgotPassword = { typedEmail ->
                             resetPrefillEmail = typedEmail
                             viewModel.setAuthMode(AuthScreenMode.PASSWORD_RESET)
-                        }
+                        },
+                        supabaseConfig = prefsState.supabaseConfig,
+                        rememberedEmail = prefsState.rememberedEmail,
+                        rememberedDisplayName = prefsState.rememberedDisplayName,
+                        rememberedAvatarUri = prefsState.rememberedAvatarUri,
+                        onSaveSupabaseConfig = viewModel::saveSupabaseConfig
                     )
 
                     AuthScreenMode.PASSWORD_RESET -> PasswordResetScreen(
