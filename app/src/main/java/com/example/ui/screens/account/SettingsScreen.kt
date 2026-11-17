@@ -32,7 +32,6 @@ import androidx.compose.material.icons.filled.AccessTime
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Person
@@ -77,7 +76,6 @@ import com.example.ui.components.GlassIconHalo
 import com.example.ui.components.GlowingPrimaryButton
 import com.example.ui.components.MicroLabel
 import com.example.ui.components.SubScreenTopRow
-import com.example.ui.components.SupabaseConnectionDialog
 import com.example.ui.components.VideoStyleChecklistRow
 import com.example.ui.components.glassFieldColors
 import com.example.ui.theme.ComplianceTheme
@@ -95,8 +93,8 @@ fun SettingsScreen(
     onLockAppNow: () -> Unit,
     onVerifyPassword: suspend (String) -> Boolean,
     onSetBiometricsEnabled: (Boolean) -> Unit,
-    onSaveSupabaseConfig: (String, String) -> Unit,
     onNotify: (String, Boolean) -> Unit,
+    onWillLaunchExternalPicker: () -> Unit = {},
     onBack: () -> Unit
 ) {
     BackHandler { onBack() }
@@ -112,7 +110,6 @@ fun SettingsScreen(
     }
     var localAvatarUri by remember(prefsState.avatarUri) { mutableStateOf(prefsState.avatarUri) }
 
-    var showConfigDialog by remember { mutableStateOf(false) }
     var showBiometricPasswordDialog by remember { mutableStateOf(false) }
     var bioPasswordInput by remember { mutableStateOf("") }
     var bioPasswordError by remember { mutableStateOf<String?>(null) }
@@ -183,6 +180,7 @@ fun SettingsScreen(
                                     .background(MaterialTheme.colorScheme.primaryContainer)
                                     .border(1.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.6f), CircleShape)
                                     .clickable {
+                                        onWillLaunchExternalPicker()
                                         avatarPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                                     },
                                 contentAlignment = Alignment.Center
@@ -200,6 +198,7 @@ fun SettingsScreen(
                             }
                             OutlinedButton(
                                 onClick = {
+                                    onWillLaunchExternalPicker()
                                     avatarPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                                 },
                                 shape = CircleShape,
@@ -415,21 +414,6 @@ fun SettingsScreen(
                     }
                 }
 
-                // 5. Cloud Backend Status Row
-                item {
-                    VideoStyleChecklistRow(
-                        icon = Icons.Default.Cloud,
-                        iconTint = if (prefsState.supabaseConfig.isConfigured) ext.emerald else ext.rose,
-                        title = "Supabase Connection",
-                        subtitle = if (prefsState.supabaseConfig.isConfigured) "Connected to Directorate archive" else "Configuration required",
-                        onClick = { showConfigDialog = true }
-                    ) {
-                        TextButton(onClick = { showConfigDialog = true }) {
-                            Text("Configure", fontWeight = FontWeight.Bold)
-                        }
-                    }
-                }
-
                 // Video-style full-width bottom glowing CTA
                 item {
                     Spacer(Modifier.height(4.dp))
@@ -520,17 +504,6 @@ fun SettingsScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showBiometricPasswordDialog = false }) { Text("Cancel") }
-            }
-        )
-    }
-
-    if (showConfigDialog) {
-        SupabaseConnectionDialog(
-            current = prefsState.supabaseConfig,
-            onDismiss = { showConfigDialog = false },
-            onSave = { url, key ->
-                onSaveSupabaseConfig(url, key)
-                showConfigDialog = false
             }
         )
     }

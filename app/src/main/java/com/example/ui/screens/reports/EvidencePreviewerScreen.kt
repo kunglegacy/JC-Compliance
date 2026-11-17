@@ -110,13 +110,15 @@ data class EvidencePreviewItem(
     val storedPath: String,
     val mediaType: String,
     val title: String,
-    val inspectorName: String = "Compliance Officer"
+    val inspectorName: String = "Compliance Officer",
+    val existingNote: String? = null
 )
 
 @Composable
 fun EvidencePreviewerScreen(
     items: List<EvidencePreviewItem>,
     initialIndex: Int = 0,
+    showModerationControls: Boolean = true,
     onResolveSignedUrl: suspend (String) -> Result<String>,
     onVerdict: ((EvidencePreviewItem, EvidenceVerdict, String?) -> Unit)? = null,
     onBack: () -> Unit
@@ -193,6 +195,7 @@ fun EvidencePreviewerScreen(
         resolvedUrls = resolvedUrls,
         isLoading = isLoading,
         errorMessage = errorMessage,
+        showModerationControls = showModerationControls,
         onSelectIndex = { activeIndex = it },
         onRetry = {
             activeItem?.storedPath?.trim()?.let { path ->
@@ -229,6 +232,7 @@ fun EvidencePreviewerScaffold(
     resolvedUrls: Map<String, String> = emptyMap(),
     isLoading: Boolean,
     errorMessage: String?,
+    showModerationControls: Boolean = true,
     onSelectIndex: (Int) -> Unit,
     onRetry: () -> Unit = {},
     onOpenExternal: () -> Unit,
@@ -965,48 +969,78 @@ fun EvidencePreviewerScaffold(
                     )
                 }
 
-                // Verdict Action Dock
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .complianceGlassCard(24.dp)
-                        .padding(10.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    VerdictPill(
-                        label = "Pass",
-                        tint = p.emerald,
-                        selected = selectedVerdict == EvidenceVerdict.PASS,
-                        onClick = {
-                            selectedVerdict = EvidenceVerdict.PASS
-                            onVerdict(EvidenceVerdict.PASS, null)
-                        },
+                // Admin / Reviewer Note Attached to This Evidence Item
+                val activeNote = activeItem?.existingNote?.trim().orEmpty()
+                if (activeNote.isNotBlank()) {
+                    Column(
                         modifier = Modifier
-                            .weight(1f)
-                            .testTag("evidence_verdict_pass")
-                    )
-                    VerdictPill(
-                        label = "Flag Issue",
-                        tint = p.rose,
-                        selected = selectedVerdict == EvidenceVerdict.FLAG,
-                        onClick = {
-                            selectedVerdict = EvidenceVerdict.FLAG
-                            onVerdict(EvidenceVerdict.FLAG, null)
-                        },
+                            .fillMaxWidth()
+                            .complianceGlassCard(18.dp)
+                            .background(p.tangerine.copy(alpha = 0.14f), RoundedCornerShape(18.dp))
+                            .border(1.dp, p.tangerine.copy(alpha = 0.45f), RoundedCornerShape(18.dp))
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(3.dp)
+                    ) {
+                        Text(
+                            text = "ADMIN NOTE ON EVIDENCE",
+                            color = p.tangerine,
+                            fontSize = 10.sp,
+                            letterSpacing = 1.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = activeNote,
+                            color = p.textPrimary,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+
+                // Verdict Action Dock (Admins / Super Admins only)
+                if (showModerationControls) {
+                    Row(
                         modifier = Modifier
-                            .weight(1f)
-                            .testTag("evidence_verdict_flag")
-                    )
-                    VerdictPill(
-                        label = "Add Note",
-                        tint = p.tangerine,
-                        selected = selectedVerdict == EvidenceVerdict.NOTE,
-                        onClick = { showNoteDialog = true },
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("evidence_verdict_note")
-                    )
+                            .fillMaxWidth()
+                            .complianceGlassCard(24.dp)
+                            .padding(10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        VerdictPill(
+                            label = "Pass",
+                            tint = p.emerald,
+                            selected = selectedVerdict == EvidenceVerdict.PASS,
+                            onClick = {
+                                selectedVerdict = EvidenceVerdict.PASS
+                                onVerdict(EvidenceVerdict.PASS, null)
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("evidence_verdict_pass")
+                        )
+                        VerdictPill(
+                            label = "Flag Issue",
+                            tint = p.rose,
+                            selected = selectedVerdict == EvidenceVerdict.FLAG,
+                            onClick = {
+                                selectedVerdict = EvidenceVerdict.FLAG
+                                onVerdict(EvidenceVerdict.FLAG, null)
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("evidence_verdict_flag")
+                        )
+                        VerdictPill(
+                            label = "Add Note",
+                            tint = p.tangerine,
+                            selected = selectedVerdict == EvidenceVerdict.NOTE,
+                            onClick = { showNoteDialog = true },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("evidence_verdict_note")
+                        )
+                    }
                 }
             }
         }

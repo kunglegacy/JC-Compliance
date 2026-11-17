@@ -74,6 +74,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.model.ComplianceReport
+import com.example.data.model.ReportResolutionStatus
 import com.example.data.model.ReportScope
 import com.example.data.model.StaffMember
 import com.example.domain.AnalysisEngine
@@ -118,8 +119,11 @@ fun ReportsScreen(
         AnalysisEngine.filterReports(reports, term = selectedTerm)
             .filter { r ->
                 if (!AnalysisEngine.recordMatchesScope(r, selectedScope, staffMap)) return@filter false
-                if (seenFilter == "SEEN" && !r.isSeen) return@filter false
-                if (seenFilter == "UNSEEN" && r.isSeen) return@filter false
+                when (seenFilter) {
+                    "ALL" -> Unit
+                    "UNSEEN" -> if (r.isSeen) return@filter false
+                    else -> if (!r.status.key.equals(seenFilter, ignoreCase = true)) return@filter false
+                }
                 if (dateNeedle.isNotBlank() && !r.incidentDate.startsWith(dateNeedle)) return@filter false
                 if (q.isNotBlank()) {
                     val hay = "${r.staffName.orEmpty()} ${r.staffCode.orEmpty()} ${r.complianceCheck} ${r.exceptionText} ${r.className.orEmpty()} ${r.reporterName}".lowercase()
@@ -378,8 +382,22 @@ fun ReportsScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            listOf("ALL" to "All", "UNSEEN" to "Unseen", "SEEN" to "Seen").forEach { (k, lbl) ->
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            val statusFilterOptions = listOf(
+                                "ALL" to "All",
+                                "UNSEEN" to "Unseen",
+                                ReportResolutionStatus.OPEN.key to ReportResolutionStatus.OPEN.label,
+                                ReportResolutionStatus.PENDING.key to ReportResolutionStatus.PENDING.label,
+                                ReportResolutionStatus.ACTION_REQUIRED.key to ReportResolutionStatus.ACTION_REQUIRED.label,
+                                ReportResolutionStatus.ACCEPTED.key to ReportResolutionStatus.ACCEPTED.label,
+                                ReportResolutionStatus.REJECTED.key to ReportResolutionStatus.REJECTED.label
+                            )
+                            statusFilterOptions.forEach { (k, lbl) ->
                                 GlassFilterChip(
                                     label = lbl,
                                     selected = seenFilter == k,
@@ -458,7 +476,13 @@ fun ReportsScreen(
                             append(if (selectedTerm == "ALL") "All Terms" else selectedTerm)
                             append(" • ")
                             append(selectedScope.label)
-                            if (seenFilter != "ALL") append(" • ${seenFilter.lowercase().replaceFirstChar { it.uppercase() }}")
+                            if (seenFilter != "ALL") {
+                                val niceLabel = when (seenFilter) {
+                                    "UNSEEN" -> "Unseen"
+                                    else -> ReportResolutionStatus.fromKey(seenFilter).label
+                                }
+                                append(" • $niceLabel")
+                            }
                             if (!selectedDateFilter.isNullOrBlank()) append(" • $selectedDateFilter")
                         }
                         Text(
@@ -611,6 +635,7 @@ fun ReportsScreen(
 
                                 HorizontalDivider(thickness = 0.8.dp, color = p.borderBottom)
 
+                                val pendingCount = item.reports.count { it.isPending }
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -618,6 +643,9 @@ fun ReportsScreen(
                                 ) {
                                     StatusGlassChip(p.tangerine, "${item.exceptionCount} Total")
                                     StatusGlassChip(p.emerald, "${item.seenCount} Seen")
+                                    if (pendingCount > 0) {
+                                        StatusGlassChip(p.tangerine, "$pendingCount Pending")
+                                    }
                                     if (item.unseenCount > 0) {
                                         StatusGlassChip(p.rose, "${item.unseenCount} Unseen")
                                     }

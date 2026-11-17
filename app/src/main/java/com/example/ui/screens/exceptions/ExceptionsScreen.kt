@@ -1,7 +1,6 @@
 package com.example.ui.screens.exceptions
 
 import android.Manifest
-import android.app.DatePickerDialog
 import android.content.pm.PackageManager
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -15,6 +14,7 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -33,6 +33,7 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -40,15 +41,16 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.AttachFile
-import androidx.compose.material.icons.rounded.CalendarMonth
 import androidx.compose.material.icons.rounded.CameraAlt
+import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.EditNote
 import androidx.compose.material.icons.rounded.Feedback
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.NotificationsActive
 import androidx.compose.material.icons.rounded.PhotoLibrary
-import androidx.compose.material.icons.rounded.PlayCircle
 import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Videocam
@@ -59,7 +61,6 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -91,35 +92,33 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import coil.compose.AsyncImage
+import com.example.data.model.ComplianceDivision
 import com.example.data.model.ComplianceReport
+import com.example.data.model.DraftMediaItem
+import com.example.data.model.MediaUploadLimits
 import com.example.data.model.OfflineDraft
+import com.example.data.model.ReportFormDraft
+import com.example.data.model.ReportResolutionStatus
 import com.example.domain.AnalysisEngine
 import com.example.ui.components.LivingAtmosphericBackground
 import com.example.ui.components.StatusGlassChip
 import com.example.ui.components.TangerineGlowButton
+import com.example.ui.components.VideoFrameThumbnail
 import com.example.ui.components.complianceGlassCard
-import com.example.ui.components.glassFieldColors
 import com.example.ui.screens.dashboard.RecentReportCard
 import com.example.ui.screens.reports.EvidencePreviewItem
 import com.example.ui.screens.reports.EvidencePreviewerScaffold
 import com.example.ui.theme.LocalCompliancePalette
 import java.io.File
 import java.text.SimpleDateFormat
-import java.util.Calendar
 import java.util.Date
 import java.util.Locale
-
-data class DraftMediaItem(
-    val id: String,
-    val pathOrUri: String,
-    val mediaType: String,
-    val capturedAtLabel: String
-)
 
 data class AdminExceptionFeedback(
     val resolutionNote: String? = null,
     val evidenceNotes: List<String> = emptyList(),
-    val isRejected: Boolean = false
+    val isRejected: Boolean = false,
+    val isPending: Boolean = false
 )
 
 @Composable
@@ -134,13 +133,17 @@ fun ExceptionsScreen(
     onSaveCameraVideoDraft: (File) -> Unit,
     onSavePickedMediaDraft: (Uri, String) -> Unit,
     onSelectReport: (ComplianceReport) -> Unit,
-    // Optional hooks for multi-media drafts, user self-edit & admin feedback display
     extraDraftMediaByDraftId: Map<String, List<DraftMediaItem>> = emptyMap(),
     onAddDraftMedia: (draft: OfflineDraft, pathOrUri: String, mediaType: String, capturedAtLabel: String) -> Unit = { _, _, _, _ -> },
     onRemoveDraftMedia: (draft: OfflineDraft, mediaId: String) -> Unit = { _, _ -> },
     onConvertDraftWithMedia: (draft: OfflineDraft, selectedMedia: List<DraftMediaItem>) -> Unit = { d, _ -> onConvertDraft(d) },
-    onEditSubmittedException: (report: ComplianceReport, updatedCheck: String, updatedDetails: String, updatedDate: String) -> Unit = { _, _, _, _ -> },
-    adminFeedbackByReportId: Map<String, AdminExceptionFeedback> = emptyMap()
+    onOpenEditForm: (ComplianceReport) -> Unit = {},
+    savedFormDraft: ReportFormDraft? = null,
+    onResumeFormDraft: () -> Unit = {},
+    onClearFormDraft: () -> Unit = {},
+    adminFeedbackByReportId: Map<String, AdminExceptionFeedback> = emptyMap(),
+    onShowLimitWarning: (String) -> Unit = {},
+    onWillLaunchExternalPicker: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val p = LocalCompliancePalette.current
@@ -148,7 +151,7 @@ fun ExceptionsScreen(
     // Reset transient UI state whenever logged-in user switches
     var selectedTab by remember(currentUserId) { mutableIntStateOf(0) } // 0 = Offline Drafts, 1 = Submitted
     var search by remember(currentUserId) { mutableStateOf("") }
-    var seenFilter by remember(currentUserId) { mutableStateOf("ALL") }
+    var statusFilter by remember(currentUserId) { mutableStateOf("ALL") }
 
     val submittedListState = rememberLazyListState()
     val showSubmittedFilters by remember {
@@ -167,27 +170,16 @@ fun ExceptionsScreen(
     var pendingVideoFile by remember { mutableStateOf<File?>(null) }
     var pendingCameraAction by remember { mutableStateOf<String?>(null) }
 
-    // Preview / Trim Review / User Edit modals
+    // Preview / Trim Review / Evidence Delete Confirm
     var previewModalState by remember(currentUserId) { mutableStateOf<Pair<OfflineDraft, Int>?>(null) }
     var reviewTrimDraft by remember(currentUserId) { mutableStateOf<OfflineDraft?>(null) }
-    var editingReport by remember(currentUserId) { mutableStateOf<ComplianceReport?>(null) }
-
-    fun appendMediaToTargetDraft(draft: OfflineDraft, pathOrUri: String, mediaType: String) {
-        val stamp = formatNowDateTime()
-        val item = DraftMediaItem(
-            id = "dm_${System.currentTimeMillis()}_${pathOrUri.hashCode()}",
-            pathOrUri = pathOrUri,
-            mediaType = mediaType,
-            capturedAtLabel = stamp
-        )
-        val current = localAddedMedia[draft.id].orEmpty()
-        localAddedMedia = localAddedMedia + (draft.id to (current + item))
-        onAddDraftMedia(draft, pathOrUri, mediaType, stamp)
-    }
+    var pendingDeleteDraftMedia by remember(currentUserId) { mutableStateOf<Pair<OfflineDraft, DraftMediaItem>?>(null) }
 
     fun resolveDraftMediaList(draft: OfflineDraft): List<DraftMediaItem> {
         val removed = localRemovedMediaIds[draft.id].orEmpty()
-        val base = if (!draft.mediaPath.isNullOrBlank()) {
+        val base = if (draft.mediaItems.isNotEmpty()) {
+            draft.mediaItems
+        } else if (!draft.mediaPath.isNullOrBlank()) {
             listOf(
                 DraftMediaItem(
                     id = "primary_${draft.id}",
@@ -204,6 +196,35 @@ fun ExceptionsScreen(
         return (base + extraFromRepo + extraLocal)
             .distinctBy { it.pathOrUri }
             .filterNot { it.id in removed }
+    }
+
+    fun canAppendToDraft(draft: OfflineDraft, mediaType: String): Boolean {
+        val media = resolveDraftMediaList(draft)
+        val imgs = media.count { it.mediaType.equals("image", ignoreCase = true) }
+        val vids = media.count { it.mediaType.equals("video", ignoreCase = true) }
+        if (mediaType.equals("image", ignoreCase = true) && imgs >= MediaUploadLimits.MAX_IMAGES_PER_REPORT) {
+            onShowLimitWarning("Maximum ${MediaUploadLimits.MAX_IMAGES_PER_REPORT} photos allowed per draft.")
+            return false
+        }
+        if (mediaType.equals("video", ignoreCase = true) && vids >= MediaUploadLimits.MAX_VIDEOS_PER_REPORT) {
+            onShowLimitWarning("Maximum ${MediaUploadLimits.MAX_VIDEOS_PER_REPORT} videos allowed per draft.")
+            return false
+        }
+        return true
+    }
+
+    fun appendMediaToTargetDraft(draft: OfflineDraft, pathOrUri: String, mediaType: String) {
+        if (!canAppendToDraft(draft, mediaType)) return
+        val stamp = formatNowDateTime()
+        val item = DraftMediaItem(
+            id = "dm_${System.currentTimeMillis()}_${pathOrUri.hashCode()}",
+            pathOrUri = pathOrUri,
+            mediaType = mediaType,
+            capturedAtLabel = stamp
+        )
+        val current = localAddedMedia[draft.id].orEmpty()
+        localAddedMedia = localAddedMedia + (draft.id to (current + item))
+        onAddDraftMedia(draft, pathOrUri, mediaType, stamp)
     }
 
     fun removeDraftMediaItem(draft: OfflineDraft, item: DraftMediaItem) {
@@ -249,17 +270,32 @@ fun ExceptionsScreen(
     }
 
     val photoPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickVisualMedia()
-    ) { uri ->
+        contract = ActivityResultContracts.PickMultipleVisualMedia(6)
+    ) { uris ->
         val appendTarget = targetDraftForAppend
         targetDraftForAppend = null
-        if (uri != null) {
-            val mime = context.contentResolver.getType(uri).orEmpty()
-            val mediaType = if (mime.startsWith("video/")) "video" else "image"
+        if (uris.isNotEmpty()) {
             if (appendTarget != null) {
-                appendMediaToTargetDraft(appendTarget, uri.toString(), mediaType)
+                uris.forEach { uri ->
+                    val mime = context.contentResolver.getType(uri).orEmpty()
+                    val mediaType = if (mime.startsWith("video/")) "video" else "image"
+                    appendMediaToTargetDraft(appendTarget, uri.toString(), mediaType)
+                }
             } else {
-                onSavePickedMediaDraft(uri, mediaType)
+                // Save first picked item as primary offline draft (respecting 4-photo / 2-video cap)
+                var imgs = 0
+                var vids = 0
+                uris.forEach { uri ->
+                    val mime = context.contentResolver.getType(uri).orEmpty()
+                    val mediaType = if (mime.startsWith("video/")) "video" else "image"
+                    if (mediaType == "image" && imgs < MediaUploadLimits.MAX_IMAGES_PER_REPORT) {
+                        onSavePickedMediaDraft(uri, mediaType)
+                        imgs++
+                    } else if (mediaType == "video" && vids < MediaUploadLimits.MAX_VIDEOS_PER_REPORT) {
+                        onSavePickedMediaDraft(uri, mediaType)
+                        vids++
+                    }
+                }
             }
             selectedTab = 0
         }
@@ -270,6 +306,7 @@ fun ExceptionsScreen(
         val file = File(dir, "photo_${System.currentTimeMillis()}.jpg")
         pendingPhotoFile = file
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        onWillLaunchExternalPicker()
         takePictureLauncher.launch(uri)
     }
 
@@ -278,6 +315,7 @@ fun ExceptionsScreen(
         val file = File(dir, "video_${System.currentTimeMillis()}.mp4")
         pendingVideoFile = file
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        onWillLaunchExternalPicker()
         captureVideoLauncher.launch(uri)
     }
 
@@ -294,6 +332,10 @@ fun ExceptionsScreen(
     }
 
     fun requestCameraAndRun(mode: String, appendTo: OfflineDraft? = null) {
+        val mediaType = if (mode == "video") "video" else "image"
+        if (appendTo != null && !canAppendToDraft(appendTo, mediaType)) {
+            return
+        }
         targetDraftForAppend = appendTo
         val hasCamera = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
             PackageManager.PERMISSION_GRANTED
@@ -305,15 +347,33 @@ fun ExceptionsScreen(
         }
     }
 
-    val mySubmitted = remember(reports, currentUserId, search, seenFilter) {
-        val q = search.trim().lowercase()
+    val allMine = remember(reports, currentUserId) {
         reports.filter { r ->
-            val mine = currentUserId.isNotBlank() && r.reportedBy.equals(currentUserId, ignoreCase = true)
-            if (!mine) return@filter false
-            if (seenFilter == "SEEN" && !r.isSeen) return@filter false
-            if (seenFilter == "UNSEEN" && r.isSeen) return@filter false
+            currentUserId.isNotBlank() && r.reportedBy.equals(currentUserId, ignoreCase = true)
+        }
+    }
+
+    val statusCounts = remember(allMine) {
+        mapOf(
+            "ALL" to allMine.size,
+            ReportResolutionStatus.OPEN.key to allMine.count { it.status == ReportResolutionStatus.OPEN },
+            ReportResolutionStatus.PENDING.key to allMine.count { it.status == ReportResolutionStatus.PENDING },
+            ReportResolutionStatus.ACTION_REQUIRED.key to allMine.count { it.status == ReportResolutionStatus.ACTION_REQUIRED },
+            ReportResolutionStatus.ACCEPTED.key to allMine.count { it.status == ReportResolutionStatus.ACCEPTED },
+            ReportResolutionStatus.REJECTED.key to allMine.count { it.status == ReportResolutionStatus.REJECTED }
+        )
+    }
+
+    val actionRequiredCount = statusCounts[ReportResolutionStatus.ACTION_REQUIRED.key] ?: 0
+
+    val mySubmitted = remember(allMine, search, statusFilter) {
+        val q = search.trim().lowercase()
+        allMine.filter { r ->
+            if (statusFilter != "ALL" && !r.status.key.equals(statusFilter, ignoreCase = true)) {
+                return@filter false
+            }
             if (q.isNotBlank()) {
-                val hay = "${r.staffName.orEmpty()} ${r.complianceCheck} ${r.exceptionText} ${r.className.orEmpty()}".lowercase()
+                val hay = "${r.staffName.orEmpty()} ${r.complianceCheck} ${r.exceptionText} ${r.className.orEmpty()} ${r.reportNumber}".lowercase()
                 if (!hay.contains(q)) return@filter false
             }
             true
@@ -403,6 +463,7 @@ fun ExceptionsScreen(
                         tint = p.textPrimary,
                         onClick = {
                             targetDraftForAppend = null
+                            onWillLaunchExternalPicker()
                             photoPickerLauncher.launch(
                                 PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
                             )
@@ -411,6 +472,26 @@ fun ExceptionsScreen(
                             .weight(1f)
                             .testTag("quick_gallery_pick_button")
                     )
+                }
+
+                // Compact media allowance guide pill + Urgent Action Required indicator
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Limit: up to ${MediaUploadLimits.MAX_IMAGES_PER_REPORT} photos & ${MediaUploadLimits.MAX_VIDEOS_PER_REPORT} videos per exception",
+                        color = p.textSecondary,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    if (actionRequiredCount > 0) {
+                        StatusGlassChip(
+                            dotColor = Color(0xFFFF6B2C),
+                            text = "$actionRequiredCount Action"
+                        )
+                    }
                 }
 
                 // Frosted Glass Segmented Tab Switcher
@@ -422,7 +503,7 @@ fun ExceptionsScreen(
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     GlassSegmentItem(
-                        label = "Offline Drafts (${drafts.size})",
+                        label = "Offline Drafts (${drafts.size + if (savedFormDraft?.hasContent == true) 1 else 0})",
                         selected = selectedTab == 0,
                         onClick = { selectedTab = 0 },
                         modifier = Modifier
@@ -430,7 +511,7 @@ fun ExceptionsScreen(
                             .testTag("tab_offline_drafts")
                     )
                     GlassSegmentItem(
-                        label = "Submitted (${mySubmitted.size})",
+                        label = "Submitted (${allMine.size})",
                         selected = selectedTab == 1,
                         onClick = { selectedTab = 1 },
                         modifier = Modifier
@@ -441,23 +522,98 @@ fun ExceptionsScreen(
             }
 
             if (selectedTab == 0) {
-                // OFFLINE DRAFTS TAB (Multi-evidence, Date+Time stamp, Preview/Delete/Add, 1-3 Gate)
+                // OFFLINE DRAFTS TAB (In-progress Composer Draft + Encrypted Offline Media Drafts, Max 4 Photos & 2 Videos)
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 112.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    if (drafts.isEmpty()) {
+                    if (savedFormDraft != null && savedFormDraft.hasContent) {
+                        item(key = "in_progress_composer_draft") {
+                            val divLabel = ComplianceDivision.fromAny(savedFormDraft.divisionKey)?.label ?: "Academic"
+                            val detailSummary = listOfNotNull(
+                                divLabel,
+                                savedFormDraft.staffName?.takeIf { it.isNotBlank() },
+                                savedFormDraft.checkName?.takeIf { it.isNotBlank() }
+                            ).joinToString(" • ")
+
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .complianceGlassCard(24.dp)
+                                    .border(1.dp, p.tangerine.copy(alpha = 0.4f), RoundedCornerShape(24.dp))
+                                    .padding(16.dp)
+                                    .testTag("in_progress_composer_draft_card"),
+                                verticalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.EditNote,
+                                            contentDescription = null,
+                                            tint = p.tangerine,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Text(
+                                            text = "IN-PROGRESS REPORT DRAFT",
+                                            color = p.tangerine,
+                                            fontSize = 10.sp,
+                                            letterSpacing = 1.sp,
+                                            fontWeight = FontWeight.ExtraBold
+                                        )
+                                    }
+                                    TextButton(onClick = onClearFormDraft) {
+                                        Text("Clear", color = p.rose, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                                Text(
+                                    text = detailSummary.ifBlank { "Saved Exception Draft" },
+                                    color = p.textPrimary,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                if (savedFormDraft.exceptionText.isNotBlank()) {
+                                    Text(
+                                        text = savedFormDraft.exceptionText,
+                                        color = p.textSecondary,
+                                        fontSize = 12.sp,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                TangerineGlowButton(
+                                    text = "Resume Unfinished Report",
+                                    onClick = onResumeFormDraft,
+                                    modifier = Modifier.testTag("resume_draft_card_button")
+                                )
+                            }
+                        }
+                    }
+
+                    if (drafts.isEmpty() && savedFormDraft?.hasContent != true) {
                         item {
                             GlassEmptyStateCard(
                                 icon = Icons.Rounded.CameraAlt,
                                 title = "No Offline Drafts",
-                                subtitle = "Capture photos or videos above—even offline. Add multiple items to a draft, then select 1 to 3 when submitting."
+                                subtitle = "Capture photos or videos above—even offline. Each report supports up to 4 photos and 2 videos."
                             )
                         }
-                    } else {
+                    } else if (drafts.isNotEmpty()) {
                         items(drafts, key = { it.id }) { draft ->
                             val mediaList = resolveDraftMediaList(draft)
+                            val imgCount = mediaList.count { it.mediaType.equals("image", true) }
+                            val vidCount = mediaList.count { it.mediaType.equals("video", true) }
+                            val exceedsLimit = imgCount > MediaUploadLimits.MAX_IMAGES_PER_REPORT ||
+                                vidCount > MediaUploadLimits.MAX_VIDEOS_PER_REPORT
                             val primaryTime = mediaList.firstOrNull()?.capturedAtLabel
                                 ?: formatDraftTimestamp(draft.incidentDate, draft.mediaPath)
 
@@ -468,7 +624,7 @@ fun ExceptionsScreen(
                                     .padding(16.dp),
                                 verticalArrangement = Arrangement.spacedBy(12.dp)
                             ) {
-                                // Header: Date + Exact Time + Delete Draft
+                                // Header: Photo/Video Quota Chips + Date+Time + Delete Draft
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -476,12 +632,12 @@ fun ExceptionsScreen(
                                 ) {
                                     Row(
                                         verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
                                         modifier = Modifier.weight(1f)
                                     ) {
                                         StatusGlassChip(
-                                            dotColor = if (mediaList.size > 3) p.tangerine else p.emerald,
-                                            text = "${mediaList.size} Evidence"
+                                            dotColor = if (exceedsLimit) p.rose else p.emerald,
+                                            text = "${imgCount}/4 Img • ${vidCount}/2 Vid"
                                         )
                                         Row(
                                             verticalAlignment = Alignment.CenterVertically,
@@ -540,7 +696,7 @@ fun ExceptionsScreen(
                                     }
                                 }
 
-                                // Multi-Evidence Thumbnail Strip (Tap to Preview, X to Delete)
+                                // Multi-Evidence Thumbnail Strip (Tap to Preview, X triggers Delete Confirmation Card)
                                 if (mediaList.isNotEmpty()) {
                                     LazyRow(
                                         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -550,26 +706,26 @@ fun ExceptionsScreen(
                                             DraftMediaThumbTile(
                                                 item = item,
                                                 onPreview = { previewModalState = draft to idx },
-                                                onDelete = { removeDraftMediaItem(draft, item) }
+                                                onDelete = { pendingDeleteDraftMedia = draft to item }
                                             )
                                         }
                                     }
                                 }
 
-                                // Add More Media Bar (Camera Photo / Camera Video / Gallery)
+                                // Add More Media Bar (Enforcing max 4 photos & 2 videos)
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
                                     SmallGlassActionChip(
                                         icon = Icons.Rounded.CameraAlt,
-                                        label = "+ Photo",
+                                        label = "+ Photo ($imgCount/4)",
                                         onClick = { requestCameraAndRun("photo", appendTo = draft) },
                                         modifier = Modifier.weight(1f)
                                     )
                                     SmallGlassActionChip(
                                         icon = Icons.Rounded.Videocam,
-                                        label = "+ Video",
+                                        label = "+ Video ($vidCount/2)",
                                         onClick = { requestCameraAndRun("video", appendTo = draft) },
                                         modifier = Modifier.weight(1f)
                                     )
@@ -577,29 +733,34 @@ fun ExceptionsScreen(
                                         icon = Icons.Rounded.PhotoLibrary,
                                         label = "+ Gallery",
                                         onClick = {
-                                            targetDraftForAppend = draft
-                                            photoPickerLauncher.launch(
-                                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
-                                            )
+                                            if (imgCount >= MediaUploadLimits.MAX_IMAGES_PER_REPORT && vidCount >= MediaUploadLimits.MAX_VIDEOS_PER_REPORT) {
+                                                onShowLimitWarning("Draft already reached the max 4 photos and 2 videos limit.")
+                                            } else {
+                                                targetDraftForAppend = draft
+                                                onWillLaunchExternalPicker()
+                                                photoPickerLauncher.launch(
+                                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
+                                                )
+                                            }
                                         },
                                         modifier = Modifier.weight(1f)
                                     )
                                 }
 
-                                if (mediaList.size > 3) {
+                                if (exceedsLimit) {
                                     Text(
-                                        text = "Review required: select 1–3 evidence items before submitting.",
-                                        color = p.tangerine,
+                                        text = "Exceeds limit (max 4 photos & 2 videos). Trim extra attachments before submitting.",
+                                        color = p.rose,
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.SemiBold
                                     )
                                 }
 
                                 TangerineGlowButton(
-                                    text = if (mediaList.size > 3) "Review & Submit (${mediaList.size} items)" else "Convert to Exception Report",
+                                    text = if (exceedsLimit) "Trim & Convert (${mediaList.size} items)" else "Convert to Exception Report",
                                     onClick = {
                                         when {
-                                            mediaList.size > 3 -> reviewTrimDraft = draft
+                                            exceedsLimit -> reviewTrimDraft = draft
                                             mediaList.isEmpty() -> onConvertDraft(draft)
                                             else -> onConvertDraftWithMedia(draft, mediaList)
                                         }
@@ -611,7 +772,7 @@ fun ExceptionsScreen(
                     }
                 }
             } else {
-                // SUBMITTED EXCEPTIONS TAB (Dynamic collapsible Search/Seen + User Edit + Admin Notes)
+                // SUBMITTED EXCEPTIONS TAB (Dynamic Search, Urgent Action Banner, 5-Status Pills, Full-Form Edit)
                 Column(modifier = Modifier.fillMaxSize()) {
                     AnimatedVisibility(
                         visible = showSubmittedFilters,
@@ -622,14 +783,57 @@ fun ExceptionsScreen(
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
+                            if (actionRequiredCount > 0 && statusFilter != ReportResolutionStatus.ACTION_REQUIRED.key) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(16.dp))
+                                        .background(Color(0xFFFF6B2C).copy(alpha = 0.16f))
+                                        .border(1.dp, Color(0xFFFF6B2C).copy(alpha = 0.45f), RoundedCornerShape(16.dp))
+                                        .clickable { statusFilter = ReportResolutionStatus.ACTION_REQUIRED.key }
+                                        .padding(horizontal = 12.dp, vertical = 9.dp)
+                                        .testTag("action_required_banner"),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.NotificationsActive,
+                                        contentDescription = null,
+                                        tint = Color(0xFFFF6B2C),
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Text(
+                                        text = "$actionRequiredCount exception${if (actionRequiredCount > 1) "s" else ""} require your attention — Tap to filter",
+                                        color = p.textPrimary,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                            }
+
                             GlassSearchBox(
                                 value = search,
                                 onValueChange = { search = it },
                                 placeholder = "Search submitted exceptions..."
                             )
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                listOf("ALL" to "All", "UNSEEN" to "Unseen", "SEEN" to "Seen").forEach { (key, label) ->
-                                    val selected = seenFilter == key
+
+                            val filterOptions = listOf(
+                                "ALL" to "All (${statusCounts["ALL"] ?: 0})",
+                                ReportResolutionStatus.OPEN.key to "Open (${statusCounts[ReportResolutionStatus.OPEN.key] ?: 0})",
+                                ReportResolutionStatus.PENDING.key to "Pending (${statusCounts[ReportResolutionStatus.PENDING.key] ?: 0})",
+                                ReportResolutionStatus.ACTION_REQUIRED.key to "Action Required (${statusCounts[ReportResolutionStatus.ACTION_REQUIRED.key] ?: 0})",
+                                ReportResolutionStatus.ACCEPTED.key to "Accepted (${statusCounts[ReportResolutionStatus.ACCEPTED.key] ?: 0})",
+                                ReportResolutionStatus.REJECTED.key to "Rejected (${statusCounts[ReportResolutionStatus.REJECTED.key] ?: 0})"
+                            )
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                filterOptions.forEach { (key, label) ->
+                                    val selected = statusFilter == key
                                     Box(
                                         modifier = Modifier
                                             .clip(CircleShape)
@@ -644,8 +848,9 @@ fun ExceptionsScreen(
                                                         .border(1.dp, p.borderBottom, CircleShape)
                                                 }
                                             )
-                                            .clickable { seenFilter = key }
-                                            .padding(horizontal = 14.dp, vertical = 8.dp)
+                                            .clickable { statusFilter = key }
+                                            .padding(horizontal = 13.dp, vertical = 7.dp)
+                                            .testTag("exception_filter_${key.lowercase()}")
                                     ) {
                                         Text(
                                             text = label,
@@ -669,8 +874,12 @@ fun ExceptionsScreen(
                             item {
                                 GlassEmptyStateCard(
                                     icon = Icons.AutoMirrored.Rounded.Send,
-                                    title = "No Submitted Exceptions",
-                                    subtitle = "Tap 'New Exception' above to log a formal compliance report."
+                                    title = if (allMine.isEmpty()) "No Submitted Exceptions" else "No Matching Exceptions",
+                                    subtitle = if (allMine.isEmpty()) {
+                                        "Tap 'New Exception' above to log a formal compliance report."
+                                    } else {
+                                        "Try clearing your search or selecting 'All' above."
+                                    }
                                 )
                             }
                         } else {
@@ -680,6 +889,17 @@ fun ExceptionsScreen(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .complianceGlassCard(24.dp)
+                                        .then(
+                                            if (report.isActionRequired) {
+                                                Modifier.border(
+                                                    1.2.dp,
+                                                    Color(0xFFFF6B2C).copy(alpha = 0.55f),
+                                                    RoundedCornerShape(24.dp)
+                                                )
+                                            } else {
+                                                Modifier
+                                            }
+                                        )
                                         .padding(12.dp),
                                     verticalArrangement = Arrangement.spacedBy(10.dp)
                                 ) {
@@ -689,9 +909,19 @@ fun ExceptionsScreen(
                                         onClick = { onSelectReport(report) }
                                     )
 
-                                    // Admin Rejection / Evidence Notes (Visible to Reporting User)
-                                    if (feedback != null && (!feedback.resolutionNote.isNullOrBlank() || feedback.evidenceNotes.isNotEmpty())) {
-                                        val noteAccent = if (feedback.isRejected) p.rose else p.tangerine
+                                    // Admin Action / Review Note Box
+                                    val resNote = feedback?.resolutionNote?.takeIf { it.isNotBlank() } ?: report.resolutionNotes?.takeIf { it.isNotBlank() }
+                                    val evNotes = feedback?.evidenceNotes?.ifEmpty { report.evidenceNotes } ?: report.evidenceNotes
+                                    if (!resNote.isNullOrBlank() || evNotes.isNotEmpty() || report.isActionRequired) {
+                                        val isAction = report.isActionRequired
+                                        val isRej = report.isRejected || feedback?.isRejected == true
+                                        val isAcc = report.isAccepted
+                                        val noteAccent = when {
+                                            isAction -> Color(0xFFFF6B2C)
+                                            isRej -> p.rose
+                                            isAcc -> p.emerald
+                                            else -> p.tangerine
+                                        }
                                         Column(
                                             modifier = Modifier
                                                 .fillMaxWidth()
@@ -706,28 +936,40 @@ fun ExceptionsScreen(
                                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
                                             ) {
                                                 Icon(
-                                                    imageVector = Icons.Rounded.Feedback,
+                                                    imageVector = if (isAcc) Icons.Rounded.CheckCircle else Icons.Rounded.Feedback,
                                                     contentDescription = null,
                                                     tint = noteAccent,
                                                     modifier = Modifier.size(15.dp)
                                                 )
                                                 Text(
-                                                    text = if (feedback.isRejected) "ADMIN REJECTION NOTE" else "ADMIN REVIEW NOTE",
+                                                    text = when {
+                                                        isAction -> "ACTION REQUIRED • CHECK & UPDATE"
+                                                        isRej -> "ADMIN REJECTION NOTE"
+                                                        isAcc -> "ACCEPTED • DIRECTORATE NOTE"
+                                                        else -> "PENDING • COMPLIANCE NOTE"
+                                                    },
                                                     color = noteAccent,
                                                     fontSize = 10.sp,
                                                     letterSpacing = 1.sp,
                                                     fontWeight = FontWeight.Bold
                                                 )
                                             }
-                                            if (!feedback.resolutionNote.isNullOrBlank()) {
+                                            if (!resNote.isNullOrBlank()) {
                                                 Text(
-                                                    text = feedback.resolutionNote,
+                                                    text = resNote,
+                                                    color = p.textPrimary,
+                                                    fontSize = 12.sp,
+                                                    fontWeight = FontWeight.Medium
+                                                )
+                                            } else if (isAction) {
+                                                Text(
+                                                    text = "Please review this exception and update any missing details or evidence.",
                                                     color = p.textPrimary,
                                                     fontSize = 12.sp,
                                                     fontWeight = FontWeight.Medium
                                                 )
                                             }
-                                            feedback.evidenceNotes.forEach { evNote ->
+                                            evNotes.forEach { evNote ->
                                                 Text(
                                                     text = "• $evNote",
                                                     color = p.textSecondary,
@@ -737,52 +979,39 @@ fun ExceptionsScreen(
                                         }
                                     }
 
-                                    // Unified User-Only Edit Trigger (Zero Admin Controls)
+                                    // Action Footer: Full Form Edit (including Evidence) for Open / Pending / Action Required; Locked for Accepted / Rejected
                                     HorizontalDivider(thickness = 0.7.dp, color = p.borderBottom)
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
                                         horizontalArrangement = Arrangement.SpaceBetween,
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
+                                        val attachCount = report.evidenceUrls.size.takeIf { it > 0 }
+                                            ?: if (!report.evidenceUrl.isNullOrBlank() && report.evidenceType != "none") 1 else 0
                                         Text(
-                                            text = if (report.isSeen) "Reviewed by Directorate • Changes locked" else "Tap card to inspect • Edit before review",
-                                            color = p.textSecondary,
+                                            text = when {
+                                                report.isActionRequired -> "Action needed • Tap Edit to resolve"
+                                                report.isPending -> "Pending review • Editable ($attachCount evidence)"
+                                                report.isAccepted -> "Accepted • Final & locked"
+                                                report.isRejected -> "Rejected • Final & locked"
+                                                else -> "Open • Tap Edit to update ($attachCount evidence)"
+                                            },
+                                            color = if (report.isActionRequired) Color(0xFFFF6B2C) else p.textSecondary,
                                             fontSize = 11.sp,
+                                            fontWeight = if (report.isActionRequired) FontWeight.SemiBold else FontWeight.Normal,
                                             modifier = Modifier.weight(1f),
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis
                                         )
-                                        if (report.isSeen) {
+                                        Spacer(Modifier.width(8.dp))
+                                        if (report.canUserEdit) {
+                                            val btnTint = if (report.isActionRequired) Color(0xFFFF6B2C) else p.tangerine
                                             Row(
                                                 modifier = Modifier
                                                     .clip(CircleShape)
-                                                    .background(p.emerald.copy(alpha = 0.14f))
-                                                    .border(1.dp, p.emerald.copy(alpha = 0.35f), CircleShape)
-                                                    .padding(horizontal = 10.dp, vertical = 5.dp)
-                                                    .testTag("exception_locked_badge_${report.id}"),
-                                                verticalAlignment = Alignment.CenterVertically,
-                                                horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                            ) {
-                                                Icon(
-                                                    imageVector = Icons.Rounded.Lock,
-                                                    contentDescription = "Reviewed and Locked",
-                                                    tint = p.emerald,
-                                                    modifier = Modifier.size(13.dp)
-                                                )
-                                                Text(
-                                                    text = "Reviewed",
-                                                    color = p.emerald,
-                                                    fontSize = 11.sp,
-                                                    fontWeight = FontWeight.SemiBold
-                                                )
-                                            }
-                                        } else {
-                                            Row(
-                                                modifier = Modifier
-                                                    .clip(CircleShape)
-                                                    .background(p.tangerine.copy(alpha = 0.15f))
-                                                    .border(1.dp, p.tangerine.copy(alpha = 0.35f), CircleShape)
-                                                    .clickable { editingReport = report }
+                                                    .background(btnTint.copy(alpha = 0.16f))
+                                                    .border(1.dp, btnTint.copy(alpha = 0.4f), CircleShape)
+                                                    .clickable { onOpenEditForm(report) }
                                                     .padding(horizontal = 12.dp, vertical = 6.dp)
                                                     .testTag("user_edit_exception_${report.id}"),
                                                 verticalAlignment = Alignment.CenterVertically,
@@ -790,14 +1019,39 @@ fun ExceptionsScreen(
                                             ) {
                                                 Icon(
                                                     imageVector = Icons.Rounded.Edit,
-                                                    contentDescription = null,
-                                                    tint = p.tangerine,
+                                                    contentDescription = "Edit Exception",
+                                                    tint = btnTint,
                                                     modifier = Modifier.size(14.dp)
                                                 )
                                                 Text(
-                                                    text = "Edit Exception",
-                                                    color = p.tangerine,
+                                                    text = if (report.isActionRequired) "Edit & Resolve" else "Edit Report",
+                                                    color = btnTint,
                                                     fontSize = 12.sp,
+                                                    fontWeight = FontWeight.SemiBold
+                                                )
+                                            }
+                                        } else {
+                                            val lockTint = if (report.isAccepted) p.emerald else p.rose
+                                            Row(
+                                                modifier = Modifier
+                                                    .clip(CircleShape)
+                                                    .background(lockTint.copy(alpha = 0.14f))
+                                                    .border(1.dp, lockTint.copy(alpha = 0.35f), CircleShape)
+                                                    .padding(horizontal = 10.dp, vertical = 5.dp)
+                                                    .testTag("exception_locked_badge_${report.id}"),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Rounded.Lock,
+                                                    contentDescription = "${report.status.label} and Locked",
+                                                    tint = lockTint,
+                                                    modifier = Modifier.size(13.dp)
+                                                )
+                                                Text(
+                                                    text = report.status.label,
+                                                    color = lockTint,
+                                                    fontSize = 11.sp,
                                                     fontWeight = FontWeight.SemiBold
                                                 )
                                             }
@@ -835,6 +1089,7 @@ fun ExceptionsScreen(
                     activeUrl = previewItems.getOrNull(initialIdx.coerceIn(0, previewItems.lastIndex))?.storedPath,
                     isLoading = false,
                     errorMessage = null,
+                    showModerationControls = false,
                     onSelectIndex = { nextIdx -> previewModalState = draft to nextIdx },
                     onOpenExternal = {},
                     onVerdict = { _, _ -> },
@@ -846,20 +1101,25 @@ fun ExceptionsScreen(
         }
     }
 
-    // Mandatory 1-to-3 Evidence Review & Trim Modal (Draft -> Report Gate)
+    // Trim Review Modal when a legacy draft exceeds Max 4 Photos & 2 Videos
     reviewTrimDraft?.let { draft ->
         val mediaList = resolveDraftMediaList(draft)
+        val imgCount = mediaList.count { it.mediaType.equals("image", true) }
+        val vidCount = mediaList.count { it.mediaType.equals("video", true) }
+        val validCounts = imgCount <= MediaUploadLimits.MAX_IMAGES_PER_REPORT &&
+            vidCount <= MediaUploadLimits.MAX_VIDEOS_PER_REPORT &&
+            mediaList.isNotEmpty()
         AlertDialog(
             onDismissRequest = { reviewTrimDraft = null },
             containerColor = if (p.isDark) Color(0xFF151923) else Color(0xFFF6F8FC),
             titleContentColor = p.textPrimary,
             textContentColor = p.textSecondary,
             icon = { Icon(Icons.Rounded.WarningAmber, contentDescription = null, tint = p.tangerine) },
-            title = { Text("Select 1–3 Evidence Items", fontWeight = FontWeight.Bold) },
+            title = { Text("Max 4 Photos & 2 Videos", fontWeight = FontWeight.Bold) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(
-                        text = "Your draft has ${mediaList.size} attachments. Delete extras until 1 to 3 evidence items remain before submitting.",
+                        text = "This draft has $imgCount photos and $vidCount videos. Please trim extras to stay within 4 photos and 2 videos.",
                         fontSize = 13.sp,
                         color = p.textSecondary
                     )
@@ -885,7 +1145,7 @@ fun ExceptionsScreen(
                                 }
                                 IconButton(
                                     enabled = mediaList.size > 1,
-                                    onClick = { removeDraftMediaItem(draft, item) }
+                                    onClick = { pendingDeleteDraftMedia = draft to item }
                                 ) {
                                     Icon(
                                         imageVector = Icons.Rounded.Delete,
@@ -900,14 +1160,14 @@ fun ExceptionsScreen(
             },
             confirmButton = {
                 Button(
-                    enabled = mediaList.size in 1..3,
+                    enabled = validCounts,
                     colors = ButtonDefaults.buttonColors(containerColor = p.tangerine, contentColor = Color.White),
                     onClick = {
                         reviewTrimDraft = null
                         onConvertDraftWithMedia(draft, mediaList)
                     }
                 ) {
-                    Text("Proceed (${mediaList.size}/3)", fontWeight = FontWeight.SemiBold)
+                    Text("Proceed (${imgCount}/4 Img, ${vidCount}/2 Vid)", fontWeight = FontWeight.SemiBold)
                 }
             },
             dismissButton = {
@@ -918,116 +1178,106 @@ fun ExceptionsScreen(
         )
     }
 
-    // Unified User-Only Exception Edit Dialog (Calendar Date Picker, Zero Typed Dates, Zero Admin Controls)
-    editingReport?.let { target ->
-        UserExceptionEditDialog(
-            report = target,
-            onDismiss = { editingReport = null },
-            onSave = { updatedCheck, updatedDetails, updatedDate ->
-                onEditSubmittedException(target, updatedCheck, updatedDetails, updatedDate)
-                editingReport = null
-            }
-        )
-    }
-}
-
-@Composable
-private fun UserExceptionEditDialog(
-    report: ComplianceReport,
-    onDismiss: () -> Unit,
-    onSave: (updatedCheck: String, updatedDetails: String, updatedDate: String) -> Unit
-) {
-    val context = LocalContext.current
-    val p = LocalCompliancePalette.current
-
-    var checkTitle by remember(report.id) { mutableStateOf(report.complianceCheck) }
-    var detailsText by remember(report.id) { mutableStateOf(report.exceptionText) }
-    var selectedDate by remember(report.id) {
-        mutableStateOf(SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date()))
-    }
-
-    fun openSystemCalendar() {
-        val cal = Calendar.getInstance()
-        DatePickerDialog(
-            context,
-            { _, year, month, day ->
-                selectedDate = String.format(Locale.US, "%04d-%02d-%02d", year, month + 1, day)
-            },
-            cal.get(Calendar.YEAR),
-            cal.get(Calendar.MONTH),
-            cal.get(Calendar.DAY_OF_MONTH)
-        ).show()
-    }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = if (p.isDark) Color(0xFF151923) else Color(0xFFF6F8FC),
-        titleContentColor = p.textPrimary,
-        textContentColor = p.textSecondary,
-        title = {
-            Text("Edit Your Exception", fontWeight = FontWeight.Bold)
-        },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(
-                    text = "Update your compliance check title, observation notes, or incident date.",
-                    fontSize = 12.sp,
-                    color = p.textSecondary
-                )
-                OutlinedTextField(
-                    value = checkTitle,
-                    onValueChange = { checkTitle = it },
-                    label = { Text("Compliance Check") },
-                    singleLine = true,
-                    colors = glassFieldColors(),
-                    shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = detailsText,
-                    onValueChange = { detailsText = it },
-                    label = { Text("Exception Details") },
-                    minLines = 3,
-                    colors = glassFieldColors(),
-                    shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                // Read-only System Calendar Date Field (Cannot be typed)
-                Row(
+    // Draft Evidence Delete Confirmation Glass Card (Prevents accidental X taps)
+    pendingDeleteDraftMedia?.let { (draft, item) ->
+        Dialog(
+            onDismissRequest = { pendingDeleteDraftMedia = null },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 24.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(p.trackFill)
-                        .border(1.dp, p.borderBottom, RoundedCornerShape(14.dp))
-                        .clickable { openSystemCalendar() }
-                        .padding(horizontal = 14.dp, vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
+                        .complianceGlassCard(26.dp)
+                        .padding(20.dp)
+                        .testTag("confirm_delete_draft_evidence_card"),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
-                    Column {
-                        Text("INCIDENT DATE (CALENDAR)", color = p.textSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                        Text(selectedDate, color = p.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        DraftMediaMiniPreview(
+                            item = item,
+                            modifier = Modifier
+                                .size(54.dp)
+                                .border(1.dp, p.rose.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Delete Evidence?",
+                                color = p.textPrimary,
+                                fontSize = 17.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "${item.mediaType.uppercase()} • ${item.capturedAtLabel}",
+                                color = p.tangerine,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
                     }
-                    Icon(Icons.Rounded.CalendarMonth, contentDescription = "Pick Date", tint = p.tangerine)
+                    Text(
+                        text = "Do you want to permanently remove this evidence attachment from your draft?",
+                        color = p.textSecondary,
+                        fontSize = 13.sp
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .clip(CircleShape)
+                                .background(p.trackFill)
+                                .border(1.dp, p.borderBottom, CircleShape)
+                                .clickable { pendingDeleteDraftMedia = null }
+                                .testTag("cancel_delete_evidence_button"),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "Keep",
+                                color = p.textPrimary,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .clip(CircleShape)
+                                .background(p.rose)
+                                .border(1.dp, Color.White.copy(alpha = 0.25f), CircleShape)
+                                .clickable {
+                                    removeDraftMediaItem(draft, item)
+                                    pendingDeleteDraftMedia = null
+                                }
+                                .testTag("confirm_delete_evidence_button"),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "Delete",
+                                color = Color.White,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
                 }
             }
-        },
-        confirmButton = {
-            Button(
-                enabled = checkTitle.isNotBlank() && detailsText.isNotBlank(),
-                colors = ButtonDefaults.buttonColors(containerColor = p.tangerine, contentColor = Color.White),
-                shape = RoundedCornerShape(12.dp),
-                onClick = { onSave(checkTitle.trim(), detailsText.trim(), selectedDate) }
-            ) {
-                Text("Save Changes", fontWeight = FontWeight.SemiBold)
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Cancel", color = p.textSecondary)
-            }
         }
-    )
+    }
 }
 
 @Composable
@@ -1085,11 +1335,18 @@ private fun DraftMediaMiniPreview(
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize()
             )
+        } else if (isVideo) {
+            VideoFrameThumbnail(
+                source = item.pathOrUri,
+                contentDescription = "Draft video preview",
+                modifier = Modifier.fillMaxSize(),
+                badgeSize = 22.dp
+            )
         } else {
             Icon(
-                imageVector = if (isVideo) Icons.Rounded.PlayCircle else Icons.Rounded.AttachFile,
+                imageVector = Icons.Rounded.AttachFile,
                 contentDescription = item.mediaType,
-                tint = if (isVideo) p.tangerine else p.textPrimary,
+                tint = p.textPrimary,
                 modifier = Modifier.size(26.dp)
             )
         }

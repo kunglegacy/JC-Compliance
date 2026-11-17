@@ -173,7 +173,7 @@ fun SystemUsersScreen(
                     )
                 }
 
-                if (currentUserRole.isSuperAdmin) {
+                if (currentUserRole.isAdminOrAbove) {
                     Row(
                         modifier = Modifier
                             .height(42.dp)
@@ -498,7 +498,12 @@ fun SystemUsersScreen(
                         modifier = Modifier.horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        UserRole.entries.forEach { r ->
+                        val assignableRoles = if (currentUserRole.isSuperAdmin) {
+                            UserRole.entries
+                        } else {
+                            listOf(UserRole.STANDARD, UserRole.ADMIN)
+                        }
+                        assignableRoles.forEach { r ->
                             val isSelected = role == r
                             Box(
                                 modifier = Modifier
@@ -648,9 +653,12 @@ private fun DirectorateUserGlassCard(
     val p = LocalCompliancePalette.current
     var showRoleMenu by remember { mutableStateOf(false) }
 
-    val isSuspended = user.status.equals("suspended", true) || user.status.equals("inactive", true)
+    val isSuspended = !user.isVerified || user.status.equals("suspended", true) || user.status.equals("inactive", true)
     val canEditRole = !user.isOwner && currentUserRole.isSuperAdmin
-    val canManageUser = !user.isOwner && currentUserRole.isAdminOrAbove
+    val canManageUser = !user.isOwner && (
+        currentUserRole.isSuperAdmin ||
+            (currentUserRole.isAdminOrAbove && !user.role.isSuperAdmin)
+        )
 
     val roleAccent = when {
         user.isOwner || user.role.isSuperAdmin -> p.tangerine

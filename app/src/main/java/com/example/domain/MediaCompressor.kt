@@ -41,12 +41,13 @@ data class CompressedMediaResult(
 
 object MediaCompressor {
 
-    private const val MAX_IMAGE_DIMENSION = 1440
-    private const val TARGET_IMAGE_MAX_BYTES = 450 * 1024 // ~450 KB target like WhatsApp HD
+    private const val MAX_IMAGE_DIMENSION = 1200
+    private const val TARGET_IMAGE_MAX_BYTES = 180 * 1024 // Compact crisp Web/Audit target (~180 KB)
     private const val MAX_AVATAR_DIMENSION = 512
-    private const val MAX_VIDEO_DIMENSION = 1280
-    private const val TARGET_VIDEO_BITRATE = 1_350_000 // ~1.35 Mbps crisp 720p
-    private const val VIDEO_FRAME_RATE = 30
+    private const val MAX_VIDEO_DIMENSION = 854 // 480p-level 16:9 long edge for fast uploads
+    private const val TARGET_VIDEO_BITRATE = 520_000 // ~520 kbps crisp H.264 video
+    private const val LONG_VIDEO_BITRATE = 420_000 // ~420 kbps for videos > 30s
+    private const val VIDEO_FRAME_RATE = 24
     private const val VIDEO_IFRAME_INTERVAL = 2
 
     suspend fun compressImageFile(
@@ -85,14 +86,24 @@ object MediaCompressor {
             val outDir = File(context.cacheDir, "compressed_media").apply { if (!exists()) mkdirs() }
             val outFile = File(outDir, "img_${System.currentTimeMillis()}_${sourceFile.nameWithoutExtension}.jpg")
 
-            var quality = 80
+            var quality = 78
             var bestBytes: ByteArray
             while (true) {
                 val baos = ByteArrayOutputStream()
                 bitmap.compress(Bitmap.CompressFormat.JPEG, quality, baos)
                 bestBytes = baos.toByteArray()
-                if (bestBytes.size <= targetMaxBytes || quality <= 56) break
+                if (bestBytes.size <= targetMaxBytes || quality <= 38) break
                 quality -= 8
+            }
+            if (bestBytes.size > targetMaxBytes && max(bitmap.width, bitmap.height) > 900) {
+                val smaller = scaleDownIfNeeded(bitmap, 900)
+                val baos2 = ByteArrayOutputStream()
+                smaller.compress(Bitmap.CompressFormat.JPEG, 52, baos2)
+                val candidate = baos2.toByteArray()
+                if (candidate.size < bestBytes.size) {
+                    bestBytes = candidate
+                }
+                if (smaller != bitmap) smaller.recycle()
             }
             bitmap.recycle()
 
@@ -175,9 +186,9 @@ object MediaCompressor {
         }
         runCatching { retriever.release() }
 
-        // If the video is already lightweight (< 2.5 MB and <= 720p), skip expensive re-encode
+        // Only skip re-encode if video is already tiny (<= 500 KB) and compact bitrate
         val maxSide = max(width, height)
-        if (origSize <= 2_500_000L && (maxSide == 0 || maxSide <= MAX_VIDEO_DIMENSION) && (bitrate == 0 || bitrate <= 1_800_000)) {
+        if (origSize <= 500_000L && (maxSide == 0 || maxSide <= MAX_VIDEO_DIMENSION) && (bitrate in 1..600_000)) {
             onProgress(1f)
             return@withContext Result.success(
                 CompressedMediaResult(
@@ -357,9 +368,10 @@ object MediaCompressor {
         val targetW = (((rawW * scale) / 16f).roundToInt() * 16).coerceAtLeast(160)
         val targetH = (((rawH * scale) / 16f).roundToInt() * 16).coerceAtLeast(160)
 
+        val chosenBitrate = if (durationUs > 30_000_000L) LONG_VIDEO_BITRATE else TARGET_VIDEO_BITRATE
         val outputFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, targetW, targetH).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, TARGET_VIDEO_BITRATE)
+            setInteger(MediaFormat.KEY_BIT_RATE, chosenBitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, VIDEO_FRAME_RATE)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, VIDEO_IFRAME_INTERVAL)
         }
@@ -398,6 +410,7 @@ object MediaCompressor {
             var decoderDone = false
             var encoderDone = false
             val totalUs = durationUs.coerceAtLeast(1_000_000L)
+            var lastVideoPtsUs = -1L
 
             while (!encoderDone) {
                 if (!extractorDone) {
@@ -442,7 +455,7 @@ object MediaCompressor {
                         encStatus == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                             muxerVideoTrack = muxer.addTrack(encoder.outputFormat)
                             if (canPassAudio && inputAudioFormat != null) {
-                                muxerAudioTrack = muxer.addTrack(inputAudioFormat)
+                                muxerAudioTrack = runCatching { muxer.addTrack(inputAudioFormat) }.getOrDefault(-1)
                             }
                             muxer.start()
                             muxerStarted = true
@@ -450,6 +463,10 @@ object MediaCompressor {
                         encStatus >= 0 -> {
                             val outBuf = encoder.getOutputBuffer(encStatus)
                             if (outBuf != null && encInfo.size > 0 && (encInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0 && muxerStarted) {
+                                if (encInfo.presentationTimeUs <= lastVideoPtsUs) {
+                                    encInfo.presentationTimeUs = lastVideoPtsUs + 1_000L
+                                }
+                                lastVideoPtsUs = encInfo.presentationTimeUs
                                 outBuf.position(encInfo.offset)
                                 outBuf.limit(encInfo.offset + encInfo.size)
                                 muxer.writeSampleData(muxerVideoTrack, outBuf, encInfo)
@@ -464,22 +481,27 @@ object MediaCompressor {
                 }
             }
 
-            // Copy AAC audio track verbatim (fast & preserves clean voice/ambient audio)
+            // Copy AAC audio track verbatim (wrapped safely so exotic audio never breaks video compression)
             if (muxerStarted && muxerAudioTrack >= 0 && audioTrackIndex >= 0) {
-                extractor.unselectTrack(videoTrackIndex)
-                extractor.selectTrack(audioTrackIndex)
-                extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
-                val audioBuf = ByteBuffer.allocate(256 * 1024)
-                val audioInfo = MediaCodec.BufferInfo()
-                while (true) {
-                    val size = extractor.readSampleData(audioBuf, 0)
-                    if (size < 0) break
-                    audioInfo.offset = 0
-                    audioInfo.size = size
-                    audioInfo.presentationTimeUs = extractor.sampleTime
-                    audioInfo.flags = extractor.sampleFlags
-                    muxer.writeSampleData(muxerAudioTrack, audioBuf, audioInfo)
-                    extractor.advance()
+                runCatching {
+                    extractor.unselectTrack(videoTrackIndex)
+                    extractor.selectTrack(audioTrackIndex)
+                    extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                    val audioBuf = ByteBuffer.allocate(256 * 1024)
+                    val audioInfo = MediaCodec.BufferInfo()
+                    var lastAudioPtsUs = -1L
+                    while (true) {
+                        val size = extractor.readSampleData(audioBuf, 0)
+                        if (size < 0) break
+                        val pts = extractor.sampleTime.coerceAtLeast(lastAudioPtsUs + 1L)
+                        lastAudioPtsUs = pts
+                        audioInfo.offset = 0
+                        audioInfo.size = size
+                        audioInfo.presentationTimeUs = pts
+                        audioInfo.flags = extractor.sampleFlags
+                        muxer.writeSampleData(muxerAudioTrack, audioBuf, audioInfo)
+                        extractor.advance()
+                    }
                 }
             }
             onProgress(0.98f)

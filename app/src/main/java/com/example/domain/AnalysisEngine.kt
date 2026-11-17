@@ -226,7 +226,7 @@ object AnalysisEngine {
         val staffMap = buildStaffLookup(staffRoster)
 
         val seenCount = filtered.count { it.isSeen }
-        val resolvedCount = filtered.count { it.status == ReportResolutionStatus.RESOLVED }
+        val resolvedCount = filtered.count { it.status == ReportResolutionStatus.ACCEPTED }
         val activeCount = filtered.size - resolvedCount
 
         val divisions = ComplianceDivision.entries.map { div ->

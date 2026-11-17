@@ -82,6 +82,32 @@ class SecurePreferences(private val context: Context) {
         val CUSTOM_CHECKS_JSON = stringPreferencesKey("custom_checks_json")
     }
 
+    private val vault = EncryptedAuthStore(context)
+
+    fun isAppLockedSync(): Boolean = vault.isAppLockedSync()
+
+    fun setAppLockedSync(locked: Boolean) = vault.setAppLockedSync(locked)
+
+    fun saveBiometricCredential(email: String, password: String) = vault.saveBiometricCredential(email, password)
+
+    fun hasBiometricCredentialFor(email: String): Boolean = vault.hasBiometricCredentialFor(email)
+
+    fun decryptBiometricCredential(email: String): String? = vault.decryptBiometricCredential(email)
+
+    fun clearBiometricCredential() = vault.clearBiometricCredential()
+
+    private fun isValidNonPlaceholder(value: String): Boolean {
+        val v = value.trim()
+        return v.isNotBlank() &&
+            !v.contains("your-project-id", ignoreCase = true) &&
+            !v.contains("your_key_here", ignoreCase = true) &&
+            !v.contains("your-anon", ignoreCase = true) &&
+            !v.contains("placeholder", ignoreCase = true)
+    }
+
+    private fun firstValid(vararg candidates: String): String =
+        candidates.firstOrNull { isValidNonPlaceholder(it) }?.trim()?.trim('"', '\'').orEmpty()
+
     val state: Flow<AppPreferencesState> = context.dataStore.data.map { prefs ->
         val envUrl = (System.getenv("SUPABASE_URL") ?: System.getenv("VITE_SUPABASE_URL")).orEmpty()
         val envKey = (System.getenv("SUPABASE_PUBLISHABLE_KEY")
@@ -89,17 +115,24 @@ class SecurePreferences(private val context: Context) {
             ?: System.getenv("SUPABASE_ANON_KEY")
             ?: System.getenv("SUPABASE_KEY")).orEmpty()
 
-        val buildUrl = readBuildConfig("VITE_SUPABASE_URL")
-            .ifBlank { readBuildConfig("SUPABASE_URL") }
-            .ifBlank { envUrl }
-        val buildKey = readBuildConfig("VITE_SUPABASE_PUBLISHABLE_KEY")
-            .ifBlank { readBuildConfig("SUPABASE_PUBLISHABLE_KEY") }
-            .ifBlank { envKey }
+        val buildUrl = firstValid(
+            readBuildConfig("CI_SUPABASE_URL"),
+            readBuildConfig("VITE_SUPABASE_URL"),
+            readBuildConfig("SUPABASE_URL"),
+            envUrl
+        )
+        val buildKey = firstValid(
+            readBuildConfig("CI_SUPABASE_KEY"),
+            readBuildConfig("VITE_SUPABASE_PUBLISHABLE_KEY"),
+            readBuildConfig("SUPABASE_PUBLISHABLE_KEY"),
+            readBuildConfig("SUPABASE_ANON_KEY"),
+            envKey
+        )
 
         val storedUrl = prefs[Keys.SUPABASE_URL].orEmpty()
         val storedKey = prefs[Keys.SUPABASE_ANON_KEY].orEmpty()
-        val effectiveUrl = storedUrl.ifBlank { buildUrl }.trim().trim('"', '\'').trimEnd('/')
-        val effectiveKey = storedKey.ifBlank { buildKey }.trim().trim('"', '\'')
+        val effectiveUrl = firstValid(storedUrl, buildUrl).trimEnd('/')
+        val effectiveKey = firstValid(storedKey, buildKey)
 
         val userId = prefs[Keys.USER_ID].orEmpty()
         val email = prefs[Keys.USER_EMAIL].orEmpty()
@@ -117,12 +150,14 @@ class SecurePreferences(private val context: Context) {
                 role = UserRole.fromKey(prefs[Keys.USER_ROLE]),
                 status = prefs[Keys.USER_STATUS] ?: "active",
                 isVerified = prefs[Keys.USER_VERIFIED] ?: true,
-                isOwner = prefs[Keys.USER_OWNER] ?: false
+                isOwner = prefs[Keys.USER_OWNER] ?: false,
+                avatarUrl = prefs[Keys.AVATAR_URI].orEmpty()
             )
         } else null
 
         val setupKey = booleanPreferencesKey("${Keys.SETUP_COMPLETED_PREFIX}$userId")
         val policyKey = stringPreferencesKey("${Keys.LOCK_POLICY_PREFIX}$userId")
+        val persistedManualLock = (prefs[Keys.MANUALLY_LOCKED] ?: false) || vault.isAppLockedSync()
 
         AppPreferencesState(
             supabaseConfig = SupabaseConfig(effectiveUrl, effectiveKey),
@@ -137,7 +172,7 @@ class SecurePreferences(private val context: Context) {
             biometricsEnabled = prefs[Keys.BIOMETRICS_ENABLED] ?: false,
             biometricsUserEmail = prefs[Keys.BIOMETRICS_EMAIL].orEmpty(),
             lastActiveMillis = prefs[Keys.LAST_ACTIVE_MILLIS] ?: 0L,
-            isManuallyLocked = prefs[Keys.MANUALLY_LOCKED] ?: false,
+            isManuallyLocked = persistedManualLock,
             customChecks = parseCustomChecks(prefs[Keys.CUSTOM_CHECKS_JSON].orEmpty()),
             rememberedEmail = prefs[Keys.REMEMBERED_EMAIL] ?: prefs[Keys.USER_EMAIL].orEmpty(),
             rememberedDisplayName = prefs[Keys.REMEMBERED_DISPLAY_NAME] ?: prefs[Keys.DISPLAY_NAME].orEmpty(),
@@ -161,6 +196,13 @@ class SecurePreferences(private val context: Context) {
     }
 
     suspend fun saveSession(session: UserSession) {
+        vault.setAppLockedSync(false)
+        val current = context.dataStore.data.first()
+        val prevRemembered = current[Keys.REMEMBERED_EMAIL].orEmpty()
+        val switchedAccount = prevRemembered.isNotBlank() && !prevRemembered.equals(session.email, ignoreCase = true)
+        if (switchedAccount) {
+            vault.clearBiometricCredential()
+        }
         context.dataStore.edit {
             it[Keys.USER_ID] = session.userId
             it[Keys.USER_EMAIL] = session.email
@@ -174,15 +216,29 @@ class SecurePreferences(private val context: Context) {
             it[Keys.USER_OWNER] = session.isOwner
             it[Keys.LAST_ACTIVE_MILLIS] = System.currentTimeMillis()
             it[Keys.MANUALLY_LOCKED] = false
-            // Persist remembered credentials across sign-out
+
+            if (switchedAccount) {
+                // Another account signed in: wipe previous user's remembered profile & biometrics and require setup for the new user
+                it[Keys.BIOMETRICS_ENABLED] = false
+                it.remove(Keys.BIOMETRICS_EMAIL)
+                it.remove(Keys.CUSTOM_DISPLAY_NAME)
+                it.remove(Keys.AVATAR_URI)
+                it.remove(Keys.REMEMBERED_AVATAR_URI)
+                it[booleanPreferencesKey("${Keys.SETUP_COMPLETED_PREFIX}${session.userId}")] = false
+            }
+
+            // Persist remembered profile & avatar across sign-out for the current device account
             if (session.email.isNotBlank()) it[Keys.REMEMBERED_EMAIL] = session.email
             if (session.displayName.isNotBlank()) it[Keys.REMEMBERED_DISPLAY_NAME] = session.displayName
-            val currentAvatar = it[Keys.AVATAR_URI]
-            if (!currentAvatar.isNullOrBlank()) it[Keys.REMEMBERED_AVATAR_URI] = currentAvatar
+            if (session.avatarUrl.isNotBlank()) {
+                it[Keys.AVATAR_URI] = session.avatarUrl
+                it[Keys.REMEMBERED_AVATAR_URI] = session.avatarUrl
+            }
         }
     }
 
     suspend fun clearSession() {
+        vault.setAppLockedSync(false)
         context.dataStore.edit {
             it.remove(Keys.ACCESS_TOKEN)
             it.remove(Keys.REFRESH_TOKEN)
@@ -195,7 +251,20 @@ class SecurePreferences(private val context: Context) {
             it.remove(Keys.USER_VERIFIED)
             it.remove(Keys.USER_OWNER)
             it[Keys.MANUALLY_LOCKED] = false
-            // Note: Keys.REMEMBERED_EMAIL, REMEMBERED_DISPLAY_NAME, and REMEMBERED_AVATAR_URI are intentionally preserved
+            // Remembered email, display name, avatar, and biometric credentials remain until another account signs in or user taps Switch
+        }
+    }
+
+    suspend fun clearRememberedAccount() {
+        vault.clearBiometricCredential()
+        context.dataStore.edit {
+            it.remove(Keys.REMEMBERED_EMAIL)
+            it.remove(Keys.REMEMBERED_DISPLAY_NAME)
+            it.remove(Keys.REMEMBERED_AVATAR_URI)
+            it.remove(Keys.AVATAR_URI)
+            it.remove(Keys.CUSTOM_DISPLAY_NAME)
+            it[Keys.BIOMETRICS_ENABLED] = false
+            it.remove(Keys.BIOMETRICS_EMAIL)
         }
     }
 
@@ -230,6 +299,7 @@ class SecurePreferences(private val context: Context) {
         biometricsEnabled: Boolean,
         biometricsEmail: String
     ) {
+        vault.setAppLockedSync(false)
         context.dataStore.edit {
             it[booleanPreferencesKey("${Keys.SETUP_COMPLETED_PREFIX}$userId")] = true
             it[stringPreferencesKey("${Keys.LOCK_POLICY_PREFIX}$userId")] = lockPolicy.key
@@ -249,6 +319,9 @@ class SecurePreferences(private val context: Context) {
     }
 
     suspend fun updateBiometrics(enabled: Boolean, userEmail: String) {
+        if (!enabled) {
+            vault.clearBiometricCredential()
+        }
         context.dataStore.edit {
             it[Keys.BIOMETRICS_ENABLED] = enabled
             if (enabled && userEmail.isNotBlank()) {
@@ -260,13 +333,21 @@ class SecurePreferences(private val context: Context) {
     }
 
     suspend fun touchLastActive() {
+        vault.setAppLockedSync(false)
         context.dataStore.edit {
             it[Keys.LAST_ACTIVE_MILLIS] = System.currentTimeMillis()
             it[Keys.MANUALLY_LOCKED] = false
         }
     }
 
+    suspend fun recordLastActiveTimestamp() {
+        context.dataStore.edit {
+            it[Keys.LAST_ACTIVE_MILLIS] = System.currentTimeMillis()
+        }
+    }
+
     suspend fun setManuallyLocked(locked: Boolean) {
+        vault.setAppLockedSync(locked)
         context.dataStore.edit { it[Keys.MANUALLY_LOCKED] = locked }
     }
 

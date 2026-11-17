@@ -29,9 +29,10 @@ import androidx.compose.foundation.clickable
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Assessment
 import androidx.compose.material.icons.filled.CalendarMonth
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -99,6 +100,27 @@ fun OfficerAnalyticsScreen(
                 onBack = onBack
             )
 
+            val context = LocalContext.current
+
+            fun openDateFilterPicker(initial: String, onPicked: (String) -> Unit) {
+                val cal = Calendar.getInstance()
+                try {
+                    if (initial.length == 10) {
+                        val parts = initial.split("-")
+                        cal.set(parts[0].toInt(), parts[1].toInt() - 1, parts[2].toInt())
+                    }
+                } catch (_: Exception) {}
+                DatePickerDialog(
+                    context,
+                    { _, y, m, d ->
+                        onPicked(String.format(Locale.US, "%04d-%02d-%02d", y, m + 1, d))
+                    },
+                    cal.get(Calendar.YEAR),
+                    cal.get(Calendar.MONTH),
+                    cal.get(Calendar.DAY_OF_MONTH)
+                ).show()
+            }
+
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -106,24 +128,20 @@ fun OfficerAnalyticsScreen(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    OutlinedTextField(
+                    OfficerCalendarFilterField(
+                        label = "FROM DATE",
                         value = fromDate,
-                        onValueChange = { fromDate = it },
-                        label = { Text("From (YYYY-MM-DD)") },
-                        singleLine = true,
-                        colors = glassFieldColors(),
-                        shape = RoundedCornerShape(16.dp),
+                        onOpenPicker = { openDateFilterPicker(fromDate) { fromDate = it } },
+                        onClear = { fromDate = "" },
                         modifier = Modifier
                             .weight(1f)
                             .testTag("officer_from_date")
                     )
-                    OutlinedTextField(
+                    OfficerCalendarFilterField(
+                        label = "TO DATE",
                         value = toDate,
-                        onValueChange = { toDate = it },
-                        label = { Text("To (YYYY-MM-DD)") },
-                        singleLine = true,
-                        colors = glassFieldColors(),
-                        shape = RoundedCornerShape(16.dp),
+                        onOpenPicker = { openDateFilterPicker(toDate) { toDate = it } },
+                        onClear = { toDate = "" },
                         modifier = Modifier
                             .weight(1f)
                             .testTag("officer_to_date")
@@ -286,5 +304,57 @@ private fun MetricMiniStat(label: String, value: Int, color: Color) {
             fontWeight = FontWeight.ExtraBold,
             color = color
         )
+    }
+}
+
+@Composable
+private fun OfficerCalendarFilterField(
+    label: String,
+    value: String,
+    onOpenPicker: () -> Unit,
+    onClear: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val ext = ComplianceTheme.extended
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(16.dp))
+            .background(ext.glassBottom)
+            .border(1.dp, if (value.isNotBlank()) MaterialTheme.colorScheme.primary.copy(alpha = 0.6f) else ext.glassRimEnd, RoundedCornerShape(16.dp))
+            .clickable(onClick = onOpenPicker)
+            .padding(start = 12.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = value.ifBlank { "Select date" },
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = if (value.isNotBlank()) FontWeight.Bold else FontWeight.Medium,
+                color = if (value.isNotBlank()) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        if (value.isNotBlank()) {
+            IconButton(onClick = onClear) {
+                Icon(
+                    imageVector = Icons.Default.Close,
+                    contentDescription = "Clear $label",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        } else {
+            IconButton(onClick = onOpenPicker) {
+                Icon(
+                    imageVector = Icons.Default.CalendarMonth,
+                    contentDescription = "Pick $label",
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            }
+        }
     }
 }

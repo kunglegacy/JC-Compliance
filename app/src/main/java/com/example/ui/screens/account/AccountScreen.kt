@@ -53,6 +53,7 @@ import com.example.ui.components.MicroLabel
 import com.example.ui.components.StatusPill
 import com.example.ui.components.VideoStyleChecklistRow
 import com.example.ui.theme.ComplianceTheme
+import java.io.File
 
 @Composable
 fun AccountScreen(
@@ -112,7 +113,7 @@ fun AccountScreen(
                         ) {
                             if (avatarUri.isNotBlank()) {
                                 AsyncImage(
-                                    model = Uri.parse(avatarUri),
+                                    model = if (avatarUri.startsWith("/")) File(avatarUri) else Uri.parse(avatarUri),
                                     contentDescription = "Profile Avatar",
                                     contentScale = ContentScale.Crop,
                                     modifier = Modifier

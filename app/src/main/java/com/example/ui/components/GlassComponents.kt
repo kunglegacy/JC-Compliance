@@ -1,6 +1,9 @@
 package com.example.ui.components
 
 import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.media.MediaMetadataRetriever
+import android.net.Uri
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -10,6 +13,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -55,6 +59,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
@@ -67,12 +72,14 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
@@ -87,6 +94,9 @@ import coil.compose.AsyncImage
 import com.example.data.model.ThemePreference
 import com.example.ui.theme.JCBestTheme
 import com.example.ui.theme.LocalCompliancePalette
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.File
 import kotlin.math.roundToInt
 
 data class EvidenceThumbItem(
@@ -95,6 +105,69 @@ data class EvidenceThumbItem(
     val mediaType: String,
     val previewModel: Any? = null
 )
+
+@Composable
+fun VideoFrameThumbnail(
+    source: Any?,
+    contentDescription: String?,
+    modifier: Modifier = Modifier,
+    badgeSize: Dp = 24.dp
+) {
+    val context = LocalContext.current
+    val p = LocalCompliancePalette.current
+    val frameBitmap by produceState<Bitmap?>(initialValue = null, key1 = source) {
+        value = withContext(Dispatchers.IO) {
+            val retriever = MediaMetadataRetriever()
+            try {
+                when (source) {
+                    is File -> if (source.exists()) retriever.setDataSource(source.absolutePath)
+                    is Uri -> retriever.setDataSource(context, source)
+                    is String -> when {
+                        source.startsWith("/") -> if (File(source).exists()) retriever.setDataSource(source)
+                        source.startsWith("http://") || source.startsWith("https://") ->
+                            retriever.setDataSource(source, emptyMap())
+                        source.isNotBlank() -> retriever.setDataSource(context, Uri.parse(source))
+                    }
+                }
+                retriever.getFrameAtTime(300_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    ?: retriever.frameAtTime
+            } catch (_: Exception) {
+                null
+            } finally {
+                runCatching { retriever.release() }
+            }
+        }
+    }
+
+    Box(
+        modifier = modifier.background(if (p.isDark) Color(0xFF10141D) else Color(0xFFDDE3EE)),
+        contentAlignment = Alignment.Center
+    ) {
+        if (frameBitmap != null) {
+            Image(
+                bitmap = frameBitmap!!.asImageBitmap(),
+                contentDescription = contentDescription,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+        Box(
+            modifier = Modifier
+                .size(badgeSize)
+                .clip(CircleShape)
+                .background(Color.Black.copy(alpha = 0.68f))
+                .border(1.dp, Color.White.copy(alpha = 0.5f), CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.PlayArrow,
+                contentDescription = contentDescription ?: "Video preview",
+                tint = Color.White,
+                modifier = Modifier.size(badgeSize * 0.64f)
+            )
+        }
+    }
+}
 
 @Composable
 fun Modifier.complianceGlassCard(radius: Dp = 24.dp): Modifier {

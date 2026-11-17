@@ -1,9 +1,11 @@
 package com.example.ui.screens.analytics
 
+import android.app.DatePickerDialog
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -23,13 +25,15 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.PendingActions
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.QueryStats
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -45,6 +49,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -62,8 +67,9 @@ import com.example.ui.components.GlassCapsuleProgressBar
 import com.example.ui.components.GlassCard
 import com.example.ui.components.GlowingPrimaryButton
 import com.example.ui.components.MicroLabel
-import com.example.ui.components.glassFieldColors
 import com.example.ui.theme.ComplianceTheme
+import java.util.Calendar
+import java.util.Locale
 
 @Composable
 fun AnalyticsScreen(
@@ -99,8 +105,28 @@ fun AnalyticsScreen(
         AnalysisEngine.calculateAnalysisSummary(scopedReports, staffList, selectedTerm, startDate, endDate)
     }
 
+    val context = LocalContext.current
     val activeRatio = if (summary.totalExceptions > 0) summary.activeCases.toFloat() / summary.totalExceptions else 0f
     val resolvedRatio = if (summary.totalExceptions > 0) summary.resolvedCases.toFloat() / summary.totalExceptions else 0f
+
+    fun openCustomDatePicker(initial: String, onPicked: (String) -> Unit) {
+        val cal = Calendar.getInstance()
+        try {
+            if (initial.length == 10) {
+                val parts = initial.split("-")
+                cal.set(parts[0].toInt(), parts[1].toInt() - 1, parts[2].toInt())
+            }
+        } catch (_: Exception) {}
+        DatePickerDialog(
+            context,
+            { _, y, m, d ->
+                onPicked(String.format(Locale.US, "%04d-%02d-%02d", y, m + 1, d))
+            },
+            cal.get(Calendar.YEAR),
+            cal.get(Calendar.MONTH),
+            cal.get(Calendar.DAY_OF_MONTH)
+        ).show()
+    }
 
     AtmosphericGlassBackground {
         LazyColumn(
@@ -180,23 +206,23 @@ fun AnalyticsScreen(
 
                     if (datePreset == "CUSTOM") {
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-                            OutlinedTextField(
+                            AnalyticsCalendarDateField(
+                                label = "FROM DATE",
                                 value = customStart,
-                                onValueChange = { customStart = it },
-                                label = { Text("From (YYYY-MM-DD)") },
-                                singleLine = true,
-                                colors = glassFieldColors(),
-                                shape = RoundedCornerShape(16.dp),
-                                modifier = Modifier.weight(1f)
+                                onOpenPicker = { openCustomDatePicker(customStart) { customStart = it } },
+                                onClear = { customStart = "" },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("analytics_from_date")
                             )
-                            OutlinedTextField(
+                            AnalyticsCalendarDateField(
+                                label = "TO DATE",
                                 value = customEnd,
-                                onValueChange = { customEnd = it },
-                                label = { Text("To (YYYY-MM-DD)") },
-                                singleLine = true,
-                                colors = glassFieldColors(),
-                                shape = RoundedCornerShape(16.dp),
-                                modifier = Modifier.weight(1f)
+                                onOpenPicker = { openCustomDatePicker(customEnd) { customEnd = it } },
+                                onClear = { customEnd = "" },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("analytics_to_date")
                             )
                         }
                     }
@@ -227,9 +253,9 @@ fun AnalyticsScreen(
                         )
                     }
                     CircularRingMetricTile(
-                        title = "Resolved Cases",
+                        title = "Accepted Cases",
                         value = "${summary.resolvedCases}",
-                        subtitle = "${(resolvedRatio * 100).toInt()}% closure rate",
+                        subtitle = "${(resolvedRatio * 100).toInt()}% acceptance rate",
                         progress = resolvedRatio,
                         icon = Icons.Default.CheckCircle,
                         ringColor = ext.emerald,
@@ -529,6 +555,58 @@ fun AnalyticsScreen(
                         Text("Generate & Share PDF Report", fontWeight = FontWeight.ExtraBold)
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AnalyticsCalendarDateField(
+    label: String,
+    value: String,
+    onOpenPicker: () -> Unit,
+    onClear: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val ext = ComplianceTheme.extended
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(16.dp))
+            .background(ext.glassBottom)
+            .border(1.dp, if (value.isNotBlank()) MaterialTheme.colorScheme.primary.copy(alpha = 0.6f) else ext.glassRimEnd, RoundedCornerShape(16.dp))
+            .clickable(onClick = onOpenPicker)
+            .padding(start = 12.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = value.ifBlank { "Select date" },
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = if (value.isNotBlank()) FontWeight.Bold else FontWeight.Medium,
+                color = if (value.isNotBlank()) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        if (value.isNotBlank()) {
+            IconButton(onClick = onClear) {
+                Icon(
+                    imageVector = Icons.Default.Close,
+                    contentDescription = "Clear $label",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        } else {
+            IconButton(onClick = onOpenPicker) {
+                Icon(
+                    imageVector = Icons.Default.CalendarMonth,
+                    contentDescription = "Pick $label",
+                    tint = MaterialTheme.colorScheme.primary
+                )
             }
         }
     }

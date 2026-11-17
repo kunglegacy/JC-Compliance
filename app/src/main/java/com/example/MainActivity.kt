@@ -1,15 +1,25 @@
 package com.example
 
+import android.Manifest
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.RenderEffect
+import android.graphics.Shader
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.core.content.ContextCompat
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
@@ -20,6 +30,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -47,21 +58,28 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Analytics
 import androidx.compose.material.icons.rounded.Assignment
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.CloudOff
 import androidx.compose.material.icons.rounded.Dashboard
+import androidx.compose.material.icons.rounded.EditNote
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.ReportProblem
 import androidx.compose.material.icons.rounded.VerifiedUser
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.NavigationRailItemDefaults
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Snackbar
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -78,6 +96,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.asComposeRenderEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -87,10 +106,18 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.model.ComplianceDivision
+import com.example.data.model.ReportFormDraft
+import com.example.data.model.ReportResolutionStatus
 import com.example.data.model.ReportScope
+import com.example.domain.ComplianceNotificationHelper
 import com.example.ui.components.LivingAtmosphericBackground
 import com.example.ui.components.NativeLoadingBar
 import com.example.ui.components.complianceGlassCard
@@ -102,6 +129,7 @@ import com.example.ui.screens.analytics.AnalyticsScreen
 import com.example.ui.screens.auth.LoginScreen
 import com.example.ui.screens.auth.PasswordResetScreen
 import com.example.ui.screens.dashboard.OverviewScreen
+import com.example.ui.screens.exceptions.AdminExceptionFeedback
 import com.example.ui.screens.exceptions.ExceptionsScreen
 import com.example.ui.screens.reports.ReportDetailSheet
 import com.example.ui.screens.reports.ReportFormSheet
@@ -112,6 +140,7 @@ import com.example.ui.theme.JCBestTheme
 import com.example.ui.theme.LocalCompliancePalette
 import com.example.ui.viewmodel.AuthScreenMode
 import com.example.ui.viewmodel.ComplianceViewModel
+import java.io.File
 
 class MainActivity : FragmentActivity() {
 
@@ -120,6 +149,7 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        handleNotificationIntent(intent)
 
         setContent {
             val prefsState by viewModel.preferencesState.collectAsStateWithLifecycle()
@@ -138,6 +168,22 @@ class MainActivity : FragmentActivity() {
                     drafts = drafts
                 )
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleNotificationIntent(intent)
+    }
+
+    private fun handleNotificationIntent(intent: Intent?) {
+        val targetTab = intent?.getStringExtra(ComplianceNotificationHelper.EXTRA_TARGET_TAB)
+        val reportId = intent?.getStringExtra(ComplianceNotificationHelper.EXTRA_REPORT_ID)
+        if (!targetTab.isNullOrBlank() || !reportId.isNullOrBlank()) {
+            viewModel.handleNotificationNavigation(targetTab, reportId)
+            intent?.removeExtra(ComplianceNotificationHelper.EXTRA_TARGET_TAB)
+            intent?.removeExtra(ComplianceNotificationHelper.EXTRA_REPORT_ID)
         }
     }
 }
@@ -169,6 +215,20 @@ private fun JCBestComplianceRoot(
     val snackbarHostState = remember { SnackbarHostState() }
     var resetPrefillEmail by remember { mutableStateOf("") }
     var initialReportsScope by remember { mutableStateOf(ReportScope.ALL) }
+
+    // System Lifecycle Observer for immediate & 24-hour App Lock enforcement
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, activity) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_STOP -> viewModel.onAppBackgrounded(activity.isChangingConfigurations)
+                Lifecycle.Event.ON_START -> viewModel.onAppForegrounded()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     // System Connectivity Observer
     DisposableEffect(context) {
@@ -239,7 +299,11 @@ private fun JCBestComplianceRoot(
                         rememberedEmail = prefsState.rememberedEmail,
                         rememberedDisplayName = prefsState.rememberedDisplayName,
                         rememberedAvatarUri = prefsState.rememberedAvatarUri,
-                        onSaveSupabaseConfig = viewModel::saveSupabaseConfig
+                        onSaveSupabaseConfig = viewModel::saveSupabaseConfig,
+                        activity = activity,
+                        biometricsQuickLoginAvailable = viewModel.hasBiometricQuickLogin(prefsState.rememberedEmail),
+                        onBiometricSignIn = viewModel::signInWithBiometrics,
+                        onSwitchAccount = viewModel::switchRememberedAccount
                     )
 
                     AuthScreenMode.PASSWORD_RESET -> PasswordResetScreen(
@@ -281,7 +345,10 @@ private fun JCBestComplianceRoot(
     }
 
     // App Lock Security Gate
-    if (viewModel.shouldShowAppLock(prefsState)) {
+    val showAppLock = remember(prefsState, uiState.lockCheckNonce) {
+        viewModel.shouldShowAppLock(prefsState)
+    }
+    if (showAppLock) {
         Scaffold(
             containerColor = p.bgBase,
             contentColor = p.textPrimary,
@@ -308,6 +375,27 @@ private fun JCBestComplianceRoot(
             }
         }
         return
+    }
+
+    // Android 13+ Native Push Notification Permission Request (only once signed in & unlocked)
+    var notificationPermissionPrompted by remember(session.userId) { mutableStateOf(false) }
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        viewModel.setAwaitingExternalActivity(false)
+    }
+    LaunchedEffect(session.userId, showAppLock, notificationPermissionPrompted) {
+        if (!showAppLock && !notificationPermissionPrompted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            notificationPermissionPrompted = true
+            val granted = ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                viewModel.setAwaitingExternalActivity(true)
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
     }
 
     // Back handler returns from secondary tabs to Overview
@@ -391,8 +479,8 @@ private fun JCBestComplianceRoot(
                             onLockAppNow = viewModel::lockAppNow,
                             onVerifyPassword = viewModel::verifyPasswordForSecurityAction,
                             onSetBiometricsEnabled = viewModel::setBiometricsEnabled,
-                            onSaveSupabaseConfig = viewModel::saveSupabaseConfig,
                             onNotify = viewModel::notifyMessage,
+                            onWillLaunchExternalPicker = { viewModel.setAwaitingExternalActivity(true) },
                             onBack = { viewModel.setAccountSubScreen(null) }
                         )
 
@@ -460,44 +548,78 @@ private fun JCBestComplianceRoot(
                             },
                             userRole = session.role,
                             currentUserId = session.userId,
+                            avatarUri = prefsState.avatarUri.ifBlank { session.avatarUrl },
                             onResolveSignedUrl = viewModel::resolveSignedEvidenceUrl
                         )
 
-                        uiState.activeTab == "my-exceptions" -> ExceptionsScreen(
-                            currentUserId = session.userId,
-                            reports = scopedReports,
-                            drafts = drafts,
-                            onNewException = { viewModel.openNewReportForm() },
-                            onConvertDraft = { draft -> viewModel.openNewReportForm(draft) },
-                            onDeleteDraft = viewModel::deleteDraft,
-                            onSaveCameraPhotoDraft = { file ->
-                                viewModel.saveOfflineDraftFile(
-                                    title = "Captured Photo Evidence",
-                                    notes = "",
-                                    file = file,
-                                    mediaType = "image",
-                                    mediaName = file.name
-                                )
-                            },
-                            onSaveCameraVideoDraft = { file ->
-                                viewModel.saveOfflineDraftFile(
-                                    title = "Captured Video Evidence",
-                                    notes = "",
-                                    file = file,
-                                    mediaType = "video",
-                                    mediaName = file.name
-                                )
-                            },
-                            onSavePickedMediaDraft = { uri, type ->
-                                viewModel.saveOfflineDraftUri(
-                                    title = "Picked ${type.replaceFirstChar { it.uppercase() }} Evidence",
-                                    notes = "",
-                                    uri = uri,
-                                    mediaType = type
-                                )
-                            },
-                            onSelectReport = viewModel::openReportDetail
-                        )
+                        uiState.activeTab == "my-exceptions" -> {
+                            val adminFeedbackByReportId = remember(scopedReports) {
+                                scopedReports.associate { r ->
+                                    r.id to AdminExceptionFeedback(
+                                        resolutionNote = r.resolutionNotes,
+                                        evidenceNotes = r.evidenceNotes,
+                                        isRejected = r.status == ReportResolutionStatus.REJECTED ||
+                                            r.status == ReportResolutionStatus.ACTION_REQUIRED,
+                                        isPending = r.isPending
+                                    )
+                                }
+                            }
+                            ExceptionsScreen(
+                                currentUserId = session.userId,
+                                reports = scopedReports,
+                                drafts = drafts,
+                                onNewException = { viewModel.openNewReportForm() },
+                                onConvertDraft = { draft -> viewModel.openNewReportForm(draft) },
+                                onDeleteDraft = viewModel::deleteDraft,
+                                onSaveCameraPhotoDraft = { file ->
+                                    viewModel.saveOfflineDraftFile(
+                                        title = "Captured Photo Evidence",
+                                        notes = "",
+                                        file = file,
+                                        mediaType = "image",
+                                        mediaName = file.name
+                                    )
+                                },
+                                onSaveCameraVideoDraft = { file ->
+                                    viewModel.saveOfflineDraftFile(
+                                        title = "Captured Video Evidence",
+                                        notes = "",
+                                        file = file,
+                                        mediaType = "video",
+                                        mediaName = file.name
+                                    )
+                                },
+                                onSavePickedMediaDraft = { uri, type ->
+                                    viewModel.saveOfflineDraftUri(
+                                        title = "Picked ${type.replaceFirstChar { it.uppercase() }} Evidence",
+                                        notes = "",
+                                        uri = uri,
+                                        mediaType = type
+                                    )
+                                },
+                                onSelectReport = viewModel::openReportDetail,
+                                onAddDraftMedia = { draft, pathOrUri, mediaType, _ ->
+                                    if (pathOrUri.startsWith("/")) {
+                                        viewModel.addMediaFileToDraft(draft.id, File(pathOrUri), mediaType)
+                                    } else {
+                                        viewModel.addMediaUriToDraft(draft.id, Uri.parse(pathOrUri), mediaType)
+                                    }
+                                },
+                                onRemoveDraftMedia = { draft, mediaId ->
+                                    viewModel.removeMediaItemFromDraft(draft.id, mediaId)
+                                },
+                                onConvertDraftWithMedia = { draft, selected ->
+                                    viewModel.openNewReportForm(draft, selected)
+                                },
+                                onOpenEditForm = viewModel::openEditReportForm,
+                                savedFormDraft = uiState.savedFormDraft,
+                                onResumeFormDraft = viewModel::resumeSavedReportDraft,
+                                onClearFormDraft = viewModel::clearInProgressReportDraft,
+                                adminFeedbackByReportId = adminFeedbackByReportId,
+                                onShowLimitWarning = { msg -> viewModel.notifyMessage(msg, isError = true) },
+                                onWillLaunchExternalPicker = { viewModel.setAwaitingExternalActivity(true) }
+                            )
+                        }
 
                         uiState.activeTab == "reports" && session.role.isAdminOrAbove -> ReportsScreen(
                             reports = uiState.reports,
@@ -526,7 +648,7 @@ private fun JCBestComplianceRoot(
                         uiState.activeTab == "account" -> AccountScreen(
                             session = session,
                             displayName = prefsState.customDisplayName.ifBlank { session.displayName },
-                            avatarUri = prefsState.avatarUri,
+                            avatarUri = prefsState.avatarUri.ifBlank { session.avatarUrl },
                             settings = uiState.systemSettings,
                             onOpenSettings = { viewModel.setAccountSubScreen("settings") },
                             onOpenChangePassword = { viewModel.setAccountSubScreen("change_password") },
@@ -561,6 +683,7 @@ private fun JCBestComplianceRoot(
                             },
                             userRole = session.role,
                             currentUserId = session.userId,
+                            avatarUri = prefsState.avatarUri.ifBlank { session.avatarUrl },
                             onResolveSignedUrl = viewModel::resolveSignedEvidenceUrl
                         )
                     }
@@ -646,7 +769,8 @@ private fun JCBestComplianceRoot(
                             onRemapCheck = viewModel::remapReportCheck,
                             onEdit = viewModel::openEditReportForm,
                             onDelete = viewModel::deleteReport,
-                            onResolveSignedUrl = viewModel::resolveSignedEvidenceUrl
+                            onResolveSignedUrl = viewModel::resolveSignedEvidenceUrl,
+                            onSaveEvidenceFeedback = viewModel::saveEvidenceFeedback
                         )
                     }
 
@@ -663,7 +787,18 @@ private fun JCBestComplianceRoot(
                             isLoading = uiState.isLoading,
                             onAddCustomCheck = viewModel::addCustomCheck,
                             onDismiss = viewModel::closeReportForm,
-                            onSubmit = { division, targetType, staff, classroom, subject, opScope, specificSubjectText, assignedLocation, check, incDate, exText, effText, localFile, pickedUri, evType, evName, cleanDraft ->
+                            preselectedDraftMedia = uiState.convertingDraftMedia,
+                            compressionProgress = uiState.compressionProgress,
+                            compressionLabel = uiState.compressionLabel,
+                            onWillLaunchExternalPicker = { viewModel.setAwaitingExternalActivity(true) },
+                            initialDraft = if (uiState.editingReport == null && uiState.convertingDraft == null) uiState.savedFormDraft else null,
+                            onDraftChanged = viewModel::saveInProgressReportDraft,
+                            onClearDraft = viewModel::clearInProgressReportDraft,
+                            onStageMediaFile = viewModel::stageReportMediaFile,
+                            onStageMediaUri = viewModel::stageReportMediaUri,
+                            onResolveSignedUrl = viewModel::resolveSignedEvidenceUrl,
+                            onMediaLimitError = { msg -> viewModel.notifyMessage(msg, isError = true) },
+                            onSubmit = { division, targetType, staff, classroom, subject, opScope, specificSubjectText, assignedLocation, check, incDate, exText, effText, attachments, cleanDraft ->
                                 viewModel.submitReport(
                                     existingReport = uiState.editingReport,
                                     division = division,
@@ -678,15 +813,189 @@ private fun JCBestComplianceRoot(
                                     incidentDate = incDate,
                                     exceptionText = exText,
                                     effectText = effText,
-                                    localFile = localFile,
-                                    pickedUri = pickedUri,
-                                    evidenceType = evType,
-                                    evidenceName = evName,
+                                    attachments = attachments,
                                     sourceDraft = uiState.convertingDraft,
                                     cleanDraftMediaOnComplete = cleanDraft,
                                     onComplete = {}
                                 )
                             }
+                        )
+                    }
+
+                    // Resume Unfinished Report Prompt (Glass Card)
+                    val resumeDraft = uiState.savedFormDraft
+                    if (uiState.showResumeReportPrompt && resumeDraft != null && !uiState.showReportForm) {
+                        ResumeReportingGlassDialog(
+                            draft = resumeDraft,
+                            onDismissCardOnly = viewModel::dismissResumeReportPrompt,
+                            onContinue = viewModel::resumeSavedReportDraft
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ResumeReportingGlassDialog(
+    draft: ReportFormDraft,
+    onDismissCardOnly: () -> Unit,
+    onContinue: () -> Unit
+) {
+    val p = LocalCompliancePalette.current
+    val divisionLabel = ComplianceDivision.fromAny(draft.divisionKey)?.label ?: "Academic"
+    val previewSummary = buildList {
+        add(divisionLabel)
+        draft.staffName?.takeIf { it.isNotBlank() }?.let { add(it) }
+        draft.checkName?.takeIf { it.isNotBlank() }?.let { add(it) }
+        draft.evidenceName?.takeIf { it.isNotBlank() }?.let { add("Evidence: $it") }
+    }.joinToString(" • ")
+
+    Dialog(
+        onDismissRequest = onDismissCardOnly,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 22.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(
+                modifier = Modifier
+                    .widthIn(max = 440.dp)
+                    .fillMaxWidth()
+                    .complianceGlassCard(28.dp)
+                    .padding(20.dp)
+                    .testTag("resume_reporting_glass_card"),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(44.dp)
+                            .clip(CircleShape)
+                            .background(p.tangerine.copy(alpha = if (p.isDark) 0.22f else 0.14f))
+                            .border(1.dp, p.tangerine.copy(alpha = 0.45f), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.EditNote,
+                            contentDescription = null,
+                            tint = p.tangerine,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "SAVED REPORT DRAFT",
+                            color = p.tangerine,
+                            fontSize = 10.sp,
+                            letterSpacing = 1.2.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                        Text(
+                            text = "Continue Reporting?",
+                            color = p.textPrimary,
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    IconButton(
+                        onClick = onDismissCardOnly,
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .testTag("dismiss_resume_report_card")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Close,
+                            contentDescription = "Remove card",
+                            tint = p.textSecondary
+                        )
+                    }
+                }
+
+                Text(
+                    text = "You were reporting an exception — do you want to continue? Dismissing this card keeps your saved entries safely offline.",
+                    color = p.textSecondary,
+                    fontSize = 13.sp,
+                    lineHeight = 19.sp
+                )
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(p.trackFill)
+                        .border(1.dp, p.borderBottom, RoundedCornerShape(16.dp))
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    if (previewSummary.isNotBlank()) {
+                        Text(
+                            text = previewSummary,
+                            color = p.textPrimary,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    if (draft.exceptionText.isNotBlank()) {
+                        Text(
+                            text = draft.exceptionText.trim(),
+                            color = p.textSecondary,
+                            fontSize = 12.sp,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onDismissCardOnly,
+                        shape = CircleShape,
+                        border = BorderStroke(1.dp, p.borderBottom),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("hide_resume_report_card")
+                    ) {
+                        Text(
+                            text = "Not Now",
+                            color = p.textPrimary,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 13.sp
+                        )
+                    }
+
+                    Button(
+                        onClick = onContinue,
+                        shape = CircleShape,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = p.tangerine,
+                            contentColor = Color.White
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("continue_reporting_button")
+                    ) {
+                        Text(
+                            text = "Continue",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp
                         )
                     }
                 }
@@ -868,10 +1177,11 @@ private fun FloatingGlassBottomDock(
     modifier: Modifier = Modifier
 ) {
     val p = LocalCompliancePalette.current
-    val dockFillTop = if (p.isDark) Color(0xFF1A1F2B).copy(alpha = 0.94f) else Color(0xFFFFFFFF).copy(alpha = 0.94f)
-    val dockFillBottom = if (p.isDark) Color(0xFF10131C).copy(alpha = 0.96f) else Color(0xFFF1F5FA).copy(alpha = 0.96f)
+    val dockFillTop = if (p.isDark) Color(0xFF161B26).copy(alpha = 0.90f) else Color(0xFFFFFFFF).copy(alpha = 0.92f)
+    val dockFillBottom = if (p.isDark) Color(0xFF0E121B).copy(alpha = 0.95f) else Color(0xFFEEF3FA).copy(alpha = 0.95f)
+    val topLuminousRim = if (p.isDark) Color.White.copy(alpha = 0.24f) else Color.White.copy(alpha = 0.95f)
 
-    // Soft atmospheric fade scrim behind the dock so scrolling text never clashes
+    // Frosted smoked-glass dock with atmospheric scrim + blurred backdrop layer + 1.dp luminous top border
     Box(
         modifier = modifier
             .fillMaxWidth()
@@ -888,27 +1198,76 @@ private fun FloatingGlassBottomDock(
             .padding(horizontal = 14.dp, vertical = 10.dp),
         contentAlignment = Alignment.Center
     ) {
-        Row(
+        Box(
             modifier = Modifier
                 .widthIn(max = 540.dp)
                 .fillMaxWidth()
                 .shadow(
-                    elevation = if (p.isDark) 22.dp else 16.dp,
+                    elevation = if (p.isDark) 24.dp else 18.dp,
                     shape = RoundedCornerShape(30.dp),
                     ambientColor = p.shadow,
                     spotColor = p.shadow
                 )
                 .clip(RoundedCornerShape(30.dp))
-                .background(Brush.verticalGradient(listOf(dockFillTop, dockFillBottom)))
-                .border(
-                    width = 1.dp,
-                    brush = Brush.verticalGradient(listOf(p.borderTop, p.borderBottom)),
-                    shape = RoundedCornerShape(30.dp)
-                )
-                .padding(horizontal = 6.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly,
-            verticalAlignment = Alignment.CenterVertically
         ) {
+            // Frosted smoked-glass backdrop layer (real RenderEffect blur on Android 12+ so icons/labels remain razor sharp)
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .then(
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            Modifier.graphicsLayer {
+                                renderEffect = RenderEffect
+                                    .createBlurEffect(28f, 28f, Shader.TileMode.CLAMP)
+                                    .asComposeRenderEffect()
+                            }
+                        } else {
+                            Modifier
+                        }
+                    )
+                    .background(Brush.verticalGradient(listOf(dockFillTop, dockFillBottom)))
+            )
+
+            // 1.dp luminous outer glass border + top specular highlight
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .border(
+                        width = 1.dp,
+                        brush = Brush.verticalGradient(
+                            listOf(
+                                topLuminousRim,
+                                p.borderBottom
+                            )
+                        ),
+                        shape = RoundedCornerShape(30.dp)
+                    )
+            ) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .fillMaxWidth()
+                        .padding(horizontal = 24.dp)
+                        .height(1.dp)
+                        .background(
+                            Brush.horizontalGradient(
+                                listOf(
+                                    Color.Transparent,
+                                    topLuminousRim,
+                                    Color.Transparent
+                                )
+                            )
+                        )
+                )
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 6.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
             items.forEach { item ->
                 val selected = activeTab == item.route
                 val tint by animateColorAsState(
@@ -970,6 +1329,7 @@ private fun FloatingGlassBottomDock(
                     )
                 }
             }
+        }
         }
     }
 }

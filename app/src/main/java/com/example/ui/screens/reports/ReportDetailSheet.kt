@@ -1,5 +1,6 @@
 package com.example.ui.screens.reports
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -17,6 +18,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Attachment
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Feedback
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.Visibility
@@ -33,6 +35,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -53,6 +56,7 @@ import com.example.data.model.ComplianceReport
 import com.example.data.model.ReportResolutionStatus
 import com.example.data.model.UserRole
 import com.example.domain.AnalysisEngine
+import com.example.ui.components.EditedBadgePill
 import com.example.ui.components.GlassCard
 import com.example.ui.components.GlowingPrimaryButton
 import com.example.ui.components.MicroLabel
@@ -74,7 +78,8 @@ fun ReportDetailSheet(
     onRemapCheck: (ComplianceReport, ComplianceCheck) -> Unit,
     onEdit: (ComplianceReport) -> Unit,
     onDelete: (ComplianceReport) -> Unit,
-    onResolveSignedUrl: suspend (String) -> Result<String>
+    onResolveSignedUrl: suspend (String) -> Result<String>,
+    onSaveEvidenceFeedback: (ComplianceReport, Int, EvidenceVerdict, String?) -> Unit = { _, _, _, _ -> }
 ) {
     val ext = ComplianceTheme.extended
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -110,8 +115,14 @@ fun ReportDetailSheet(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 MonoCodeText(report.reportNumber)
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    SeenBadge(report.isSeen)
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (report.isEdited) {
+                        EditedBadgePill()
+                    }
+                    SeenBadge(report.isSeen, report.isPending)
                     ResolutionBadge(report.status)
                 }
             }
@@ -154,8 +165,76 @@ fun ReportDetailSheet(
                 )
             }
 
+            val evidenceUrls = remember(report.id, report.evidenceUrl, report.evidenceUrls, report.evidenceType) {
+                report.evidenceUrls.ifEmpty {
+                    listOfNotNull(report.evidenceUrl?.takeIf { it.isNotBlank() && report.evidenceType != "none" })
+                }
+            }
+            val evidenceItems = remember(report.id, evidenceUrls, report.evidenceTypes, report.evidenceType, report.evidenceName, report.complianceCheck, report.reporterName) {
+                evidenceUrls.mapIndexed { idx, path ->
+                    val type = report.evidenceTypes.getOrNull(idx)?.takeIf { it.isNotBlank() && it != "none" }
+                        ?: report.evidenceType.takeIf { it.isNotBlank() && it != "none" }
+                        ?: "image"
+                    EvidencePreviewItem(
+                        id = "${report.id}_ev_$idx",
+                        storedPath = path,
+                        mediaType = type,
+                        title = if (evidenceUrls.size > 1) "${report.evidenceName ?: report.complianceCheck} (${idx + 1}/${evidenceUrls.size})"
+                        else (report.evidenceName ?: report.complianceCheck),
+                        inspectorName = report.reporterName.ifBlank { "Compliance Officer" }
+                    )
+                }
+            }
+
+            // Visible Directorate Review / Rejection Notes for Reporters & Admins
+            if (!report.resolutionNotes.isNullOrBlank() || report.evidenceNotes.isNotEmpty()) {
+                val isRejectedOrFlagged = report.status == ReportResolutionStatus.REJECTED ||
+                    report.status == ReportResolutionStatus.ACTION_REQUIRED
+                val accent = if (isRejectedOrFlagged) ext.rose else ext.amber
+                Surface(
+                    color = accent.copy(alpha = 0.12f),
+                    shape = RoundedCornerShape(18.dp),
+                    border = BorderStroke(1.dp, accent.copy(alpha = 0.42f)),
+                    modifier = Modifier.fillMaxWidth().testTag("report_detail_admin_feedback")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(Icons.Default.Feedback, contentDescription = null, tint = accent)
+                            MicroLabel(
+                                text = when {
+                                    isRejectedOrFlagged -> "Directorate Rejection / Action Feedback"
+                                    report.isPending -> "Pending • Admin / Media Note"
+                                    else -> "Directorate Review Notes"
+                                },
+                                color = accent
+                            )
+                        }
+                        if (!report.resolutionNotes.isNullOrBlank()) {
+                            Text(
+                                text = report.resolutionNotes,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                        report.evidenceNotes.forEach { evNote ->
+                            Text(
+                                text = "• $evNote",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+
             // Evidence Viewer Trigger
-            if (!report.evidenceUrl.isNullOrBlank() && report.evidenceType != "none") {
+            if (evidenceItems.isNotEmpty()) {
                 OutlinedButton(
                     onClick = { showEvidenceViewer = true },
                     shape = CircleShape,
@@ -166,12 +245,16 @@ fun ReportDetailSheet(
                 ) {
                     Icon(Icons.Default.Attachment, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
-                    Text("View ${report.evidenceType.replaceFirstChar { it.uppercase() }} Evidence", fontWeight = FontWeight.Bold)
+                    Text(
+                        text = if (evidenceItems.size > 1) "View ${evidenceItems.size} Evidence Items"
+                        else "View ${evidenceItems.first().mediaType.replaceFirstChar { it.uppercase() }} Evidence",
+                        fontWeight = FontWeight.Bold
+                    )
                 }
             }
 
             // Action Controls
-            val canEdit = userRole.isAdminOrAbove || !report.isSeen
+            val canEdit = userRole.isAdminOrAbove || report.canUserEdit
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedButton(
                     onClick = { if (canEdit) onEdit(report) },
@@ -184,15 +267,25 @@ fun ReportDetailSheet(
                 ) {
                     Icon(if (canEdit) Icons.Default.Edit else Icons.Default.Lock, contentDescription = null)
                     Spacer(Modifier.width(6.dp))
-                    Text(if (canEdit) "Edit" else "Reviewed (Locked)")
+                    Text(
+                        when {
+                            canEdit && report.isActionRequired -> "Update (Action Required)"
+                            canEdit && report.isPending -> "Update (Pending)"
+                            canEdit -> "Edit"
+                            report.isAccepted -> "Accepted (Locked)"
+                            else -> "Rejected (Locked)"
+                        },
+                        maxLines = 1
+                    )
                 }
 
                 if (userRole.isAdminOrAbove) {
+                    val markAsReviewed = !report.isSeen || report.isPending
                     Button(
                         onClick = { onToggleSeen(report) },
                         shape = CircleShape,
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (report.isSeen) ext.amber else ext.emerald,
+                            containerColor = if (markAsReviewed) ext.emerald else ext.amber,
                             contentColor = if (ext.isDark) Color(0xFF0A0C10) else Color.White
                         ),
                         modifier = Modifier
@@ -200,16 +293,24 @@ fun ReportDetailSheet(
                             .height(48.dp)
                             .testTag("toggle_seen_button")
                     ) {
-                        Icon(if (report.isSeen) Icons.Default.VisibilityOff else Icons.Default.Visibility, contentDescription = null)
+                        Icon(if (markAsReviewed) Icons.Default.Visibility else Icons.Default.VisibilityOff, contentDescription = null)
                         Spacer(Modifier.width(6.dp))
-                        Text(if (report.isSeen) "Mark Unseen" else "Mark Seen", fontWeight = FontWeight.Bold)
+                        Text(
+                            text = when {
+                                report.isPending -> "Accept & Mark Seen"
+                                report.isSeen -> "Mark Unseen"
+                                else -> "Mark Seen"
+                            },
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1
+                        )
                     }
                 }
             }
 
             if (userRole.isAdminOrAbove) {
                 HorizontalDivider(color = ext.glassRimEnd)
-                MicroLabel("Admin Moderation & Resolution")
+                MicroLabel("Admin Moderation & Status")
 
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(
@@ -217,7 +318,7 @@ fun ReportDetailSheet(
                         shape = CircleShape,
                         modifier = Modifier.weight(1f)
                     ) {
-                        Text("Stage: ${selectedStatus.label}")
+                        Text("Status: ${selectedStatus.label}")
                         DropdownMenu(expanded = showStatusMenu, onDismissRequest = { showStatusMenu = false }) {
                             ReportResolutionStatus.entries.forEach { st ->
                                 DropdownMenuItem(
@@ -256,7 +357,7 @@ fun ReportDetailSheet(
                 OutlinedTextField(
                     value = resolutionNotes,
                     onValueChange = { resolutionNotes = it },
-                    label = { Text("Directorate Resolution Notes") },
+                    label = { Text("Directorate Review / Action Notes") },
                     minLines = 2,
                     colors = glassFieldColors(),
                     shape = RoundedCornerShape(16.dp),
@@ -269,7 +370,7 @@ fun ReportDetailSheet(
                         .fillMaxWidth()
                         .testTag("save_resolution_button")
                 ) {
-                    Text("Save Resolution Update", fontWeight = FontWeight.ExtraBold)
+                    Text("Save Status Update", fontWeight = FontWeight.ExtraBold)
                 }
 
                 if (userRole.isSuperAdmin) {
@@ -293,36 +394,63 @@ fun ReportDetailSheet(
         }
     }
 
-    if (showEvidenceViewer && !report.evidenceUrl.isNullOrBlank()) {
+    val evidenceUrlsForViewer = report.evidenceUrls.ifEmpty {
+        listOfNotNull(report.evidenceUrl?.takeIf { it.isNotBlank() && report.evidenceType != "none" })
+    }
+    val viewerItems = remember(
+        report.id,
+        evidenceUrlsForViewer,
+        report.evidenceTypes,
+        report.evidenceType,
+        report.evidenceName,
+        report.complianceCheck,
+        report.reporterName,
+        report.evidenceNotes
+    ) {
+        evidenceUrlsForViewer.mapIndexed { idx, path ->
+            val type = report.evidenceTypes.getOrNull(idx)?.takeIf { it.isNotBlank() && it != "none" }
+                ?: report.evidenceType.takeIf { it.isNotBlank() && it != "none" }
+                ?: "image"
+            val itemNote = report.evidenceNotes
+                .filter { it.startsWith("[Evidence #${idx + 1}") }
+                .joinToString("\n")
+                .takeIf { it.isNotBlank() }
+            EvidencePreviewItem(
+                id = "${report.id}_ev_$idx",
+                storedPath = path,
+                mediaType = type,
+                title = if (evidenceUrlsForViewer.size > 1) "${report.evidenceName ?: report.complianceCheck} (${idx + 1}/${evidenceUrlsForViewer.size})"
+                else (report.evidenceName ?: report.complianceCheck),
+                inspectorName = report.reporterName.ifBlank { "Compliance Officer" },
+                existingNote = itemNote
+            )
+        }
+    }
+
+    if (showEvidenceViewer && viewerItems.isNotEmpty()) {
         EvidenceViewerDialog(
-            storedPath = report.evidenceUrl,
-            evidenceType = report.evidenceType,
+            storedPath = viewerItems.first().storedPath,
+            evidenceType = viewerItems.first().mediaType,
             evidenceName = report.evidenceName ?: report.complianceCheck,
             inspectorName = report.reporterName.ifBlank { "Compliance Officer" },
+            items = viewerItems,
+            showModerationControls = userRole.isAdminOrAbove,
             onResolveSignedUrl = onResolveSignedUrl,
-            onVerdict = { _, verdict, note ->
+            onVerdict = { item, verdict, note ->
+                val idx = viewerItems.indexOfFirst { it.id == item.id }.coerceAtLeast(0)
                 when (verdict) {
-                    EvidenceVerdict.PASS -> {
-                        selectedStatus = ReportResolutionStatus.RESOLVED
-                        if (userRole.isAdminOrAbove) {
-                            onUpdateResolution(report, ReportResolutionStatus.RESOLVED, resolutionNotes)
-                        }
-                    }
-                    EvidenceVerdict.FLAG -> {
-                        selectedStatus = ReportResolutionStatus.ACTION_REQUIRED
-                        if (userRole.isAdminOrAbove) {
-                            onUpdateResolution(report, ReportResolutionStatus.ACTION_REQUIRED, resolutionNotes)
-                        }
-                    }
+                    EvidenceVerdict.PASS -> selectedStatus = ReportResolutionStatus.ACCEPTED
+                    EvidenceVerdict.FLAG -> selectedStatus = ReportResolutionStatus.ACTION_REQUIRED
                     EvidenceVerdict.NOTE -> {
+                        selectedStatus = ReportResolutionStatus.PENDING
                         if (!note.isNullOrBlank()) {
-                            val updatedNotes = if (resolutionNotes.isBlank()) note else "$resolutionNotes\n$note"
-                            resolutionNotes = updatedNotes
-                            if (userRole.isAdminOrAbove) {
-                                onUpdateResolution(report, selectedStatus, updatedNotes)
-                            }
+                            val tag = "[Evidence #${idx + 1} • ${verdict.name}] ${note.trim()}"
+                            resolutionNotes = if (resolutionNotes.isBlank()) tag else "$resolutionNotes\n$tag"
                         }
                     }
+                }
+                if (userRole.isAdminOrAbove) {
+                    onSaveEvidenceFeedback(report, idx, verdict, note)
                 }
             },
             onDismiss = { showEvidenceViewer = false }

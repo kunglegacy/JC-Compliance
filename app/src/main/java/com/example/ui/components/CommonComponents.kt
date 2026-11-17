@@ -27,6 +27,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -61,6 +62,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -538,12 +540,12 @@ fun StatusPill(
 }
 
 @Composable
-fun SeenBadge(isSeen: Boolean) {
+fun SeenBadge(isSeen: Boolean, isPending: Boolean = false) {
     val ext = ComplianceTheme.extended
-    if (isSeen) {
-        StatusPill("SEEN", ext.emerald, ext.emeraldContainer, Icons.Default.Visibility)
-    } else {
-        StatusPill("UNSEEN", ext.amber, ext.amberContainer, Icons.Default.VisibilityOff)
+    when {
+        isPending -> StatusPill("PENDING", ext.amber, ext.amberContainer, Icons.Default.Schedule)
+        isSeen -> StatusPill("REVIEWED", ext.emerald, ext.emeraldContainer, Icons.Default.Visibility)
+        else -> StatusPill("UNSEEN", ext.amber, ext.amberContainer, Icons.Default.VisibilityOff)
     }
 }
 
@@ -551,13 +553,38 @@ fun SeenBadge(isSeen: Boolean) {
 fun ResolutionBadge(status: ReportResolutionStatus) {
     val ext = ComplianceTheme.extended
     val (fg, bg) = when (status) {
-        ReportResolutionStatus.RESOLVED -> ext.emerald to ext.emeraldContainer
+        ReportResolutionStatus.ACCEPTED -> ext.emerald to ext.emeraldContainer
         ReportResolutionStatus.REJECTED -> ext.rose to ext.roseContainer
-        ReportResolutionStatus.ESCALATED, ReportResolutionStatus.ACTION_REQUIRED -> ext.amber to ext.amberContainer
-        ReportResolutionStatus.IN_REVIEW -> ext.indigo to ext.indigoContainer
+        ReportResolutionStatus.ACTION_REQUIRED -> Color(0xFFFF6B2C) to Color(0x28FF6B2C)
+        ReportResolutionStatus.PENDING -> ext.amber to ext.amberContainer
         ReportResolutionStatus.OPEN -> MaterialTheme.colorScheme.primary to MaterialTheme.colorScheme.primaryContainer
     }
     StatusPill(status.label.uppercase(), fg, bg)
+}
+
+@Composable
+fun EditedBadgePill(modifier: Modifier = Modifier) {
+    val ext = ComplianceTheme.extended
+    val fg = MaterialTheme.colorScheme.onSurfaceVariant
+    val bg = if (ext.isDark) Color.White.copy(alpha = 0.08f) else Color(0xFF0F172A).copy(alpha = 0.06f)
+    Surface(
+        modifier = modifier,
+        color = bg,
+        shape = RoundedCornerShape(50.dp),
+        border = BorderStroke(0.7.dp, fg.copy(alpha = 0.25f))
+    ) {
+        Text(
+            text = "Edited",
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontSize = 10.sp,
+                fontStyle = FontStyle.Italic
+            ),
+            color = fg,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+        )
+    }
 }
 
 @Composable

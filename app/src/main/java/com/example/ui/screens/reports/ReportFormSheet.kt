@@ -1,9 +1,8 @@
 package com.example.ui.screens.reports
 
 import android.Manifest
-import androidx.compose.ui.Modifier
-import android.content.pm.PackageManager
 import android.app.DatePickerDialog
+import android.content.pm.PackageManager
 import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
@@ -38,11 +37,12 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PhotoLibrary
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
@@ -52,6 +52,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -60,13 +61,17 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
@@ -75,13 +80,11 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import coil.compose.AsyncImage
-import java.util.Calendar
-import java.util.Locale
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import coil.compose.AsyncImage
 import com.example.data.local.AcademicWeekEngine
 import com.example.data.local.ComplianceAutoFillEngine
 import com.example.data.local.ComplianceTaxonomy
@@ -89,15 +92,23 @@ import com.example.data.model.Classroom
 import com.example.data.model.ComplianceCheck
 import com.example.data.model.ComplianceDivision
 import com.example.data.model.ComplianceReport
+import com.example.data.model.DraftMediaItem
+import com.example.data.model.MediaUploadLimits
 import com.example.data.model.OfflineDraft
+import com.example.data.model.ReportEvidenceAttachment
+import com.example.data.model.ReportFormDraft
 import com.example.data.model.StaffMember
 import com.example.data.model.SubjectItem
 import com.example.ui.components.GlowingPrimaryButton
 import com.example.ui.components.MicroLabel
 import com.example.ui.components.PreSubmitAuditSheet
+import com.example.ui.components.VideoFrameThumbnail
 import com.example.ui.components.glassFieldColors
 import com.example.ui.theme.ComplianceTheme
+import kotlinx.coroutines.launch
 import java.io.File
+import java.util.Calendar
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -112,6 +123,17 @@ fun ReportFormSheet(
     isLoading: Boolean,
     onAddCustomCheck: (ComplianceDivision, String, String) -> Unit,
     onDismiss: () -> Unit,
+    preselectedDraftMedia: List<DraftMediaItem> = emptyList(),
+    compressionProgress: Float? = null,
+    compressionLabel: String? = null,
+    onWillLaunchExternalPicker: () -> Unit = {},
+    initialDraft: ReportFormDraft? = null,
+    onDraftChanged: (ReportFormDraft) -> Unit = {},
+    onClearDraft: () -> Unit = {},
+    onStageMediaFile: suspend (File) -> String? = { it.absolutePath },
+    onStageMediaUri: suspend (Uri) -> Pair<String, String>? = { null },
+    onResolveSignedUrl: suspend (String) -> Result<String> = { Result.failure(Exception("Unavailable")) },
+    onMediaLimitError: (String) -> Unit = {},
     onSubmit: (
         division: ComplianceDivision,
         targetType: String,
@@ -125,63 +147,100 @@ fun ReportFormSheet(
         incidentDate: String,
         exceptionText: String,
         effectText: String,
-        localFile: File?,
-        pickedUri: Uri?,
-        evidenceType: String,
-        evidenceName: String?,
+        attachments: List<ReportEvidenceAttachment>,
         cleanDraftMedia: Boolean
     ) -> Unit
 ) {
     val context = LocalContext.current
     val ext = ComplianceTheme.extended
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val coroutineScope = rememberCoroutineScope()
+
+    val draftToRestore = if (editingReport == null && sourceDraft == null) initialDraft else null
+    var userTouched by remember { mutableStateOf(false) }
 
     var division by remember {
         mutableStateOf(
-            ComplianceDivision.fromAny(editingReport?.division) ?: ComplianceDivision.ACADEMIC
+            ComplianceDivision.fromAny(editingReport?.division ?: draftToRestore?.divisionKey)
+                ?: ComplianceDivision.ACADEMIC
         )
     }
-    var targetType by remember { mutableStateOf(editingReport?.targetType ?: "staff") }
-    var classTierFilter by remember { mutableStateOf("All Tiers") }
-    var staffSearch by remember { mutableStateOf("") }
+    var targetType by remember {
+        mutableStateOf(editingReport?.targetType ?: draftToRestore?.targetType ?: "staff")
+    }
+    var classTierFilter by remember {
+        mutableStateOf(draftToRestore?.classTierFilter ?: "All Tiers")
+    }
+    var staffSearch by remember {
+        mutableStateOf(draftToRestore?.staffSearch ?: "")
+    }
     var selectedStaff by remember {
         mutableStateOf(
             editingReport?.staffId?.let { id -> staffList.firstOrNull { it.id == id } }
                 ?: editingReport?.staffName?.let { n -> staffList.firstOrNull { it.name.equals(n, true) } }
+                ?: draftToRestore?.staffId?.let { id -> staffList.firstOrNull { it.id == id } }
+                ?: draftToRestore?.staffCode?.let { code -> staffList.firstOrNull { it.staffCode.equals(code, true) } }
+                ?: draftToRestore?.staffName?.let { n -> staffList.firstOrNull { it.name.equals(n, true) } }
         )
     }
     var selectedClass by remember {
         mutableStateOf(
             editingReport?.classId?.let { id -> classes.firstOrNull { it.id == id } }
                 ?: editingReport?.className?.let { n -> classes.firstOrNull { it.name.equals(n, true) } }
+                ?: draftToRestore?.classId?.let { id -> classes.firstOrNull { it.id == id } }
+                ?: draftToRestore?.className?.let { n -> classes.firstOrNull { it.name.equals(n, true) } }
         )
     }
     var selectedSubject by remember {
         mutableStateOf(
             editingReport?.subjectId?.let { id -> subjects.firstOrNull { it.id == id } }
                 ?: editingReport?.subject?.let { n -> subjects.firstOrNull { it.name.equals(n, true) } }
+                ?: draftToRestore?.subjectId?.let { id -> subjects.firstOrNull { it.id == id } }
+                ?: draftToRestore?.subjectName?.let { n -> subjects.firstOrNull { it.name.equals(n, true) } }
         )
     }
 
-    var operationScope by remember { mutableStateOf(editingReport?.category ?: "Maintenance") }
-    var selectedBus by remember { mutableStateOf("Bus 1") }
-    var opPersonOrLocation by remember { mutableStateOf(editingReport?.assignedLocation.orEmpty()) }
-    var studentNamesArm by remember { mutableStateOf("") }
+    var operationScope by remember {
+        mutableStateOf(editingReport?.category ?: draftToRestore?.operationScope ?: "Maintenance")
+    }
+    var selectedBus by remember {
+        mutableStateOf(draftToRestore?.selectedBus ?: "Bus 1")
+    }
+    var opPersonOrLocation by remember {
+        mutableStateOf(editingReport?.assignedLocation ?: draftToRestore?.opPersonOrLocation.orEmpty())
+    }
+    var studentNamesArm by remember {
+        mutableStateOf(draftToRestore?.studentNamesArm.orEmpty())
+    }
     var incidentDate by remember {
-        mutableStateOf(editingReport?.incidentDate ?: sourceDraft?.incidentDate ?: AcademicWeekEngine.todayIso())
+        mutableStateOf(
+            editingReport?.incidentDate
+                ?: sourceDraft?.incidentDate?.takeIf { it.isNotBlank() }
+                ?: draftToRestore?.incidentDate?.takeIf { it.isNotBlank() }
+                ?: AcademicWeekEngine.todayIso()
+        )
     }
     var exceptionText by remember {
-        mutableStateOf(editingReport?.exceptionText ?: sourceDraft?.notes.orEmpty())
+        mutableStateOf(
+            editingReport?.exceptionText
+                ?: sourceDraft?.notes?.takeIf { it.isNotBlank() }
+                ?: draftToRestore?.exceptionText.orEmpty()
+        )
     }
-    var effectText by remember { mutableStateOf(editingReport?.effectText.orEmpty()) }
+    var effectText by remember {
+        mutableStateOf(editingReport?.effectText ?: draftToRestore?.effectText.orEmpty())
+    }
 
     val checks = remember(division, operationScope, customChecks) {
         ComplianceTaxonomy.getApplicableChecks(division, operationScope, customChecks)
     }
     var selectedCheck by remember(division, operationScope) {
         mutableStateOf(
-            checks.firstOrNull { it.name.equals(editingReport?.complianceCheck, true) || it.id == editingReport?.checkId }
-                ?: checks.firstOrNull()
+            checks.firstOrNull {
+                it.name.equals(editingReport?.complianceCheck, true) ||
+                    it.id == editingReport?.checkId ||
+                    (draftToRestore != null && (it.id == draftToRestore.checkId || it.name.equals(draftToRestore.checkName, true)))
+            } ?: checks.firstOrNull()
         )
     }
 
@@ -193,47 +252,276 @@ fun ReportFormSheet(
     var showCustomCheckDialog by remember { mutableStateOf(false) }
     var showNoEvidenceWarning by remember { mutableStateOf(false) }
     var cleanDraftMedia by remember { mutableStateOf(true) }
+    var mediaLimitBanner by remember { mutableStateOf<String?>(null) }
 
-    // Media attachments
-    var localMediaFile by remember {
-        mutableStateOf(sourceDraft?.mediaPath?.let { File(it) }?.takeIf { it.exists() })
+    // Unified evidence attachments for BOTH Create and Edit modes (Max 4 Images, Max 2 Videos)
+    var attachedEvidence by remember(
+        editingReport?.id,
+        sourceDraft?.id,
+        preselectedDraftMedia,
+        draftToRestore?.updatedAtMillis
+    ) {
+        val initial = buildList {
+            if (editingReport != null) {
+                val urls = editingReport.evidenceUrls.ifEmpty {
+                    listOfNotNull(editingReport.evidenceUrl?.takeIf { it.isNotBlank() && editingReport.evidenceType != "none" })
+                }
+                urls.forEachIndexed { idx, path ->
+                    val type = editingReport.evidenceTypes.getOrNull(idx)?.takeIf { it.isNotBlank() && it != "none" }
+                        ?: editingReport.evidenceType.takeIf { it.isNotBlank() && it != "none" }
+                        ?: "image"
+                    add(
+                        ReportEvidenceAttachment(
+                            id = "cloud_${editingReport.id}_$idx",
+                            pathOrUri = path,
+                            mediaType = type,
+                            displayName = path.substringAfterLast('/').ifBlank { "Cloud ${type.replaceFirstChar { c -> c.uppercase() }} #${idx + 1}" },
+                            isExistingCloud = true
+                        )
+                    )
+                }
+            } else {
+                val draftItems = when {
+                    preselectedDraftMedia.isNotEmpty() -> preselectedDraftMedia
+                    sourceDraft != null && sourceDraft.mediaItems.isNotEmpty() -> sourceDraft.mediaItems
+                    !sourceDraft?.mediaPath.isNullOrBlank() -> listOf(
+                        DraftMediaItem(
+                            id = "src_${sourceDraft!!.id}",
+                            pathOrUri = sourceDraft.mediaPath!!,
+                            mediaType = sourceDraft.mediaType.ifBlank { "image" },
+                            capturedAtLabel = sourceDraft.mediaName ?: "Draft media"
+                        )
+                    )
+                    draftToRestore?.selectedDraftMedia?.isNotEmpty() == true -> draftToRestore.selectedDraftMedia
+                    !draftToRestore?.localMediaPath.isNullOrBlank() -> listOf(
+                        DraftMediaItem(
+                            id = "restored_${draftToRestore!!.updatedAtMillis}",
+                            pathOrUri = draftToRestore.localMediaPath!!,
+                            mediaType = draftToRestore.evidenceType.takeIf { it != "none" } ?: "image",
+                            capturedAtLabel = draftToRestore.evidenceName ?: "Restored media"
+                        )
+                    )
+                    else -> emptyList()
+                }
+                draftItems.forEachIndexed { idx, dm ->
+                    val name = if (dm.pathOrUri.startsWith("/")) {
+                        File(dm.pathOrUri).name.ifBlank { dm.capturedAtLabel }
+                    } else {
+                        dm.capturedAtLabel.ifBlank { "Attachment #${idx + 1}" }
+                    }
+                    add(
+                        ReportEvidenceAttachment(
+                            id = dm.id,
+                            pathOrUri = dm.pathOrUri,
+                            mediaType = dm.mediaType.ifBlank { "image" },
+                            displayName = name,
+                            isExistingCloud = false
+                        )
+                    )
+                }
+            }
+        }
+        mutableStateOf(initial)
     }
-    var pickedMediaUri by remember { mutableStateOf<Uri?>(null) }
-    var evidenceType by remember {
-        mutableStateOf(editingReport?.evidenceType ?: sourceDraft?.mediaType ?: "none")
+
+    val currentImageCount = remember(attachedEvidence) {
+        attachedEvidence.count { it.mediaType.equals("image", ignoreCase = true) }
     }
-    var evidenceName by remember {
-        mutableStateOf(editingReport?.evidenceName ?: sourceDraft?.mediaName)
+    val currentVideoCount = remember(attachedEvidence) {
+        attachedEvidence.count { it.mediaType.equals("video", ignoreCase = true) }
+    }
+
+    fun tryAppendAttachment(item: ReportEvidenceAttachment): Boolean {
+        if (item.mediaType.equals("image", ignoreCase = true) && currentImageCount >= MediaUploadLimits.MAX_IMAGES_PER_REPORT) {
+            val msg = "Limit reached: maximum ${MediaUploadLimits.MAX_IMAGES_PER_REPORT} images allowed per exception."
+            mediaLimitBanner = msg
+            onMediaLimitError(msg)
+            return false
+        }
+        if (item.mediaType.equals("video", ignoreCase = true) && currentVideoCount >= MediaUploadLimits.MAX_VIDEOS_PER_REPORT) {
+            val msg = "Limit reached: maximum ${MediaUploadLimits.MAX_VIDEOS_PER_REPORT} videos allowed per exception."
+            mediaLimitBanner = msg
+            onMediaLimitError(msg)
+            return false
+        }
+        if (attachedEvidence.any { it.pathOrUri == item.pathOrUri }) {
+            return true
+        }
+        mediaLimitBanner = null
+        attachedEvidence = attachedEvidence + item
+        userTouched = true
+        return true
+    }
+
+    // Live auto-save composer draft whenever the user edits or selects any field
+    LaunchedEffect(
+        userTouched,
+        division, targetType, classTierFilter, staffSearch,
+        selectedStaff, selectedClass, selectedSubject,
+        operationScope, selectedBus, opPersonOrLocation, studentNamesArm,
+        selectedCheck, incidentDate, exceptionText, effectText,
+        attachedEvidence
+    ) {
+        if (editingReport == null && userTouched) {
+            val syncedDraftMedia = attachedEvidence
+                .filterNot { it.isExistingCloud }
+                .map {
+                    DraftMediaItem(
+                        id = it.id,
+                        pathOrUri = it.pathOrUri,
+                        mediaType = it.mediaType,
+                        capturedAtLabel = it.displayName
+                    )
+                }
+            onDraftChanged(
+                ReportFormDraft(
+                    divisionKey = division.key,
+                    targetType = targetType,
+                    classTierFilter = classTierFilter,
+                    staffSearch = staffSearch,
+                    staffId = selectedStaff?.id,
+                    staffCode = selectedStaff?.staffCode,
+                    staffName = selectedStaff?.name,
+                    classId = selectedClass?.id,
+                    className = selectedClass?.name,
+                    subjectId = selectedSubject?.id,
+                    subjectName = selectedSubject?.name,
+                    operationScope = operationScope,
+                    selectedBus = selectedBus,
+                    opPersonOrLocation = opPersonOrLocation,
+                    studentNamesArm = studentNamesArm,
+                    checkId = selectedCheck?.id,
+                    checkName = selectedCheck?.name,
+                    incidentDate = incidentDate,
+                    exceptionText = exceptionText,
+                    effectText = effectText,
+                    sourceDraftId = sourceDraft?.id ?: draftToRestore?.sourceDraftId,
+                    selectedDraftMedia = syncedDraftMedia,
+                    localMediaPath = syncedDraftMedia.firstOrNull()?.pathOrUri,
+                    evidenceType = syncedDraftMedia.firstOrNull()?.mediaType ?: "none",
+                    evidenceName = when {
+                        syncedDraftMedia.isEmpty() -> null
+                        syncedDraftMedia.size == 1 -> syncedDraftMedia.first().capturedAtLabel
+                        else -> "${syncedDraftMedia.size} items"
+                    },
+                    hasUserEdited = true,
+                    updatedAtMillis = System.currentTimeMillis()
+                )
+            )
+        }
     }
 
     var pendingPhotoFile by remember { mutableStateOf<File?>(null) }
+    var pendingVideoFile by remember { mutableStateOf<File?>(null) }
+    var pendingCameraAction by remember { mutableStateOf<String?>(null) }
+
     val takePhotoLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
         val f = pendingPhotoFile
         pendingPhotoFile = null
         if (ok && f != null && f.exists()) {
-            localMediaFile = f
-            pickedMediaUri = null
-            evidenceType = "image"
-            evidenceName = f.name
+            coroutineScope.launch {
+                val staged = onStageMediaFile(f)
+                val finalPath = staged?.let(::File)?.takeIf { it.exists() }?.absolutePath ?: f.absolutePath
+                tryAppendAttachment(
+                    ReportEvidenceAttachment(
+                        id = "photo_${System.currentTimeMillis()}",
+                        pathOrUri = finalPath,
+                        mediaType = "image",
+                        displayName = f.name,
+                        isExistingCloud = false
+                    )
+                )
+            }
         }
     }
 
-    val mediaPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-        if (uri != null) {
-            val mime = context.contentResolver.getType(uri).orEmpty()
-            pickedMediaUri = uri
-            localMediaFile = null
-            evidenceType = if (mime.startsWith("video/")) "video" else "image"
-            evidenceName = uri.lastPathSegment ?: "Picked media"
+    val captureVideoLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CaptureVideo()) { ok ->
+        val f = pendingVideoFile
+        pendingVideoFile = null
+        if (ok && f != null && f.exists()) {
+            coroutineScope.launch {
+                val staged = onStageMediaFile(f)
+                val finalPath = staged?.let(::File)?.takeIf { it.exists() }?.absolutePath ?: f.absolutePath
+                tryAppendAttachment(
+                    ReportEvidenceAttachment(
+                        id = "video_${System.currentTimeMillis()}",
+                        pathOrUri = finalPath,
+                        mediaType = "video",
+                        displayName = f.name,
+                        isExistingCloud = false
+                    )
+                )
+            }
+        }
+    }
+
+    val mediaPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(6)
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            coroutineScope.launch {
+                var imgTotal = attachedEvidence.count { it.mediaType.equals("image", true) }
+                var vidTotal = attachedEvidence.count { it.mediaType.equals("video", true) }
+                val added = mutableListOf<ReportEvidenceAttachment>()
+                var hitLimitMsg: String? = null
+
+                for (uri in uris) {
+                    val mime = context.contentResolver.getType(uri).orEmpty()
+                    val detectedType = if (mime.startsWith("video/")) "video" else "image"
+                    if (detectedType == "image" && imgTotal >= MediaUploadLimits.MAX_IMAGES_PER_REPORT) {
+                        hitLimitMsg = "Max ${MediaUploadLimits.MAX_IMAGES_PER_REPORT} images allowed per exception (extra photos skipped)."
+                        continue
+                    }
+                    if (detectedType == "video" && vidTotal >= MediaUploadLimits.MAX_VIDEOS_PER_REPORT) {
+                        hitLimitMsg = "Max ${MediaUploadLimits.MAX_VIDEOS_PER_REPORT} videos allowed per exception (extra videos skipped)."
+                        continue
+                    }
+                    val stagedPair = onStageMediaUri(uri)
+                    val pathOrUri = stagedPair?.first ?: uri.toString()
+                    val name = stagedPair?.second ?: uri.lastPathSegment ?: "Picked $detectedType"
+                    if (attachedEvidence.none { it.pathOrUri == pathOrUri } && added.none { it.pathOrUri == pathOrUri }) {
+                        added.add(
+                            ReportEvidenceAttachment(
+                                id = "pick_${System.currentTimeMillis()}_${uri.hashCode()}",
+                                pathOrUri = pathOrUri,
+                                mediaType = detectedType,
+                                displayName = name,
+                                isExistingCloud = false
+                            )
+                        )
+                        if (detectedType == "image") imgTotal++ else vidTotal++
+                    }
+                }
+                if (added.isNotEmpty()) {
+                    attachedEvidence = attachedEvidence + added
+                    userTouched = true
+                }
+                if (hitLimitMsg != null) {
+                    mediaLimitBanner = hitLimitMsg
+                    onMediaLimitError(hitLimitMsg)
+                } else if (added.isNotEmpty()) {
+                    mediaLimitBanner = null
+                }
+            }
         }
     }
 
     val docPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
-            pickedMediaUri = uri
-            localMediaFile = null
-            evidenceType = "document"
-            evidenceName = uri.lastPathSegment ?: "Attached document"
+            coroutineScope.launch {
+                val stagedPair = onStageMediaUri(uri)
+                val pathOrUri = stagedPair?.first ?: uri.toString()
+                val name = stagedPair?.second ?: uri.lastPathSegment ?: "Attached document"
+                tryAppendAttachment(
+                    ReportEvidenceAttachment(
+                        id = "doc_${System.currentTimeMillis()}",
+                        pathOrUri = pathOrUri,
+                        mediaType = "document",
+                        displayName = name,
+                        isExistingCloud = false
+                    )
+                )
+            }
         }
     }
 
@@ -276,10 +564,19 @@ fun ReportFormSheet(
         isRecordingAudio = false
         val f = recordingFile
         if (f != null && f.exists()) {
-            localMediaFile = f
-            pickedMediaUri = null
-            evidenceType = "audio"
-            evidenceName = f.name
+            coroutineScope.launch {
+                val staged = onStageMediaFile(f)
+                val finalPath = staged?.let(::File)?.takeIf { it.exists() }?.absolutePath ?: f.absolutePath
+                tryAppendAttachment(
+                    ReportEvidenceAttachment(
+                        id = "audio_${System.currentTimeMillis()}",
+                        pathOrUri = finalPath,
+                        mediaType = "audio",
+                        displayName = f.name,
+                        isExistingCloud = false
+                    )
+                )
+            }
         }
     }
 
@@ -287,12 +584,39 @@ fun ReportFormSheet(
         if (granted) startAudioRecording()
     }
 
-    val camPermLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) {
+    fun launchCameraCapture(mode: String) {
+        if (mode == "image" && currentImageCount >= MediaUploadLimits.MAX_IMAGES_PER_REPORT) {
+            val msg = "Maximum ${MediaUploadLimits.MAX_IMAGES_PER_REPORT} images reached."
+            mediaLimitBanner = msg
+            onMediaLimitError(msg)
+            return
+        }
+        if (mode == "video" && currentVideoCount >= MediaUploadLimits.MAX_VIDEOS_PER_REPORT) {
+            val msg = "Maximum ${MediaUploadLimits.MAX_VIDEOS_PER_REPORT} videos reached."
+            mediaLimitBanner = msg
+            onMediaLimitError(msg)
+            return
+        }
+        if (mode == "video") {
+            val f = File(context.cacheDir, "report_video_${System.currentTimeMillis()}.mp4")
+            pendingVideoFile = f
+            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", f)
+            onWillLaunchExternalPicker()
+            captureVideoLauncher.launch(uri)
+        } else {
             val f = File(context.cacheDir, "report_photo_${System.currentTimeMillis()}.jpg")
             pendingPhotoFile = f
             val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", f)
+            onWillLaunchExternalPicker()
             takePhotoLauncher.launch(uri)
+        }
+    }
+
+    val camPermLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val action = pendingCameraAction ?: "image"
+        pendingCameraAction = null
+        if (granted) {
+            launchCameraCapture(action)
         }
     }
 
@@ -317,6 +641,7 @@ fun ReportFormSheet(
         )
         exceptionText = res.exceptionText
         effectText = res.effectText
+        userTouched = true
     }
 
     val filteredClasses = remember(classes, classTierFilter) {
@@ -350,15 +675,65 @@ fun ReportFormSheet(
                 .navigationBarsPadding(),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Text(
                     text = if (editingReport != null) "Edit Exception" else "Log Compliance Exception",
-                    style = MaterialTheme.typography.headlineSmall,
+                    style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.ExtraBold,
-                    color = MaterialTheme.colorScheme.onSurface
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
-                IconButton(onClick = onDismiss) {
-                    Icon(Icons.Default.Close, contentDescription = "Close", tint = MaterialTheme.colorScheme.onSurface)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    if (editingReport == null) {
+                        TextButton(
+                            onClick = {
+                                userTouched = false
+                                division = ComplianceDivision.ACADEMIC
+                                targetType = "staff"
+                                classTierFilter = "All Tiers"
+                                staffSearch = ""
+                                selectedStaff = null
+                                selectedClass = null
+                                selectedSubject = null
+                                operationScope = "Maintenance"
+                                selectedBus = "Bus 1"
+                                opPersonOrLocation = ""
+                                studentNamesArm = ""
+                                incidentDate = AcademicWeekEngine.todayIso()
+                                exceptionText = ""
+                                effectText = ""
+                                selectedCheck = ComplianceTaxonomy.getApplicableChecks(
+                                    ComplianceDivision.ACADEMIC,
+                                    "Maintenance",
+                                    customChecks
+                                ).firstOrNull()
+                                attachedEvidence = emptyList()
+                                mediaLimitBanner = null
+                                onClearDraft()
+                            },
+                            modifier = Modifier
+                                .minimumInteractiveComponentSize()
+                                .testTag("clear_report_form_button")
+                        ) {
+                            Text(
+                                text = "Clear",
+                                color = ext.rose,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Default.Close, contentDescription = "Close", tint = MaterialTheme.colorScheme.onSurface)
+                    }
                 }
             }
 
@@ -370,6 +745,7 @@ fun ReportFormSheet(
                         onClick = {
                             division = div
                             targetType = if (div == ComplianceDivision.CDS) "division" else "staff"
+                            userTouched = true
                         },
                         label = { Text(div.label) },
                         modifier = Modifier.testTag("form_div_${div.key}")
@@ -380,12 +756,22 @@ fun ReportFormSheet(
             if (division == ComplianceDivision.ACADEMIC) {
                 Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     ComplianceTaxonomy.academicClassTiers.forEach { tier ->
-                        FilterChip(selected = classTierFilter == tier, onClick = { classTierFilter = tier }, label = { Text(tier) })
+                        FilterChip(
+                            selected = classTierFilter == tier,
+                            onClick = {
+                                classTierFilter = tier
+                                userTouched = true
+                            },
+                            label = { Text(tier) }
+                        )
                     }
                 }
                 OutlinedTextField(
                     value = staffSearch,
-                    onValueChange = { staffSearch = it },
+                    onValueChange = {
+                        staffSearch = it
+                        userTouched = true
+                    },
                     label = { Text("Search Staff Roster") },
                     singleLine = true,
                     colors = glassFieldColors(),
@@ -398,7 +784,14 @@ fun ReportFormSheet(
                     }
                     DropdownMenu(expanded = showStaffMenu, onDismissRequest = { showStaffMenu = false }) {
                         activeStaff.forEach { s ->
-                            DropdownMenuItem(text = { Text("${s.name} • ${s.staffCode}") }, onClick = { selectedStaff = s; showStaffMenu = false })
+                            DropdownMenuItem(
+                                text = { Text("${s.name} • ${s.staffCode}") },
+                                onClick = {
+                                    selectedStaff = s
+                                    showStaffMenu = false
+                                    userTouched = true
+                                }
+                            )
                         }
                     }
                 }
@@ -409,7 +802,14 @@ fun ReportFormSheet(
                         }
                         DropdownMenu(expanded = showClassMenu, onDismissRequest = { showClassMenu = false }) {
                             filteredClasses.forEach { c ->
-                                DropdownMenuItem(text = { Text(c.name) }, onClick = { selectedClass = c; showClassMenu = false })
+                                DropdownMenuItem(
+                                    text = { Text(c.name) },
+                                    onClick = {
+                                        selectedClass = c
+                                        showClassMenu = false
+                                        userTouched = true
+                                    }
+                                )
                             }
                         }
                     }
@@ -419,7 +819,14 @@ fun ReportFormSheet(
                         }
                         DropdownMenu(expanded = showSubjectMenu, onDismissRequest = { showSubjectMenu = false }) {
                             subjects.forEach { subj ->
-                                DropdownMenuItem(text = { Text(subj.name) }, onClick = { selectedSubject = subj; showSubjectMenu = false })
+                                DropdownMenuItem(
+                                    text = { Text(subj.name) },
+                                    onClick = {
+                                        selectedSubject = subj
+                                        showSubjectMenu = false
+                                        userTouched = true
+                                    }
+                                )
                             }
                         }
                     }
@@ -429,7 +836,14 @@ fun ReportFormSheet(
             if (division == ComplianceDivision.OPERATIONS) {
                 Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     ComplianceTaxonomy.operationSubScopes.forEach { sc ->
-                        FilterChip(selected = operationScope == sc, onClick = { operationScope = sc }, label = { Text(sc) })
+                        FilterChip(
+                            selected = operationScope == sc,
+                            onClick = {
+                                operationScope = sc
+                                userTouched = true
+                            },
+                            label = { Text(sc) }
+                        )
                     }
                 }
                 if (operationScope == "Transport") {
@@ -439,14 +853,24 @@ fun ReportFormSheet(
                         }
                         DropdownMenu(expanded = showBusMenu, onDismissRequest = { showBusMenu = false }) {
                             ComplianceTaxonomy.fleetBuses.forEach { b ->
-                                DropdownMenuItem(text = { Text(b) }, onClick = { selectedBus = b; showBusMenu = false })
+                                DropdownMenuItem(
+                                    text = { Text(b) },
+                                    onClick = {
+                                        selectedBus = b
+                                        showBusMenu = false
+                                        userTouched = true
+                                    }
+                                )
                             }
                         }
                     }
                 }
                 OutlinedTextField(
                     value = opPersonOrLocation,
-                    onValueChange = { opPersonOrLocation = it },
+                    onValueChange = {
+                        opPersonOrLocation = it
+                        userTouched = true
+                    },
                     label = {
                         Text(
                             when (operationScope) {
@@ -466,13 +890,30 @@ fun ReportFormSheet(
 
             if (division == ComplianceDivision.DISCIPLINE) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(selected = targetType == "division", onClick = { targetType = "division" }, label = { Text("Student Decorum") })
-                    FilterChip(selected = targetType == "staff", onClick = { targetType = "staff" }, label = { Text("Staff Monitor") })
+                    FilterChip(
+                        selected = targetType == "division",
+                        onClick = {
+                            targetType = "division"
+                            userTouched = true
+                        },
+                        label = { Text("Student Decorum") }
+                    )
+                    FilterChip(
+                        selected = targetType == "staff",
+                        onClick = {
+                            targetType = "staff"
+                            userTouched = true
+                        },
+                        label = { Text("Staff Monitor") }
+                    )
                 }
                 if (targetType == "division") {
                     OutlinedTextField(
                         value = studentNamesArm,
-                        onValueChange = { studentNamesArm = it },
+                        onValueChange = {
+                            studentNamesArm = it
+                            userTouched = true
+                        },
                         label = { Text("Student Name(s) & Class Arm") },
                         singleLine = true,
                         colors = glassFieldColors(),
@@ -486,7 +927,14 @@ fun ReportFormSheet(
                         }
                         DropdownMenu(expanded = showStaffMenu, onDismissRequest = { showStaffMenu = false }) {
                             staffList.filter { it.isActive }.forEach { s ->
-                                DropdownMenuItem(text = { Text(s.name) }, onClick = { selectedStaff = s; showStaffMenu = false })
+                                DropdownMenuItem(
+                                    text = { Text(s.name) },
+                                    onClick = {
+                                        selectedStaff = s
+                                        showStaffMenu = false
+                                        userTouched = true
+                                    }
+                                )
                             }
                         }
                     }
@@ -506,6 +954,7 @@ fun ReportFormSheet(
                                 onClick = {
                                     selectedCheck = chk
                                     showCheckMenu = false
+                                    userTouched = true
                                     if (autoFillEnabled && exceptionText.isBlank()) runAutoFill(true)
                                 }
                             )
@@ -529,6 +978,7 @@ fun ReportFormSheet(
                     context,
                     { _, y, m, d ->
                         incidentDate = String.format(Locale.US, "%04d-%02d-%02d", y, m + 1, d)
+                        userTouched = true
                     },
                     cal.get(Calendar.YEAR),
                     cal.get(Calendar.MONTH),
@@ -583,7 +1033,10 @@ fun ReportFormSheet(
 
             OutlinedTextField(
                 value = exceptionText,
-                onValueChange = { exceptionText = it },
+                onValueChange = {
+                    exceptionText = it
+                    userTouched = true
+                },
                 label = { Text("Exception Observation") },
                 minLines = 3,
                 colors = glassFieldColors(),
@@ -593,7 +1046,10 @@ fun ReportFormSheet(
 
             OutlinedTextField(
                 value = effectText,
-                onValueChange = { effectText = it },
+                onValueChange = {
+                    effectText = it
+                    userTouched = true
+                },
                 label = { Text("Operational / Academic Effect") },
                 minLines = 2,
                 colors = glassFieldColors(),
@@ -601,27 +1057,53 @@ fun ReportFormSheet(
                 modifier = Modifier.fillMaxWidth().testTag("form_effect_text")
             )
 
-            MicroLabel("Evidence Attachment (Max 1 for Direct Report)")
+            // Unified Evidence Attachments (Supports Create AND Edit; Max 4 Photos, Max 2 Videos)
+            MicroLabel("Evidence Attachments • Photos $currentImageCount/${MediaUploadLimits.MAX_IMAGES_PER_REPORT} • Videos $currentVideoCount/${MediaUploadLimits.MAX_VIDEOS_PER_REPORT}")
+
             Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = {
-                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-                        val f = File(context.cacheDir, "report_photo_${System.currentTimeMillis()}.jpg")
-                        pendingPhotoFile = f
-                        takePhotoLauncher.launch(FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", f))
-                    } else camPermLauncher.launch(Manifest.permission.CAMERA)
-                }) {
+                OutlinedButton(
+                    enabled = currentImageCount < MediaUploadLimits.MAX_IMAGES_PER_REPORT,
+                    onClick = {
+                        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                            launchCameraCapture("image")
+                        } else {
+                            pendingCameraAction = "image"
+                            camPermLauncher.launch(Manifest.permission.CAMERA)
+                        }
+                    }
+                ) {
                     Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(4.dp))
-                    Text("Camera")
+                    Text("Photo (${currentImageCount}/4)")
                 }
-                OutlinedButton(onClick = {
-                    mediaPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
-                }) {
+                OutlinedButton(
+                    enabled = currentVideoCount < MediaUploadLimits.MAX_VIDEOS_PER_REPORT,
+                    onClick = {
+                        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                            launchCameraCapture("video")
+                        } else {
+                            pendingCameraAction = "video"
+                            camPermLauncher.launch(Manifest.permission.CAMERA)
+                        }
+                    }
+                ) {
+                    Icon(Icons.Default.Videocam, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("Video (${currentVideoCount}/2)")
+                }
+                OutlinedButton(
+                    enabled = currentImageCount < MediaUploadLimits.MAX_IMAGES_PER_REPORT || currentVideoCount < MediaUploadLimits.MAX_VIDEOS_PER_REPORT,
+                    onClick = {
+                        onWillLaunchExternalPicker()
+                        mediaPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+                    }
+                ) {
                     Icon(Icons.Default.PhotoLibrary, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(4.dp))
                     Text("Gallery")
                 }
                 OutlinedButton(onClick = {
+                    onWillLaunchExternalPicker()
                     docPicker.launch(arrayOf("application/pdf", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"))
                 }) {
                     Icon(Icons.Default.Description, contentDescription = null, modifier = Modifier.size(16.dp))
@@ -639,104 +1121,126 @@ fun ReportFormSheet(
                 }
             }
 
-            // Small Instant Upload Preview Thumbnail (Image preview / Video frame + Play badge)
-            if (evidenceType != "none" && (!evidenceName.isNullOrBlank() || localMediaFile != null || pickedMediaUri != null)) {
+            mediaLimitBanner?.let { warn ->
                 Surface(
-                    color = ext.emeraldContainer,
-                    shape = RoundedCornerShape(16.dp),
-                    border = BorderStroke(1.dp, ext.emerald.copy(alpha = 0.35f)),
-                    modifier = Modifier.fillMaxWidth().testTag("evidence_preview_card")
+                    color = ext.rose.copy(alpha = 0.14f),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, ext.rose.copy(alpha = 0.4f)),
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    Row(
-                        modifier = Modifier.padding(10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        // Visual thumbnail box
-                        Box(
-                            modifier = Modifier
-                                .size(56.dp)
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(Color.Black.copy(alpha = 0.35f)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            if (evidenceType == "image" || evidenceType == "video") {
-                                AsyncImage(
-                                    model = localMediaFile ?: pickedMediaUri ?: editingReport?.evidenceUrl,
-                                    contentDescription = "Evidence Thumbnail",
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier.fillMaxSize()
-                                )
+                    Text(
+                        text = warn,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = ext.rose,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                    )
+                }
+            }
+
+            if (attachedEvidence.isNotEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    attachedEvidence.forEachIndexed { idx, item ->
+                        val isVideo = item.mediaType.equals("video", ignoreCase = true)
+                        val isImage = item.mediaType.equals("image", ignoreCase = true)
+                        var signedThumbUrl by remember(item.id, item.pathOrUri) { mutableStateOf<String?>(null) }
+                        if (item.isExistingCloud && (isImage || isVideo)) {
+                            LaunchedEffect(item.id, item.pathOrUri) {
+                                onResolveSignedUrl(item.pathOrUri).onSuccess { signedThumbUrl = it }
                             }
-                            if (evidenceType == "video") {
+                        }
+                        val previewModel: Any? = when {
+                            item.isExistingCloud -> signedThumbUrl
+                            item.pathOrUri.startsWith("/") -> File(item.pathOrUri)
+                            else -> Uri.parse(item.pathOrUri)
+                        }
+
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.width(84.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(84.dp)
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(Color.Black.copy(alpha = 0.35f))
+                                    .border(
+                                        1.dp,
+                                        if (item.isExistingCloud) MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)
+                                        else ext.emerald.copy(alpha = 0.45f),
+                                        RoundedCornerShape(14.dp)
+                                    ),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                when {
+                                    isVideo && previewModel != null -> VideoFrameThumbnail(
+                                        source = previewModel,
+                                        contentDescription = "Evidence Video Thumbnail",
+                                        modifier = Modifier.fillMaxSize(),
+                                        badgeSize = 22.dp
+                                    )
+                                    isImage && previewModel != null -> AsyncImage(
+                                        model = previewModel,
+                                        contentDescription = "Evidence Image Thumbnail",
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                    item.mediaType.equals("audio", true) -> Icon(
+                                        imageVector = Icons.Default.Mic,
+                                        contentDescription = "Audio Evidence",
+                                        tint = ext.emerald,
+                                        modifier = Modifier.size(26.dp)
+                                    )
+                                    else -> Icon(
+                                        imageVector = if (item.isExistingCloud) Icons.Default.CloudDone else Icons.Default.Description,
+                                        contentDescription = "Attachment",
+                                        tint = ext.emerald,
+                                        modifier = Modifier.size(26.dp)
+                                    )
+                                }
+
                                 Box(
                                     modifier = Modifier
-                                        .size(24.dp)
+                                        .align(Alignment.TopEnd)
+                                        .padding(4.dp)
+                                        .size(22.dp)
                                         .clip(CircleShape)
-                                        .background(Color.Black.copy(alpha = 0.70f)),
+                                        .background(Color.Black.copy(alpha = 0.78f))
+                                        .clickable {
+                                            attachedEvidence = attachedEvidence.filterNot { it.id == item.id }
+                                            mediaLimitBanner = null
+                                            userTouched = true
+                                        }
+                                        .testTag("remove_form_evidence_${idx}"),
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Default.PlayArrow,
-                                        contentDescription = "Play badge",
+                                        imageVector = Icons.Default.Close,
+                                        contentDescription = "Remove evidence item",
                                         tint = Color.White,
-                                        modifier = Modifier.size(16.dp)
+                                        modifier = Modifier.size(13.dp)
                                     )
                                 }
-                            } else if (evidenceType == "audio") {
-                                Icon(
-                                    imageVector = Icons.Default.Mic,
-                                    contentDescription = "Audio Evidence",
-                                    tint = ext.emerald,
-                                    modifier = Modifier.size(24.dp)
-                                )
-                            } else if (evidenceType == "document") {
-                                Icon(
-                                    imageVector = Icons.Default.Description,
-                                    contentDescription = "Document Evidence",
-                                    tint = ext.emerald,
-                                    modifier = Modifier.size(24.dp)
-                                )
                             }
-                        }
-
-                        Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = evidenceName ?: "Attached Evidence",
-                                style = MaterialTheme.typography.bodySmall,
-                                fontWeight = FontWeight.Bold,
-                                color = ext.emerald,
+                                text = if (item.isExistingCloud) "Saved • ${item.mediaType.uppercase()}" else item.displayName,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
-                            )
-                            Text(
-                                text = "${evidenceType.uppercase()} • 1 evidence attached (Strict limit)",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = ext.emerald.copy(alpha = 0.85f)
-                            )
-                        }
-
-                        IconButton(
-                            onClick = {
-                                localMediaFile = null
-                                pickedMediaUri = null
-                                evidenceType = "none"
-                                evidenceName = null
-                            },
-                            modifier = Modifier.size(32.dp).testTag("remove_attached_evidence_button")
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Close,
-                                contentDescription = "Remove evidence",
-                                tint = ext.rose,
-                                modifier = Modifier.size(18.dp)
                             )
                         }
                     }
                 }
             }
 
-            if (sourceDraft != null && !sourceDraft.mediaPath.isNullOrBlank()) {
+            if (sourceDraft != null && attachedEvidence.any { !it.isExistingCloud }) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(checked = cleanDraftMedia, onCheckedChange = { cleanDraftMedia = it })
                     Text(
@@ -744,6 +1248,44 @@ fun ReportFormSheet(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurface
                     )
+                }
+            }
+
+            if (compressionProgress != null && !compressionLabel.isNullOrBlank()) {
+                Surface(
+                    color = ext.glassBottom,
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.45f)),
+                    modifier = Modifier.fillMaxWidth().testTag("compression_progress_card")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = compressionLabel,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                text = "${(compressionProgress.coerceIn(0f, 1f) * 100).toInt()}%",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        LinearProgressIndicator(
+                            progress = { compressionProgress.coerceIn(0f, 1f) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(6.dp)
+                                .clip(CircleShape)
+                        )
+                    }
                 }
             }
 
@@ -763,26 +1305,37 @@ fun ReportFormSheet(
                     incidentDate,
                     exceptionText,
                     effectText,
-                    localMediaFile,
-                    pickedMediaUri,
-                    evidenceType,
-                    evidenceName,
+                    attachedEvidence,
                     cleanDraftMedia
                 )
             }
 
-            val hasEvidence = localMediaFile != null || pickedMediaUri != null || !editingReport?.evidenceUrl.isNullOrBlank()
+            val hasEvidence = attachedEvidence.isNotEmpty()
 
             GlowingPrimaryButton(
                 onClick = { showNoEvidenceWarning = true },
                 enabled = !isLoading && exceptionText.isNotBlank(),
                 modifier = Modifier.fillMaxWidth().testTag("submit_report_button")
             ) {
-                Text(if (isLoading) "Submitting..." else "Submit Exception Report", fontWeight = FontWeight.ExtraBold)
+                Text(
+                    text = if (isLoading) {
+                        compressionLabel ?: "Submitting..."
+                    } else if (editingReport != null) {
+                        "Save Updated Exception"
+                    } else {
+                        "Submit Exception Report"
+                    },
+                    fontWeight = FontWeight.ExtraBold
+                )
             }
             Spacer(Modifier.height(14.dp))
 
             if (showNoEvidenceWarning) {
+                val evidenceAuditLabel = if (hasEvidence) {
+                    "Evidence: ${attachedEvidence.size} attached (${currentImageCount} photos, ${currentVideoCount} videos)"
+                } else {
+                    "No Media Attached (Optional — tap X to attach)"
+                }
                 Dialog(
                     onDismissRequest = { showNoEvidenceWarning = false },
                     properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -793,7 +1346,7 @@ fun ReportFormSheet(
                                 "${division.label} • ${selectedCheck?.name ?: "Standard Check"}" to (selectedCheck != null),
                                 "Observation Narrative Entered" to exceptionText.isNotBlank(),
                                 "Date Anchored ($incidentDate)" to incidentDate.isNotBlank(),
-                                (if (hasEvidence) "Evidence Attached (${evidenceType.uppercase()})" else "No Media Attached (Optional — tap X to attach)") to hasEvidence
+                                evidenceAuditLabel to hasEvidence
                             ),
                             isLoading = isLoading,
                             onDismiss = { showNoEvidenceWarning = false },

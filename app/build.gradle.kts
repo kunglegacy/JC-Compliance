@@ -20,6 +20,46 @@ android {
     versionName = "1.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+    val envValues = mutableMapOf<String, String>()
+    listOf(rootProject.file(".env"), project.file(".env"), rootProject.file(".env.local")).forEach { envFile ->
+      if (envFile.exists()) {
+        envFile.readLines().forEach { rawLine ->
+          val line = rawLine.replace("\r", "").trim()
+          if (line.isNotEmpty() && !line.startsWith("#") && line.contains("=")) {
+            val idx = line.indexOf('=')
+            val key = line.substring(0, idx).removePrefix("export ").trim()
+            val value = line.substring(idx + 1).trim().trim('"', '\'')
+            if (key.isNotEmpty() && value.isNotEmpty()) {
+              envValues[key] = value
+            }
+          }
+        }
+      }
+    }
+    fun resolveCiEnv(vararg keys: String): String {
+      for (k in keys) {
+        val v = (envValues[k] ?: System.getenv(k) ?: "").trim().trim('"', '\'')
+        if (v.isNotEmpty() &&
+          !v.contains("your-project-id", ignoreCase = true) &&
+          !v.contains("your_key_here", ignoreCase = true) &&
+          !v.contains("placeholder", ignoreCase = true)
+        ) {
+          return v.replace("\\", "\\\\").replace("\"", "\\\"")
+        }
+      }
+      return ""
+    }
+    buildConfigField(
+      "String",
+      "CI_SUPABASE_URL",
+      "\"${resolveCiEnv("VITE_SUPABASE_URL", "SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL")}\""
+    )
+    buildConfigField(
+      "String",
+      "CI_SUPABASE_KEY",
+      "\"${resolveCiEnv("VITE_SUPABASE_PUBLISHABLE_KEY", "SUPABASE_PUBLISHABLE_KEY", "VITE_SUPABASE_ANON_KEY", "SUPABASE_ANON_KEY", "SUPABASE_KEY", "ANON_KEY")}\""
+    )
   }
 
   // Do not remove or modify these signingConfigs. They are necessary for building, installing,

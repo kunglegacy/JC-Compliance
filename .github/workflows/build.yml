@@ -30,24 +30,73 @@ jobs:
 
       - name: Create .env Configuration File from Secrets
         env:
-          ENV_RAW: ${{ secrets.ENV || secrets.DOTENV || secrets.ENV_FILE || '' }}
-          S_URL: ${{ secrets.VITE_SUPABASE_URL || secrets.SUPABASE_URL || '' }}
-          S_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY || secrets.SUPABASE_PUBLISHABLE_KEY || secrets.SUPABASE_ANON_KEY || secrets.SUPABASE_KEY || '' }}
+          ENV_RAW: ${{ secrets.ENV || secrets.DOTENV || secrets.ENV_FILE || secrets.ENV_VARS || '' }}
+          S_URL: ${{ secrets.VITE_SUPABASE_URL || secrets.SUPABASE_URL || secrets.NEXT_PUBLIC_SUPABASE_URL || '' }}
+          S_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY || secrets.SUPABASE_PUBLISHABLE_KEY || secrets.VITE_SUPABASE_ANON_KEY || secrets.SUPABASE_ANON_KEY || secrets.SUPABASE_KEY || secrets.ANON_KEY || '' }}
           S_SECRET: ${{ secrets.SUPABASE_SECRET_KEY || '' }}
         run: |
-          if [ -n "$ENV_RAW" ]; then
-            echo "$ENV_RAW" > .env
-          else
-            cat << EOF > .env
-          VITE_SUPABASE_URL=$S_URL
-          SUPABASE_URL=$S_URL
-          VITE_SUPABASE_PUBLISHABLE_KEY=$S_KEY
-          SUPABASE_PUBLISHABLE_KEY=$S_KEY
-          SUPABASE_SECRET_KEY=$S_SECRET
-          EOF
-          fi
-          echo "Created .env successfully with variables:"
-          grep -o '^[A-Z_]*' .env || true
+          python3 - << 'PY'
+          import os, re
+
+          def clean_val(v: str) -> str:
+              v = (v or "").replace("\r", "").strip()
+              if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                  v = v[1:-1].strip()
+              return v
+
+          env_map = {}
+          raw = os.environ.get("ENV_RAW", "").replace("\r", "")
+          for line in raw.splitlines():
+              s = line.strip()
+              if not s or s.startswith("#") or "=" not in s:
+                  continue
+              k, v = s.split("=", 1)
+              k = k.strip()
+              if k.startswith("export "):
+                  k = k[len("export "):].strip()
+              v = clean_val(v)
+              if k and v:
+                  env_map[k] = v
+
+          url = clean_val(
+              env_map.get("VITE_SUPABASE_URL")
+              or env_map.get("SUPABASE_URL")
+              or env_map.get("NEXT_PUBLIC_SUPABASE_URL")
+              or os.environ.get("S_URL", "")
+          )
+          key = clean_val(
+              env_map.get("VITE_SUPABASE_PUBLISHABLE_KEY")
+              or env_map.get("SUPABASE_PUBLISHABLE_KEY")
+              or env_map.get("VITE_SUPABASE_ANON_KEY")
+              or env_map.get("SUPABASE_ANON_KEY")
+              or env_map.get("SUPABASE_KEY")
+              or env_map.get("ANON_KEY")
+              or os.environ.get("S_KEY", "")
+          )
+          secret = clean_val(
+              env_map.get("SUPABASE_SECRET_KEY")
+              or os.environ.get("S_SECRET", "")
+          )
+
+          if url:
+              env_map["VITE_SUPABASE_URL"] = url
+              env_map["SUPABASE_URL"] = url
+          if key:
+              env_map["VITE_SUPABASE_PUBLISHABLE_KEY"] = key
+              env_map["SUPABASE_PUBLISHABLE_KEY"] = key
+              env_map["SUPABASE_ANON_KEY"] = key
+          if secret:
+              env_map["SUPABASE_SECRET_KEY"] = secret
+
+          content = "\n".join(f"{k}={v}" for k, v in env_map.items()) + "\n"
+          for path in [".env", "app/.env"]:
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(content)
+
+          print("Generated .env keys:", list(env_map.keys()))
+          print("Supabase URL configured:", bool(url) and "your-project-id" not in url)
+          print("Supabase Key configured:", bool(key) and "your_key_here" not in key)
+          PY
 
       - name: Build Signed Release APK
         env:
@@ -55,10 +104,11 @@ jobs:
           STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL || secrets.SUPABASE_URL }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL || secrets.VITE_SUPABASE_URL }}
-          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY || secrets.SUPABASE_PUBLISHABLE_KEY || secrets.SUPABASE_ANON_KEY || secrets.SUPABASE_KEY }}
-          SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY || secrets.VITE_SUPABASE_PUBLISHABLE_KEY || secrets.SUPABASE_ANON_KEY || secrets.SUPABASE_KEY }}
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL || secrets.SUPABASE_URL || secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL || secrets.VITE_SUPABASE_URL || secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY || secrets.SUPABASE_PUBLISHABLE_KEY || secrets.VITE_SUPABASE_ANON_KEY || secrets.SUPABASE_ANON_KEY || secrets.SUPABASE_KEY || secrets.ANON_KEY }}
+          SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY || secrets.VITE_SUPABASE_PUBLISHABLE_KEY || secrets.VITE_SUPABASE_ANON_KEY || secrets.SUPABASE_ANON_KEY || secrets.SUPABASE_KEY || secrets.ANON_KEY }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY || secrets.VITE_SUPABASE_PUBLISHABLE_KEY || secrets.SUPABASE_PUBLISHABLE_KEY || secrets.VITE_SUPABASE_ANON_KEY || secrets.SUPABASE_KEY }}
         run: gradle assembleRelease
 
       - name: Auto-Publish to Permanent Release Link

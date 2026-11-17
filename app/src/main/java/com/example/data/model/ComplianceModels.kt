@@ -65,7 +65,8 @@ data class UserSession(
     val role: UserRole = UserRole.STANDARD,
     val status: String = "active",
     val isVerified: Boolean = true,
-    val isOwner: Boolean = false
+    val isOwner: Boolean = false,
+    val avatarUrl: String = ""
 )
 
 data class DirectorateUser(
@@ -78,7 +79,8 @@ data class DirectorateUser(
     val isVerified: Boolean,
     val isOwner: Boolean,
     val isFounder: Boolean,
-    val createdAt: String? = null
+    val createdAt: String? = null,
+    val avatarUrl: String = ""
 )
 
 data class StaffMember(
@@ -141,19 +143,17 @@ data class ComplianceCheck(
 
 enum class ReportResolutionStatus(val key: String, val label: String) {
     OPEN("OPEN", "Open"),
-    IN_REVIEW("IN_REVIEW", "In Review"),
+    PENDING("PENDING", "Pending"),
     ACTION_REQUIRED("ACTION_REQUIRED", "Action Required"),
-    ESCALATED("ESCALATED", "Escalated"),
-    RESOLVED("RESOLVED", "Resolved"),
-    REJECTED("REJECTED", "Rejected");
+    REJECTED("REJECTED", "Rejected"),
+    ACCEPTED("ACCEPTED", "Accepted");
 
     companion object {
         fun fromKey(raw: String?): ReportResolutionStatus = when (raw?.uppercase()?.trim()) {
-            "IN_REVIEW" -> IN_REVIEW
-            "ACTION_REQUIRED" -> ACTION_REQUIRED
-            "ESCALATED" -> ESCALATED
-            "RESOLVED" -> RESOLVED
+            "PENDING", "IN_REVIEW" -> PENDING
+            "ACTION_REQUIRED", "ESCALATED" -> ACTION_REQUIRED
             "REJECTED", "DISMISSED" -> REJECTED
+            "ACCEPTED", "RESOLVED" -> ACCEPTED
             else -> OPEN
         }
     }
@@ -208,26 +208,138 @@ data class ComplianceReport(
     val evidenceUrl: String? = null,
     val evidenceType: String = "none",
     val evidenceName: String? = null,
+    val evidenceUrls: List<String> = emptyList(),
+    val evidenceTypes: List<String> = emptyList(),
+    val evidenceNotes: List<String> = emptyList(),
     val status: ReportResolutionStatus = ReportResolutionStatus.OPEN,
+    val reviewStatus: String = "UNSEEN",
     val isSeen: Boolean = false,
     val seenAt: String? = null,
     val seenBy: String? = null,
     val resolutionNotes: String? = null,
     val resolvedBy: String? = null,
     val resolvedAt: String? = null,
+    val isEdited: Boolean = false,
+    val editedAt: String? = null,
     val createdAt: String = ""
+) {
+    val isPending: Boolean
+        get() = status == ReportResolutionStatus.PENDING
+
+    val isActionRequired: Boolean
+        get() = status == ReportResolutionStatus.ACTION_REQUIRED
+
+    val isAccepted: Boolean
+        get() = status == ReportResolutionStatus.ACCEPTED
+
+    val isRejected: Boolean
+        get() = status == ReportResolutionStatus.REJECTED
+
+    val canUserEdit: Boolean
+        get() = status == ReportResolutionStatus.OPEN ||
+            status == ReportResolutionStatus.PENDING ||
+            status == ReportResolutionStatus.ACTION_REQUIRED
+
+    val isReviewedFinal: Boolean
+        get() = status == ReportResolutionStatus.ACCEPTED ||
+            status == ReportResolutionStatus.REJECTED
+}
+
+object MediaUploadLimits {
+    const val MAX_IMAGES_PER_REPORT = 4
+    const val MAX_VIDEOS_PER_REPORT = 2
+}
+
+data class ReportEvidenceAttachment(
+    val id: String,
+    val pathOrUri: String,
+    val mediaType: String, // image | video | audio | document
+    val displayName: String,
+    val isExistingCloud: Boolean = false
+)
+
+data class AppNotificationRecord(
+    val id: String,
+    val recipientUserId: String?,
+    val recipientRole: String,
+    val type: String,
+    val title: String,
+    val body: String,
+    val reportId: String? = null,
+    val reportNumber: String? = null,
+    val actorName: String = "",
+    val isRead: Boolean = false,
+    val createdAt: String = ""
+)
+
+data class DraftMediaItem(
+    val id: String,
+    val pathOrUri: String,
+    val mediaType: String,
+    val capturedAtLabel: String
 )
 
 data class OfflineDraft(
     val id: String,
+    val userId: String = "",
     val title: String,
     val notes: String,
     val mediaPath: String? = null,
     val mediaType: String = "none", // image, video, audio, document, none
     val mediaName: String? = null,
+    val mediaItems: List<DraftMediaItem> = emptyList(),
     val incidentDate: String,
     val createdAtMillis: Long
 )
+
+data class ReportFormDraft(
+    val divisionKey: String = ComplianceDivision.ACADEMIC.key,
+    val targetType: String = "staff",
+    val classTierFilter: String = "All Tiers",
+    val staffSearch: String = "",
+    val staffId: String? = null,
+    val staffCode: String? = null,
+    val staffName: String? = null,
+    val classId: String? = null,
+    val className: String? = null,
+    val subjectId: String? = null,
+    val subjectName: String? = null,
+    val operationScope: String = "Maintenance",
+    val selectedBus: String = "Bus 1",
+    val opPersonOrLocation: String = "",
+    val studentNamesArm: String = "",
+    val checkId: String? = null,
+    val checkName: String? = null,
+    val incidentDate: String = "",
+    val exceptionText: String = "",
+    val effectText: String = "",
+    val sourceDraftId: String? = null,
+    val selectedDraftMedia: List<DraftMediaItem> = emptyList(),
+    val localMediaPath: String? = null,
+    val evidenceType: String = "none",
+    val evidenceName: String? = null,
+    val hasUserEdited: Boolean = false,
+    val updatedAtMillis: Long = 0L
+) {
+    val hasContent: Boolean
+        get() = hasUserEdited && (
+            exceptionText.isNotBlank() ||
+                effectText.isNotBlank() ||
+                opPersonOrLocation.isNotBlank() ||
+                studentNamesArm.isNotBlank() ||
+                staffSearch.isNotBlank() ||
+                !staffId.isNullOrBlank() ||
+                !classId.isNullOrBlank() ||
+                !subjectId.isNullOrBlank() ||
+                !checkId.isNullOrBlank() ||
+                selectedDraftMedia.isNotEmpty() ||
+                !localMediaPath.isNullOrBlank() ||
+                (evidenceType != "none" && !evidenceName.isNullOrBlank()) ||
+                divisionKey != ComplianceDivision.ACADEMIC.key ||
+                targetType != "staff" ||
+                operationScope != "Maintenance"
+            )
+}
 
 data class SystemSettings(
     val academicSession: String = "2025/2026",

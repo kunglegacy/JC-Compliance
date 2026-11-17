@@ -13,6 +13,7 @@ fun EvidenceViewerDialog(
     inspectorName: String = "Compliance Officer",
     items: List<EvidencePreviewItem>? = null,
     initialIndex: Int = 0,
+    showModerationControls: Boolean = true,
     onResolveSignedUrl: suspend (String) -> Result<String>,
     onVerdict: ((EvidencePreviewItem, EvidenceVerdict, String?) -> Unit)? = null,
     onDismiss: () -> Unit
@@ -43,6 +44,7 @@ fun EvidenceViewerDialog(
         EvidencePreviewerScreen(
             items = previewItems,
             initialIndex = initialIndex,
+            showModerationControls = showModerationControls,
             onResolveSignedUrl = onResolveSignedUrl,
             onVerdict = onVerdict,
             onBack = onDismiss

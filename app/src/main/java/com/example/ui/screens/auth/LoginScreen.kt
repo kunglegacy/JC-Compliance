@@ -1,12 +1,15 @@
 package com.example.ui.screens.auth
 
+import android.net.Uri
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -20,20 +23,18 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
-import androidx.compose.material.icons.filled.CloudSync
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PersonOutline
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.WarningAmber
@@ -43,6 +44,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -58,14 +60,19 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.fragment.app.FragmentActivity
+import coil.compose.AsyncImage
 import com.example.data.model.SupabaseConfig
+import com.example.domain.BiometricHelper
 import com.example.ui.components.AtmosphericGlassBackground
 import com.example.ui.components.GlassCard
 import com.example.ui.components.GlowingPrimaryButton
@@ -74,6 +81,7 @@ import com.example.ui.components.SchoolCrestBadge
 import com.example.ui.components.SupabaseConnectionDialog
 import com.example.ui.components.glassFieldColors
 import com.example.ui.theme.ComplianceTheme
+import java.io.File
 
 @Composable
 fun LoginScreen(
@@ -86,12 +94,17 @@ fun LoginScreen(
     rememberedEmail: String = "",
     rememberedDisplayName: String = "",
     rememberedAvatarUri: String = "",
-    onSaveSupabaseConfig: (String, String) -> Unit = { _, _ -> }
+    onSaveSupabaseConfig: (String, String) -> Unit = { _, _ -> },
+    activity: FragmentActivity? = null,
+    biometricsQuickLoginAvailable: Boolean = false,
+    onBiometricSignIn: (String) -> Unit = {},
+    onSwitchAccount: () -> Unit = {}
 ) {
     var email by remember(rememberedEmail) { mutableStateOf(rememberedEmail) }
     var password by remember { mutableStateOf("") }
     var showPassword by remember { mutableStateOf(false) }
     var showConfigDialog by remember { mutableStateOf(false) }
+    var bioError by remember { mutableStateOf<String?>(null) }
 
     val ext = ComplianceTheme.extended
     val haloColor = MaterialTheme.colorScheme.primary
@@ -112,31 +125,6 @@ fun LoginScreen(
                 modifier = Modifier.widthIn(max = 460.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                // Top Action: Backend Connection Config Pill
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End
-                ) {
-                    TextButton(
-                        onClick = { showConfigDialog = true },
-                        modifier = Modifier.testTag("login_configure_backend_button")
-                    ) {
-                        Icon(
-                            imageVector = if (supabaseConfig.isConfigured) Icons.Default.CloudSync else Icons.Default.Settings,
-                            contentDescription = "Backend Settings",
-                            tint = if (supabaseConfig.isConfigured) ext.emerald else ext.amber,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            text = if (supabaseConfig.isConfigured) "Backend Connected" else "Configure Backend",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (supabaseConfig.isConfigured) ext.emerald else ext.amber,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-
                 // Glowing ambient crest halo emblem
                 Box(
                     modifier = Modifier
@@ -171,17 +159,76 @@ fun LoginScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
-                if (rememberedDisplayName.isNotBlank()) {
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        text = "Welcome back, $rememberedDisplayName",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.SemiBold
-                    )
+                if (rememberedEmail.isNotBlank()) {
+                    Spacer(Modifier.height(14.dp))
+                    GlassCard(
+                        modifier = Modifier.fillMaxWidth().testTag("remembered_account_card"),
+                        cornerRadius = 22.dp,
+                        contentPadding = 12.dp
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            if (rememberedAvatarUri.isNotBlank()) {
+                                AsyncImage(
+                                    model = if (rememberedAvatarUri.startsWith("/")) File(rememberedAvatarUri) else Uri.parse(rememberedAvatarUri),
+                                    contentDescription = "Remembered Profile Avatar",
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier
+                                        .size(44.dp)
+                                        .clip(CircleShape)
+                                        .border(1.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.7f), CircleShape)
+                                )
+                            } else {
+                                Box(
+                                    modifier = Modifier
+                                        .size(44.dp)
+                                        .clip(CircleShape)
+                                        .background(MaterialTheme.colorScheme.primaryContainer)
+                                        .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.45f), CircleShape),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Person,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(22.dp)
+                                    )
+                                }
+                            }
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = rememberedDisplayName.ifBlank { "Saved Officer Session" },
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = rememberedEmail,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            TextButton(
+                                onClick = {
+                                    bioError = null
+                                    onSwitchAccount()
+                                },
+                                modifier = Modifier.testTag("switch_remembered_account_button")
+                            ) {
+                                Text("Switch", fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
                 }
 
-                Spacer(Modifier.height(18.dp))
+                Spacer(Modifier.height(16.dp))
 
                 // Prominent banner if backend is not configured yet
                 if (!supabaseConfig.isConfigured) {
@@ -284,29 +331,31 @@ fun LoginScreen(
                     cornerRadius = 28.dp,
                     contentPadding = 20.dp
                 ) {
-                    OutlinedTextField(
-                        value = email,
-                        onValueChange = {
-                            email = it
-                            if (authError != null) onClearError()
-                        },
-                        label = { Text("Institutional Email") },
-                        trailingIcon = {
-                            Icon(Icons.Default.PersonOutline, contentDescription = null)
-                        },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(
-                            keyboardType = KeyboardType.Email,
-                            imeAction = ImeAction.Next
-                        ),
-                        colors = glassFieldColors(),
-                        shape = RoundedCornerShape(18.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("login_email_input")
-                    )
+                    if (rememberedEmail.isBlank()) {
+                        OutlinedTextField(
+                            value = email,
+                            onValueChange = {
+                                email = it
+                                if (authError != null) onClearError()
+                            },
+                            label = { Text("Institutional Email") },
+                            trailingIcon = {
+                                Icon(Icons.Default.PersonOutline, contentDescription = null)
+                            },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(
+                                keyboardType = KeyboardType.Email,
+                                imeAction = ImeAction.Next
+                            ),
+                            colors = glassFieldColors(),
+                            shape = RoundedCornerShape(18.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("login_email_input")
+                        )
 
-                    Spacer(Modifier.height(14.dp))
+                        Spacer(Modifier.height(14.dp))
+                    }
 
                     OutlinedTextField(
                         value = password,
@@ -344,6 +393,19 @@ fun LoginScreen(
 
                     Spacer(Modifier.height(12.dp))
 
+                    val visibleError = bioError ?: authError
+                    AnimatedVisibility(visible = !visibleError.isNullOrBlank()) {
+                        if (visibleError == bioError && !bioError.isNullOrBlank()) {
+                            Text(
+                                text = bioError.orEmpty(),
+                                color = ext.rose,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(bottom = 10.dp)
+                            )
+                        }
+                    }
+
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
@@ -357,7 +419,11 @@ fun LoginScreen(
                         )
                         Spacer(Modifier.width(6.dp))
                         Text(
-                            text = "Biometric login can be enabled after signing in.",
+                            text = if (biometricsQuickLoginAvailable && rememberedEmail.isNotBlank()) {
+                                "Biometric quick sign-in ready for this device."
+                            } else {
+                                "Biometric login can be enabled after signing in."
+                            },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -390,6 +456,46 @@ fun LoginScreen(
                             )
                             Spacer(Modifier.width(8.dp))
                             Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = null)
+                        }
+                    }
+
+                    if (biometricsQuickLoginAvailable && activity != null && rememberedEmail.isNotBlank()) {
+                        Spacer(Modifier.height(10.dp))
+                        OutlinedButton(
+                            onClick = {
+                                bioError = null
+                                BiometricHelper.authenticate(
+                                    activity = activity,
+                                    title = "Directorate Biometric Sign-In",
+                                    subtitle = "Sign in as ${rememberedDisplayName.ifBlank { rememberedEmail }}",
+                                    negativeButtonText = "Use Password",
+                                    onSuccess = { onBiometricSignIn(rememberedEmail) },
+                                    onError = { msg, needsEnroll, isCancelled ->
+                                        if (needsEnroll) BiometricHelper.openEnrollmentSettings(activity)
+                                        if (!isCancelled) bioError = msg
+                                    }
+                                )
+                            },
+                            enabled = !isLoading,
+                            shape = CircleShape,
+                            border = BorderStroke(1.dp, ext.emerald.copy(alpha = 0.55f)),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(50.dp)
+                                .testTag("biometric_quick_login_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Fingerprint,
+                                contentDescription = "Sign In with Biometrics",
+                                tint = ext.emerald,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                text = "Sign In with Biometrics",
+                                color = ext.emerald,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
                     }
 
