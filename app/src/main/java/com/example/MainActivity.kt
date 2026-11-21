@@ -115,6 +115,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.model.ComplianceDivision
 import com.example.data.model.ReportFormDraft
+import com.example.data.model.ReportFormMode
 import com.example.data.model.ReportResolutionStatus
 import com.example.data.model.ReportScope
 import com.example.domain.ComplianceNotificationHelper
@@ -408,9 +409,11 @@ private fun JCBestComplianceRoot(
         if (session.role.isAdminOrAbove) FooterItems
         else FooterItems.filterNot { it.route == "reports" }
     }
-    val scopedReports = remember(uiState.reports, session.role, session.userId) {
-        if (session.role.isAdminOrAbove) uiState.reports
-        else uiState.reports.filter { it.reportedBy.equals(session.userId, ignoreCase = true) }
+    val myOwnReports = remember(uiState.reports, session.userId) {
+        uiState.reports.filter { it.reportedBy.equals(session.userId, ignoreCase = true) }
+    }
+    val analyticsReports = remember(uiState.reports, session.role, myOwnReports) {
+        if (session.role.isAdminOrAbove) uiState.reports else myOwnReports
     }
 
     LaunchedEffect(session.role, uiState.activeTab, uiState.accountSubScreen) {
@@ -471,7 +474,12 @@ private fun JCBestComplianceRoot(
                         uiState.accountSubScreen == "settings" -> SettingsScreen(
                             activity = activity,
                             prefsState = prefsState,
-                            onSaveIdentity = viewModel::saveProfileIdentity,
+                            isLoading = uiState.isLoading,
+                            onUploadAvatar = viewModel::uploadProfileAvatar,
+                            onRemoveAvatar = viewModel::removeProfileAvatar,
+                            onSaveDisplayName = viewModel::saveProfileDisplayName,
+                            onResolveSignedUrl = viewModel::resolveSignedEvidenceUrl,
+                            onGetMediaHeaders = viewModel::getMediaRequestHeaders,
                             onSetAutoFill = viewModel::setAutoFillEnabled,
                             onSetTheme = viewModel::setThemePreference,
                             onSetAccent = viewModel::setAccentPalette,
@@ -481,6 +489,8 @@ private fun JCBestComplianceRoot(
                             onSetBiometricsEnabled = viewModel::setBiometricsEnabled,
                             onNotify = viewModel::notifyMessage,
                             onWillLaunchExternalPicker = { viewModel.setAwaitingExternalActivity(true) },
+                            mobileAppConfig = uiState.mobileAppConfig,
+                            storageProviderConfig = uiState.storageProviderConfig,
                             onBack = { viewModel.setAccountSubScreen(null) }
                         )
 
@@ -519,12 +529,14 @@ private fun JCBestComplianceRoot(
                             onForceResetUserPassword = viewModel::forceResetUserPassword,
                             onProvisionUser = viewModel::provisionUser,
                             onSaveSystemSettings = viewModel::saveSystemSettings,
-                            onPurgeEvidenceBucket = viewModel::purgeEvidenceBucket
+                            onPurgeEvidenceBucket = viewModel::purgeEvidenceBucket,
+                            onResolveSignedUrl = viewModel::resolveSignedEvidenceUrl,
+                            onGetMediaHeaders = viewModel::getMediaRequestHeaders
                         )
 
                         uiState.activeTab == "dashboard" -> OverviewScreen(
                             displayName = prefsState.customDisplayName.ifBlank { session.displayName },
-                            reports = scopedReports,
+                            reports = myOwnReports,
                             staffList = uiState.staffList,
                             settings = uiState.systemSettings,
                             selectedTerm = uiState.selectedTerm,
@@ -533,28 +545,20 @@ private fun JCBestComplianceRoot(
                             onRefresh = { viewModel.refreshAllData(silent = false) },
                             onNewReport = { viewModel.openNewReportForm() },
                             onSelectReport = viewModel::openReportDetail,
-                            onNavigateToDivision = { div ->
-                                if (session.role.isAdminOrAbove) {
-                                    initialReportsScope = when (div) {
-                                        ComplianceDivision.ACADEMIC -> ReportScope.ACADEMIC
-                                        ComplianceDivision.OPERATIONS -> ReportScope.MAINTENANCE
-                                        ComplianceDivision.CDS -> ReportScope.CDS
-                                        ComplianceDivision.DISCIPLINE -> ReportScope.DISCIPLINE
-                                    }
-                                    viewModel.setActiveTab("reports")
-                                } else {
-                                    viewModel.setActiveTab("my-exceptions")
-                                }
+                            onNavigateToDivision = { _ ->
+                                viewModel.setActiveTab("my-exceptions")
                             },
                             userRole = session.role,
                             currentUserId = session.userId,
-                            avatarUri = prefsState.avatarUri.ifBlank { session.avatarUrl },
-                            onResolveSignedUrl = viewModel::resolveSignedEvidenceUrl
+                            avatarUri = session.avatarUrl.ifBlank { prefsState.avatarUri },
+                            onResolveSignedUrl = viewModel::resolveSignedEvidenceUrl,
+                            onGetMediaHeaders = viewModel::getMediaRequestHeaders,
+                            onOpenProfileSettings = { viewModel.setAccountSubScreen("settings") }
                         )
 
                         uiState.activeTab == "my-exceptions" -> {
-                            val adminFeedbackByReportId = remember(scopedReports) {
-                                scopedReports.associate { r ->
+                            val adminFeedbackByReportId = remember(myOwnReports) {
+                                myOwnReports.associate { r ->
                                     r.id to AdminExceptionFeedback(
                                         resolutionNote = r.resolutionNotes,
                                         evidenceNotes = r.evidenceNotes,
@@ -566,7 +570,7 @@ private fun JCBestComplianceRoot(
                             }
                             ExceptionsScreen(
                                 currentUserId = session.userId,
-                                reports = scopedReports,
+                                reports = myOwnReports,
                                 drafts = drafts,
                                 onNewException = { viewModel.openNewReportForm() },
                                 onConvertDraft = { draft -> viewModel.openNewReportForm(draft) },
@@ -617,7 +621,12 @@ private fun JCBestComplianceRoot(
                                 onClearFormDraft = viewModel::clearInProgressReportDraft,
                                 adminFeedbackByReportId = adminFeedbackByReportId,
                                 onShowLimitWarning = { msg -> viewModel.notifyMessage(msg, isError = true) },
-                                onWillLaunchExternalPicker = { viewModel.setAwaitingExternalActivity(true) }
+                                onWillLaunchExternalPicker = { viewModel.setAwaitingExternalActivity(true) },
+                                isOnline = uiState.isOnline,
+                                onAddOfflineFormDraft = { viewModel.openNewOfflineDraftForm() },
+                                onEditFormDraft = viewModel::openEditOfflineFormDraft,
+                                onCancelQueuedDraft = { draft -> viewModel.cancelQueuedDraft(draft.id) },
+                                onRetryQueuedSubmissions = viewModel::flushQueuedSubmissionsIfOnline
                             )
                         }
 
@@ -627,20 +636,27 @@ private fun JCBestComplianceRoot(
                             selectedTerm = uiState.selectedTerm,
                             initialScope = initialReportsScope,
                             onSelectTerm = viewModel::setSelectedTerm,
-                            onExportPdf = { scope, term ->
-                                viewModel.exportOfficialPdf(scope, term)
-                            },
+                            onGenerateReport = viewModel::exportOfficialReport,
                             onSelectReport = viewModel::openReportDetail
                         )
 
                         uiState.activeTab == "analytics" -> AnalyticsScreen(
-                            reports = scopedReports,
+                            reports = analyticsReports,
                             staffList = uiState.staffList,
+                            snapshots = uiState.termSnapshots,
+                            systemSettings = uiState.systemSettings,
                             selectedTerm = uiState.selectedTerm,
+                            isRefreshing = uiState.isRefreshing,
+                            isExportingPptx = uiState.isExportingPptx,
+                            pptxExportSuccess = uiState.pptxExportSuccessMessage,
+                            pptxExportError = uiState.pptxExportError,
                             onSelectTerm = viewModel::setSelectedTerm,
-                            onExportPdf = { scope, term, start, end ->
-                                viewModel.exportOfficialPdf(scope, term, start, end)
+                            onSyncDatabase = { viewModel.refreshAllData(silent = false) },
+                            onExportReport = { scope, format, term, start, end ->
+                                viewModel.exportAnalyticsReport(scope, format, term, start, end)
                             },
+                            onExportPptx = viewModel::exportCompliancePptx,
+                            onClearPptxStatus = viewModel::clearPptxExportStatus,
                             userRole = session.role,
                             currentUserId = session.userId
                         )
@@ -648,8 +664,10 @@ private fun JCBestComplianceRoot(
                         uiState.activeTab == "account" -> AccountScreen(
                             session = session,
                             displayName = prefsState.customDisplayName.ifBlank { session.displayName },
-                            avatarUri = prefsState.avatarUri.ifBlank { session.avatarUrl },
+                            avatarUri = session.avatarUrl.ifBlank { prefsState.avatarUri },
                             settings = uiState.systemSettings,
+                            onResolveSignedUrl = viewModel::resolveSignedEvidenceUrl,
+                            onGetMediaHeaders = viewModel::getMediaRequestHeaders,
                             onOpenSettings = { viewModel.setAccountSubScreen("settings") },
                             onOpenChangePassword = { viewModel.setAccountSubScreen("change_password") },
                             onOpenAdminPanel = { viewModel.setAccountSubScreen("admin") },
@@ -659,7 +677,7 @@ private fun JCBestComplianceRoot(
 
                         else -> OverviewScreen(
                             displayName = prefsState.customDisplayName.ifBlank { session.displayName },
-                            reports = scopedReports,
+                            reports = myOwnReports,
                             staffList = uiState.staffList,
                             settings = uiState.systemSettings,
                             selectedTerm = uiState.selectedTerm,
@@ -668,23 +686,15 @@ private fun JCBestComplianceRoot(
                             onRefresh = { viewModel.refreshAllData(silent = false) },
                             onNewReport = { viewModel.openNewReportForm() },
                             onSelectReport = viewModel::openReportDetail,
-                            onNavigateToDivision = { div ->
-                                if (session.role.isAdminOrAbove) {
-                                    initialReportsScope = when (div) {
-                                        ComplianceDivision.ACADEMIC -> ReportScope.ACADEMIC
-                                        ComplianceDivision.OPERATIONS -> ReportScope.MAINTENANCE
-                                        ComplianceDivision.CDS -> ReportScope.CDS
-                                        ComplianceDivision.DISCIPLINE -> ReportScope.DISCIPLINE
-                                    }
-                                    viewModel.setActiveTab("reports")
-                                } else {
-                                    viewModel.setActiveTab("my-exceptions")
-                                }
+                            onNavigateToDivision = { _ ->
+                                viewModel.setActiveTab("my-exceptions")
                             },
                             userRole = session.role,
                             currentUserId = session.userId,
-                            avatarUri = prefsState.avatarUri.ifBlank { session.avatarUrl },
-                            onResolveSignedUrl = viewModel::resolveSignedEvidenceUrl
+                            avatarUri = session.avatarUrl.ifBlank { prefsState.avatarUri },
+                            onResolveSignedUrl = viewModel::resolveSignedEvidenceUrl,
+                            onGetMediaHeaders = viewModel::getMediaRequestHeaders,
+                            onOpenProfileSettings = { viewModel.setAccountSubScreen("settings") }
                         )
                     }
 
@@ -716,7 +726,7 @@ private fun JCBestComplianceRoot(
                                     modifier = Modifier.size(16.dp)
                                 )
                                 Text(
-                                    text = "Offline Mode — Capture drafts locally and sync later.",
+                                    text = "Offline Mode — Draft locally or queue to auto-submit online.",
                                     color = p.textPrimary,
                                     fontSize = 12.sp,
                                     fontWeight = FontWeight.SemiBold,
@@ -759,10 +769,15 @@ private fun JCBestComplianceRoot(
 
                     // Global Report Detail Sheet
                     uiState.selectedReportForDetail?.let { detailReport ->
+                        val isArchiveOrAdminView = uiState.activeTab == "reports" || uiState.accountSubScreen == "admin"
+                        val isOwnReport = detailReport.reportedBy.equals(session.userId, ignoreCase = true)
+                        val showEditButton = session.role.isSuperAdmin || (!isArchiveOrAdminView && isOwnReport)
                         ReportDetailSheet(
                             report = detailReport,
                             userRole = session.role,
                             customChecks = allCustomChecks,
+                            showEditButton = showEditButton,
+                            isOwnReport = isOwnReport,
                             onDismiss = { viewModel.openReportDetail(null) },
                             onToggleSeen = viewModel::toggleSeenStatus,
                             onUpdateResolution = viewModel::updateResolution,
@@ -770,6 +785,10 @@ private fun JCBestComplianceRoot(
                             onEdit = viewModel::openEditReportForm,
                             onDelete = viewModel::deleteReport,
                             onResolveSignedUrl = viewModel::resolveSignedEvidenceUrl,
+                            onResolveMediaHeaders = viewModel::getMediaRequestHeaders,
+                            onDownloadEvidence = { storedPath, fileName ->
+                                viewModel.downloadAndOpenEvidence(context, storedPath, fileName)
+                            },
                             onSaveEvidenceFeedback = viewModel::saveEvidenceFeedback
                         )
                     }
@@ -779,6 +798,8 @@ private fun JCBestComplianceRoot(
                         ReportFormSheet(
                             editingReport = uiState.editingReport,
                             sourceDraft = uiState.convertingDraft,
+                            formMode = uiState.reportFormMode,
+                            isOnline = uiState.isOnline,
                             staffList = uiState.staffList,
                             classes = uiState.classes,
                             subjects = uiState.subjects,
@@ -791,13 +812,45 @@ private fun JCBestComplianceRoot(
                             compressionProgress = uiState.compressionProgress,
                             compressionLabel = uiState.compressionLabel,
                             onWillLaunchExternalPicker = { viewModel.setAwaitingExternalActivity(true) },
-                            initialDraft = if (uiState.editingReport == null && uiState.convertingDraft == null) uiState.savedFormDraft else null,
+                            initialDraft = if (
+                                uiState.editingReport == null &&
+                                uiState.convertingDraft == null &&
+                                uiState.reportFormMode == ReportFormMode.STANDARD
+                            ) uiState.savedFormDraft else null,
                             onDraftChanged = viewModel::saveInProgressReportDraft,
                             onClearDraft = viewModel::clearInProgressReportDraft,
+                            onSaveToOfflineDraft = { draft, attachments ->
+                                viewModel.saveFullFormOfflineDraft(
+                                    existingDraftId = uiState.convertingDraft?.id,
+                                    formDraft = draft,
+                                    attachments = attachments
+                                )
+                            },
                             onStageMediaFile = viewModel::stageReportMediaFile,
                             onStageMediaUri = viewModel::stageReportMediaUri,
                             onResolveSignedUrl = viewModel::resolveSignedEvidenceUrl,
                             onMediaLimitError = { msg -> viewModel.notifyMessage(msg, isError = true) },
+                            feedbackMessage = uiState.feedbackMessage,
+                            isErrorFeedback = uiState.isErrorFeedback,
+                            onClearFeedback = viewModel::clearFeedback,
+                            onQueueOfflineAutoSubmit = { division, targetType, staff, classroom, subject, opScope, specificSubjectText, assignedLocation, check, incDate, exText, effText, attachments, _ ->
+                                viewModel.queueReportForAutoSubmit(
+                                    division = division,
+                                    targetType = targetType,
+                                    staff = staff,
+                                    classroom = classroom,
+                                    subject = subject,
+                                    operationScope = opScope,
+                                    specificSubjectText = specificSubjectText,
+                                    assignedLocation = assignedLocation,
+                                    check = check,
+                                    incidentDate = incDate,
+                                    exceptionText = exText,
+                                    effectText = effText,
+                                    attachments = attachments,
+                                    sourceDraft = uiState.convertingDraft
+                                )
+                            },
                             onSubmit = { division, targetType, staff, classroom, subject, opScope, specificSubjectText, assignedLocation, check, incDate, exText, effText, attachments, cleanDraft ->
                                 viewModel.submitReport(
                                     existingReport = uiState.editingReport,

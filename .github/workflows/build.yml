@@ -34,6 +34,7 @@ jobs:
           S_URL: ${{ secrets.VITE_SUPABASE_URL || secrets.SUPABASE_URL || secrets.NEXT_PUBLIC_SUPABASE_URL || '' }}
           S_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY || secrets.SUPABASE_PUBLISHABLE_KEY || secrets.VITE_SUPABASE_ANON_KEY || secrets.SUPABASE_ANON_KEY || secrets.SUPABASE_KEY || secrets.ANON_KEY || '' }}
           S_SECRET: ${{ secrets.SUPABASE_SECRET_KEY || '' }}
+          S_API_BASE: ${{ secrets.API_BASE_URL || secrets.EXPO_PUBLIC_API_BASE_URL || secrets.VITE_API_BASE_URL || secrets.NEXT_PUBLIC_API_BASE_URL || secrets.WEB_APP_URL || '' }}
         run: |
           python3 - << 'PY'
           import os, re
@@ -77,6 +78,14 @@ jobs:
               env_map.get("SUPABASE_SECRET_KEY")
               or os.environ.get("S_SECRET", "")
           )
+          api_base = clean_val(
+              env_map.get("API_BASE_URL")
+              or env_map.get("EXPO_PUBLIC_API_BASE_URL")
+              or env_map.get("VITE_API_BASE_URL")
+              or env_map.get("NEXT_PUBLIC_API_BASE_URL")
+              or env_map.get("WEB_APP_URL")
+              or os.environ.get("S_API_BASE", "")
+          )
 
           if url:
               env_map["VITE_SUPABASE_URL"] = url
@@ -87,6 +96,9 @@ jobs:
               env_map["SUPABASE_ANON_KEY"] = key
           if secret:
               env_map["SUPABASE_SECRET_KEY"] = secret
+          if api_base:
+              env_map["API_BASE_URL"] = api_base
+              env_map["EXPO_PUBLIC_API_BASE_URL"] = api_base
 
           content = "\n".join(f"{k}={v}" for k, v in env_map.items()) + "\n"
           for path in [".env", "app/.env"]:
@@ -96,6 +108,7 @@ jobs:
           print("Generated .env keys:", list(env_map.keys()))
           print("Supabase URL configured:", bool(url) and "your-project-id" not in url)
           print("Supabase Key configured:", bool(key) and "your_key_here" not in key)
+          print("API Base URL configured:", bool(api_base) and "your-web-backend" not in api_base)
           PY
 
       - name: Build Signed Release APK
@@ -109,6 +122,8 @@ jobs:
           VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY || secrets.SUPABASE_PUBLISHABLE_KEY || secrets.VITE_SUPABASE_ANON_KEY || secrets.SUPABASE_ANON_KEY || secrets.SUPABASE_KEY || secrets.ANON_KEY }}
           SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY || secrets.VITE_SUPABASE_PUBLISHABLE_KEY || secrets.VITE_SUPABASE_ANON_KEY || secrets.SUPABASE_ANON_KEY || secrets.SUPABASE_KEY || secrets.ANON_KEY }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY || secrets.VITE_SUPABASE_PUBLISHABLE_KEY || secrets.SUPABASE_PUBLISHABLE_KEY || secrets.VITE_SUPABASE_ANON_KEY || secrets.SUPABASE_KEY }}
+          API_BASE_URL: ${{ secrets.API_BASE_URL || secrets.EXPO_PUBLIC_API_BASE_URL || secrets.VITE_API_BASE_URL || secrets.NEXT_PUBLIC_API_BASE_URL || secrets.WEB_APP_URL }}
+          EXPO_PUBLIC_API_BASE_URL: ${{ secrets.EXPO_PUBLIC_API_BASE_URL || secrets.API_BASE_URL || secrets.VITE_API_BASE_URL || secrets.NEXT_PUBLIC_API_BASE_URL || secrets.WEB_APP_URL }}
         run: gradle assembleRelease
 
       - name: Auto-Publish to Permanent Release Link

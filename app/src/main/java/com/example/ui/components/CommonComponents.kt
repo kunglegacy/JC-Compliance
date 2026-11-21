@@ -396,23 +396,12 @@ fun GlassCapsuleProgressBar(
 
 @Composable
 fun SchoolCrestBadge(size: Dp = 56.dp, modifier: Modifier = Modifier) {
-    val ext = ComplianceTheme.extended
-    Surface(
-        modifier = modifier.size(size),
-        shape = RoundedCornerShape(18.dp),
-        color = Color.White,
-        shadowElevation = 6.dp,
-        border = BorderStroke(1.2.dp, ext.glassRimStart)
-    ) {
-        Image(
-            painter = painterResource(id = R.drawable.jcbest_crest),
-            contentDescription = "JC-Best Schools International Crest",
-            contentScale = ContentScale.Fit,
-            modifier = Modifier
-                .padding(6.dp)
-                .clip(RoundedCornerShape(12.dp))
-        )
-    }
+    Image(
+        painter = painterResource(id = R.drawable.ic_jcbest_crest),
+        contentDescription = "JC-Best Schools International Crest",
+        contentScale = ContentScale.Fit,
+        modifier = modifier.size(size)
+    )
 }
 
 @Composable
@@ -660,10 +649,11 @@ fun MonoCodeText(text: String, color: Color = MaterialTheme.colorScheme.onSurfac
 fun SupabaseConnectionDialog(
     current: SupabaseConfig,
     onDismiss: () -> Unit,
-    onSave: (String, String) -> Unit
+    onSave: (String, String, String) -> Unit
 ) {
     var url by remember(current.url) { mutableStateOf(current.url) }
     var key by remember(current.anonKey) { mutableStateOf(current.anonKey) }
+    var apiBase by remember(current.apiBaseUrl) { mutableStateOf(current.apiBaseUrl) }
 
     val ext = ComplianceTheme.extended
     AlertDialog(
@@ -674,20 +664,20 @@ fun SupabaseConnectionDialog(
         title = {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Icon(Icons.Default.CheckCircle, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                Text("Supabase Backend", fontWeight = FontWeight.Bold)
+                Text("Directorate Backend", fontWeight = FontWeight.Bold)
             }
         },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(
-                    "Connect this app to your JCBest Directorate Supabase project URL and publishable/anon key.",
+                    "Connect this app to your JCBest Supabase project and shared Web Storage API backend URL (zero B2 secrets stored on device).",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 OutlinedTextField(
                     value = url,
                     onValueChange = { url = it },
-                    label = { Text("Project URL") },
+                    label = { Text("Supabase Project URL") },
                     placeholder = { Text("https://xxxxx.supabase.co") },
                     singleLine = true,
                     colors = glassFieldColors(),
@@ -704,11 +694,21 @@ fun SupabaseConnectionDialog(
                     shape = RoundedCornerShape(14.dp),
                     modifier = Modifier.fillMaxWidth().testTag("supabase_key_input")
                 )
+                OutlinedTextField(
+                    value = apiBase,
+                    onValueChange = { apiBase = it },
+                    label = { Text("Web Storage API Base URL (API_BASE_URL)") },
+                    placeholder = { Text("https://your-web-app.example.com") },
+                    singleLine = true,
+                    colors = glassFieldColors(),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier.fillMaxWidth().testTag("api_base_url_input")
+                )
             }
         },
         confirmButton = {
             Button(
-                onClick = { onSave(url, key) },
+                onClick = { onSave(url, key, apiBase) },
                 enabled = url.isNotBlank() && key.isNotBlank(),
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.testTag("save_supabase_config_button")

@@ -81,8 +81,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.model.DirectorateUser
 import com.example.data.model.UserRole
+import com.example.ui.components.AvatarFallbackMode
 import com.example.ui.components.GlassCircleIcon
 import com.example.ui.components.LivingAtmosphericBackground
+import com.example.ui.components.ProfileAvatar
 import com.example.ui.components.StatusGlassChip
 import com.example.ui.components.complianceGlassCard
 import com.example.ui.components.glassFieldColors
@@ -97,6 +99,8 @@ fun SystemUsersScreen(
     onUpdateEmail: (DirectorateUser, String) -> Unit,
     onForceResetPassword: (DirectorateUser) -> Unit,
     onProvisionUser: (email: String, password: String, name: String, staffNo: String, role: UserRole, () -> Unit) -> Unit,
+    onResolveSignedUrl: (suspend (String) -> Result<String>)? = null,
+    onGetMediaHeaders: ((String) -> Map<String, String>)? = null,
     onBack: () -> Unit
 ) {
     BackHandler { onBack() }
@@ -358,6 +362,8 @@ fun SystemUsersScreen(
                         DirectorateUserGlassCard(
                             user = user,
                             currentUserRole = currentUserRole,
+                            onResolveSignedUrl = onResolveSignedUrl,
+                            onGetMediaHeaders = onGetMediaHeaders,
                             onUpdateRole = { role -> onUpdateRole(user, role) },
                             onEditEmail = { editingEmailUser = user },
                             onResetPassword = { onForceResetPassword(user) },
@@ -645,6 +651,8 @@ private fun GlassDirectorySearchBar(
 private fun DirectorateUserGlassCard(
     user: DirectorateUser,
     currentUserRole: UserRole,
+    onResolveSignedUrl: (suspend (String) -> Result<String>)?,
+    onGetMediaHeaders: ((String) -> Map<String, String>)?,
     onUpdateRole: (UserRole) -> Unit,
     onEditEmail: () -> Unit,
     onResetPassword: () -> Unit,
@@ -665,15 +673,6 @@ private fun DirectorateUserGlassCard(
         user.role.isAdminOrAbove -> p.emerald
         else -> p.textSecondary
     }
-    val initials = remember(user.displayName) {
-        user.displayName
-            .trim()
-            .split(Regex("\\s+"))
-            .filter { it.isNotBlank() }
-            .take(2)
-            .joinToString("") { it.first().uppercaseChar().toString() }
-            .ifBlank { "U" }
-    }
 
     Column(
         modifier = Modifier
@@ -682,27 +681,22 @@ private fun DirectorateUserGlassCard(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Tier 1: Monogram Avatar + Identity + Status Chip
+        // Tier 1: Read-only Officer Avatar + Identity + Status Chip
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Box(
-                modifier = Modifier
-                    .size(46.dp)
-                    .clip(CircleShape)
-                    .background(roleAccent.copy(alpha = if (p.isDark) 0.20f else 0.14f))
-                    .border(1.dp, roleAccent.copy(alpha = 0.50f), CircleShape),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = initials,
-                    color = if (roleAccent == p.textSecondary) p.textPrimary else roleAccent,
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.Bold
-                )
-            }
+            ProfileAvatar(
+                avatarUrl = user.avatarUrl,
+                displayName = user.displayName,
+                size = 46.dp,
+                borderColor = roleAccent.copy(alpha = 0.55f),
+                accentColor = if (roleAccent == p.textSecondary) p.textPrimary else roleAccent,
+                fallbackMode = AvatarFallbackMode.INITIALS,
+                onResolveSignedUrl = onResolveSignedUrl,
+                getAuthHeaders = onGetMediaHeaders
+            )
 
             Column(
                 modifier = Modifier.weight(1f),

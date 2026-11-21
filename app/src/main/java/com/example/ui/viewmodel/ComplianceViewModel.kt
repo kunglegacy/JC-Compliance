@@ -1,7 +1,11 @@
 package com.example.ui.viewmodel
 
 import android.app.Application
+import android.content.Context
+import android.content.Intent
 import android.net.Uri
+import android.webkit.MimeTypeMap
+import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.local.AcademicWeekEngine
@@ -20,22 +24,29 @@ import com.example.data.model.DirectorateUser
 import com.example.data.model.DraftMediaItem
 import com.example.data.model.LockPolicy
 import com.example.data.model.MediaUploadLimits
+import com.example.data.model.MobileAppConfig
 import com.example.data.model.OfflineDraft
+import com.example.data.model.PptxSlideConfig
 import com.example.data.model.ReportEvidenceAttachment
 import com.example.data.model.ReportFormDraft
+import com.example.data.model.ReportFormMode
 import com.example.data.model.ReportResolutionStatus
 import com.example.data.model.ReportScope
 import com.example.data.model.StaffMember
+import com.example.data.model.StorageProviderConfig
 import com.example.data.model.SubjectItem
 import com.example.data.model.SupabaseConfig
 import com.example.data.model.SystemSettings
+import com.example.data.model.TermAnalysisSnapshot
 import com.example.data.model.ThemePreference
 import com.example.data.model.UserRole
 import com.example.data.model.UserSession
 import com.example.data.remote.ComplianceRepository
 import com.example.domain.AnalysisEngine
 import com.example.domain.ComplianceNotificationHelper
+import com.example.domain.DocxReportExporter
 import com.example.domain.MediaCompressor
+import com.example.domain.OfflineAutoSubmitEngine
 import com.example.domain.PdfReportExporter
 import com.example.ui.screens.reports.EvidenceVerdict
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -87,6 +98,7 @@ data class ComplianceUiState(
     val activeTab: String = "dashboard",
     val selectedReportForDetail: ComplianceReport? = null,
     val showReportForm: Boolean = false,
+    val reportFormMode: ReportFormMode = ReportFormMode.STANDARD,
     val editingReport: ComplianceReport? = null,
     val convertingDraft: OfflineDraft? = null,
     val convertingDraftMedia: List<DraftMediaItem> = emptyList(),
@@ -95,7 +107,13 @@ data class ComplianceUiState(
     val accountSubScreen: String? = null, // null | "settings" | "change_password" | "password_reset" | "admin"
     val adminSubScreen: String = "hub",    // "hub" | "officer_stats" | "staff_register" | "system_users" | "system_config"
     val lockCheckNonce: Long = 0L,
-    val pendingNavigationReportId: String? = null
+    val pendingNavigationReportId: String? = null,
+    val storageProviderConfig: StorageProviderConfig? = null,
+    val mobileAppConfig: MobileAppConfig? = null,
+    val termSnapshots: List<TermAnalysisSnapshot> = emptyList(),
+    val isExportingPptx: Boolean = false,
+    val pptxExportSuccessMessage: String? = null,
+    val pptxExportError: String? = null
 )
 
 class ComplianceViewModel(application: Application) : AndroidViewModel(application) {
@@ -111,6 +129,11 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
     private var knownReportSnapshots: Map<String, ReportResolutionStatus>? = null
     private var initialSyncDone = false
     private var pollingJob: Job? = null
+
+    private val uuidRegex = Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+    private fun isUuid(value: String?): Boolean =
+        !value.isNullOrBlank() && uuidRegex.matches(value.trim())
 
     fun setAwaitingExternalActivity(awaiting: Boolean) {
         isAwaitingExternalActivity = awaiting
@@ -156,7 +179,11 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             _uiState.update { it.copy(isBootstrapping = false) }
             if (initial.session != null && initial.supabaseConfig.isConfigured) {
                 ComplianceNotificationJobService.schedulePeriodicSync(application)
+                ComplianceNotificationJobService.scheduleEveningReminder(application)
                 startForegroundNotificationLoop()
+                if (_uiState.value.isOnline) {
+                    flushQueuedSubmissionsIfOnline()
+                }
                 refreshAllData(silent = true)
             }
         }
@@ -207,7 +234,44 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun setOnlineStatus(online: Boolean) {
+        val wasOffline = !_uiState.value.isOnline
         _uiState.update { it.copy(isOnline = online) }
+        if (online) {
+            val state = preferencesState.value
+            if (state.session != null && !shouldShowAppLock(state)) {
+                flushQueuedSubmissionsIfOnline()
+                if (wasOffline) {
+                    refreshAllData(silent = true)
+                }
+            }
+        }
+    }
+
+    fun flushQueuedSubmissionsIfOnline() {
+        val state = preferencesState.value
+        val session = state.session ?: return
+        if (!_uiState.value.isOnline || !state.supabaseConfig.isConfigured) return
+        viewModelScope.launch {
+            val queuedBefore = draftRepo.listQueuedForAutoSubmit(session.userId)
+            if (queuedBefore.isEmpty()) return@launch
+            val res = OfflineAutoSubmitEngine.processQueue(getApplication())
+            if (res.hasAnySubmitted) {
+                _uiState.update { current ->
+                    val newIds = res.submittedReports.map { it.id }.toSet()
+                    current.copy(
+                        reports = res.submittedReports + current.reports.filterNot { it.id in newIds }
+                    )
+                }
+                val count = res.submittedReports.size
+                notifyMessage(
+                    if (count == 1) "Queued offline report submitted automatically."
+                    else "$count queued offline reports submitted automatically."
+                )
+                refreshAllData(silent = true)
+            } else if (res.hasRemainingFailures) {
+                ComplianceNotificationJobService.scheduleAutoSubmitJob(getApplication())
+            }
+        }
     }
 
     fun clearAuthError() {
@@ -257,17 +321,56 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         _uiState.update {
             it.copy(
                 showReportForm = true,
+                reportFormMode = ReportFormMode.STANDARD,
                 showResumeReportPrompt = false,
                 editingReport = null,
                 convertingDraft = draft,
-                convertingDraftMedia = resolvedMedia
+                convertingDraftMedia = resolvedMedia,
+                feedbackMessage = null,
+                isErrorFeedback = false
+            )
+        }
+    }
+
+    fun openNewOfflineDraftForm() {
+        _uiState.update {
+            it.copy(
+                showReportForm = true,
+                reportFormMode = ReportFormMode.OFFLINE_DRAFT,
+                showResumeReportPrompt = false,
+                editingReport = null,
+                convertingDraft = null,
+                convertingDraftMedia = emptyList(),
+                feedbackMessage = null,
+                isErrorFeedback = false
+            )
+        }
+    }
+
+    fun openEditOfflineFormDraft(draft: OfflineDraft) {
+        _uiState.update {
+            it.copy(
+                showReportForm = true,
+                reportFormMode = ReportFormMode.OFFLINE_DRAFT,
+                showResumeReportPrompt = false,
+                editingReport = null,
+                convertingDraft = draft,
+                convertingDraftMedia = draft.mediaItems,
+                feedbackMessage = null,
+                isErrorFeedback = false
             )
         }
     }
 
     fun openEditReportForm(report: ComplianceReport) {
         val session = preferencesState.value.session
-        if (report.isReviewedFinal && session?.role?.isAdminOrAbove != true) {
+        val isSuperAdmin = session?.role?.isSuperAdmin == true
+        val isMine = session != null && report.reportedBy.equals(session.userId, ignoreCase = true)
+        if (!isSuperAdmin && (!isMine || _uiState.value.activeTab == "reports" || _uiState.value.accountSubScreen == "admin")) {
+            notifyMessage("Only Super Admins can edit exceptions from the institutional archive.", isError = true)
+            return
+        }
+        if (report.isReviewedFinal && !isSuperAdmin) {
             notifyMessage("Accepted or rejected exceptions are locked and cannot be edited.", isError = true)
             return
         }
@@ -275,9 +378,12 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             it.copy(
                 selectedReportForDetail = null,
                 showReportForm = true,
+                reportFormMode = ReportFormMode.STANDARD,
                 editingReport = report,
                 convertingDraft = null,
-                convertingDraftMedia = emptyList()
+                convertingDraftMedia = emptyList(),
+                feedbackMessage = null,
+                isErrorFeedback = false
             )
         }
     }
@@ -286,17 +392,20 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         _uiState.update {
             it.copy(
                 showReportForm = false,
+                reportFormMode = ReportFormMode.STANDARD,
                 editingReport = null,
                 convertingDraft = null,
-                convertingDraftMedia = emptyList()
+                convertingDraftMedia = emptyList(),
+                feedbackMessage = null,
+                isErrorFeedback = false
             )
         }
     }
 
-    fun saveSupabaseConfig(url: String, anonKey: String) {
+    fun saveSupabaseConfig(url: String, anonKey: String, apiBaseUrl: String = "") {
         viewModelScope.launch {
-            prefs.saveSupabaseConfig(url, anonKey)
-            notifyMessage("Supabase connection settings saved.")
+            prefs.saveSupabaseConfig(url, anonKey, apiBaseUrl)
+            notifyMessage("Backend connection settings saved.")
         }
     }
 
@@ -341,7 +450,9 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                 }
                 refreshAllData(silent = true)
                 ComplianceNotificationJobService.schedulePeriodicSync(getApplication())
+                ComplianceNotificationJobService.scheduleEveningReminder(getApplication())
                 startForegroundNotificationLoop()
+                flushQueuedSubmissionsIfOnline()
             }.onFailure { err ->
                 _uiState.update {
                     it.copy(
@@ -502,9 +613,12 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         val state = preferencesState.value
         if (state.session == null || !state.deviceSetupCompleted) return
         wasBackgrounded = true
-        val hasPendingDrafts = drafts.value.isNotEmpty() || _uiState.value.savedFormDraft?.hasContent == true
+        val hasPendingDrafts = drafts.value.any { !it.isQueuedForSubmit } ||
+            _uiState.value.savedFormDraft?.hasContent == true
         if (hasPendingDrafts) {
-            ComplianceNotificationJobService.scheduleDraftReminder(getApplication(), 90_000L)
+            ComplianceNotificationJobService.scheduleDraftReminder(getApplication())
+        } else {
+            ComplianceNotificationJobService.cancelDraftReminder(getApplication())
         }
         when (state.lockPolicy) {
             LockPolicy.ALWAYS -> {
@@ -634,7 +748,9 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                 refreshSavedFormDraftState(userId, triggerPrompt = true)
             }
             ComplianceNotificationJobService.schedulePeriodicSync(getApplication())
+            ComplianceNotificationJobService.scheduleEveningReminder(getApplication())
             startForegroundNotificationLoop()
+            flushQueuedSubmissionsIfOnline()
             _uiState.update { it.copy(lockCheckNonce = System.currentTimeMillis()) }
         }
     }
@@ -665,73 +781,147 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         viewModelScope.launch { prefs.saveAutoFillEnabled(enabled) }
     }
 
-    fun saveProfileIdentity(displayName: String, avatarUri: String?) {
+    fun uploadProfileAvatar(imageUri: Uri) {
+        val state = preferencesState.value
+        val session = state.session ?: return
+        if (!state.supabaseConfig.isConfigured) {
+            notifyMessage("Cloud backend is not configured.", isError = true)
+            return
+        }
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    isLoading = true,
+                    compressionLabel = "Resizing profile photo...",
+                    compressionProgress = 0.15f
+                )
+            }
+            val activeSession = ensureFreshSession(state.supabaseConfig, session)
+            val compRes = MediaCompressor.compressAvatarUri(
+                context = getApplication(),
+                uri = imageUri,
+                onProgress = { p -> _uiState.update { it.copy(compressionProgress = p * 0.7f) } }
+            )
+            val compressedFile = compRes.getOrNull()?.file
+            if (compressedFile == null || !compressedFile.exists()) {
+                _uiState.update { it.copy(isLoading = false, compressionLabel = null, compressionProgress = null) }
+                notifyMessage(
+                    compRes.exceptionOrNull()?.message ?: "Unable to process selected image.",
+                    isError = true
+                )
+                return@launch
+            }
+
+            _uiState.update {
+                it.copy(compressionLabel = "Uploading profile photo...", compressionProgress = 0.85f)
+            }
+            val previousAvatar = activeSession.avatarUrl.ifBlank { state.avatarUri }
+            val upRes = try {
+                remoteRepo.uploadProfileAvatar(
+                    config = state.supabaseConfig,
+                    session = activeSession,
+                    avatarFile = compressedFile,
+                    previousAvatarPath = previousAvatar
+                )
+            } finally {
+                runCatching { compressedFile.delete() }
+            }
+
+            upRes.onSuccess { canonicalObjectKey ->
+                val updatedSession = activeSession.copy(avatarUrl = canonicalObjectKey)
+                prefs.saveProfileCustomization(null, canonicalObjectKey)
+                prefs.saveSession(updatedSession)
+                _uiState.update { current ->
+                    current.copy(
+                        isLoading = false,
+                        compressionLabel = null,
+                        compressionProgress = null,
+                        directorateUsers = current.directorateUsers.map { u ->
+                            if (u.userId.equals(activeSession.userId, ignoreCase = true)) {
+                                u.copy(avatarUrl = canonicalObjectKey)
+                            } else u
+                        }
+                    )
+                }
+                notifyMessage("Profile photo updated.")
+            }.onFailure { err ->
+                _uiState.update { it.copy(isLoading = false, compressionLabel = null, compressionProgress = null) }
+                notifyMessage(err.message ?: "Unable to upload profile photo.", isError = true)
+            }
+        }
+    }
+
+    fun removeProfileAvatar() {
+        val state = preferencesState.value
+        val session = state.session ?: return
+        val previousAvatar = session.avatarUrl.ifBlank { state.avatarUri }
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoading = true) }
+            if (state.supabaseConfig.isConfigured) {
+                val activeSession = ensureFreshSession(state.supabaseConfig, session)
+                val res = remoteRepo.removeProfileAvatar(
+                    config = state.supabaseConfig,
+                    session = activeSession,
+                    previousAvatarPath = previousAvatar
+                )
+                if (res.isFailure) {
+                    _uiState.update { it.copy(isLoading = false) }
+                    notifyMessage(res.exceptionOrNull()?.message ?: "Unable to remove profile photo.", isError = true)
+                    return@launch
+                }
+                prefs.saveProfileCustomization(null, "")
+                prefs.saveSession(activeSession.copy(avatarUrl = ""))
+                _uiState.update { current ->
+                    current.copy(
+                        isLoading = false,
+                        directorateUsers = current.directorateUsers.map { u ->
+                            if (u.userId.equals(activeSession.userId, ignoreCase = true)) {
+                                u.copy(avatarUrl = "")
+                            } else u
+                        }
+                    )
+                }
+            } else {
+                prefs.saveProfileCustomization(null, "")
+                prefs.saveSession(session.copy(avatarUrl = ""))
+                _uiState.update { it.copy(isLoading = false) }
+            }
+            notifyMessage("Profile photo removed.")
+        }
+    }
+
+    fun saveProfileDisplayName(displayName: String) {
         val state = preferencesState.value
         val session = state.session
         val cleanName = displayName.trim()
+        if (cleanName.isBlank()) {
+            notifyMessage("Display name cannot be empty.", isError = true)
+            return
+        }
         viewModelScope.launch {
-            var resolvedAvatar = avatarUri
-            val needsUpload = !avatarUri.isNullOrBlank() &&
-                !avatarUri.startsWith("http://") &&
-                !avatarUri.startsWith("https://") &&
-                session != null &&
-                state.supabaseConfig.isConfigured
-
-            if (needsUpload && session != null) {
-                _uiState.update {
-                    it.copy(
-                        isLoading = true,
-                        compressionLabel = "Optimizing profile photo...",
-                        compressionProgress = 0.1f
-                    )
-                }
-                val activeSession = ensureFreshSession(state.supabaseConfig, session)
-                val compRes = if (avatarUri!!.startsWith("/")) {
-                    MediaCompressor.compressImageFile(
-                        context = getApplication(),
-                        sourceFile = File(avatarUri),
-                        maxDimension = 512,
-                        targetMaxBytes = 140 * 1024,
-                        onProgress = { p -> _uiState.update { it.copy(compressionProgress = p) } }
-                    )
-                } else {
-                    MediaCompressor.compressAvatarUri(
-                        context = getApplication(),
-                        uri = Uri.parse(avatarUri),
-                        onProgress = { p -> _uiState.update { it.copy(compressionProgress = p) } }
-                    )
-                }
-                val compressedFile = compRes.getOrNull()?.file
-                if (compressedFile != null && compressedFile.exists()) {
-                    _uiState.update {
-                        it.copy(compressionLabel = "Uploading profile photo...", compressionProgress = 0.9f)
-                    }
-                    val upRes = remoteRepo.uploadProfileAvatar(state.supabaseConfig, activeSession, compressedFile)
-                    upRes.onSuccess { cloudUrl ->
-                        resolvedAvatar = cloudUrl
-                    }.onFailure { err ->
-                        _uiState.update { it.copy(isLoading = false, compressionLabel = null, compressionProgress = null) }
-                        notifyMessage(err.message ?: "Unable to sync profile photo to cloud.", isError = true)
-                        return@launch
-                    }
-                }
-            }
-
-            prefs.saveProfileCustomization(cleanName, resolvedAvatar)
+            _uiState.update { it.copy(isLoading = true) }
+            prefs.saveProfileCustomization(cleanName, null)
             if (session != null && state.supabaseConfig.isConfigured) {
                 val activeSession = ensureFreshSession(state.supabaseConfig, session)
-                if (cleanName.isNotBlank()) {
-                    remoteRepo.updateDisplayNameOnServer(state.supabaseConfig, activeSession, cleanName)
+                val res = remoteRepo.updateDisplayNameOnServer(state.supabaseConfig, activeSession, cleanName)
+                if (res.isFailure) {
+                    _uiState.update { it.copy(isLoading = false) }
+                    notifyMessage(res.exceptionOrNull()?.message ?: "Unable to update display name.", isError = true)
+                    return@launch
                 }
-                prefs.saveSession(
-                    activeSession.copy(
-                        displayName = cleanName.ifBlank { activeSession.displayName },
-                        avatarUrl = resolvedAvatar ?: activeSession.avatarUrl
+                prefs.saveSession(activeSession.copy(displayName = cleanName))
+                _uiState.update { current ->
+                    current.copy(
+                        directorateUsers = current.directorateUsers.map { u ->
+                            if (u.userId.equals(activeSession.userId, ignoreCase = true)) {
+                                u.copy(displayName = cleanName)
+                            } else u
+                        }
                     )
-                )
+                }
             }
-            _uiState.update { it.copy(isLoading = false, compressionLabel = null, compressionProgress = null) }
-            notifyMessage("Profile settings saved.")
+            _uiState.update { it.copy(isLoading = false) }
+            notifyMessage("Profile display name updated.")
         }
     }
 
@@ -754,7 +944,7 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             val classesDeferred = async { remoteRepo.fetchClasses(config, activeSession.accessToken) }
             val subjectsDeferred = async { remoteRepo.fetchSubjects(config, activeSession.accessToken) }
             val checksDeferred = async { remoteRepo.fetchComplianceChecks(config, activeSession.accessToken) }
-            val avatarDeferred = async { remoteRepo.fetchProfileAvatarUrl(config, activeSession) }
+            val profileDeferred = async { remoteRepo.fetchCurrentUserProfile(config, activeSession) }
             val usersDeferred = async {
                 if (activeSession.role.isAdminOrAbove) {
                     remoteRepo.fetchDirectorateUsers(config, activeSession.accessToken, activeSession)
@@ -765,6 +955,15 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             val notificationsDeferred = async {
                 remoteRepo.fetchUnreadNotifications(config, activeSession)
             }
+            val storageProviderDeferred = async {
+                runCatching { remoteRepo.fetchStorageProviderConfig(config, activeSession.accessToken) }.getOrNull()
+            }
+            val mobileAppConfigDeferred = async {
+                runCatching { remoteRepo.fetchMobileAppConfig(config, activeSession.accessToken) }.getOrNull()
+            }
+            val snapshotsDeferred = async {
+                runCatching { remoteRepo.fetchTermSnapshots(config, activeSession.accessToken) }.getOrDefault(emptyList())
+            }
 
             val settings = settingsDeferred.await()
             val reportsRes = reportsDeferred.await()
@@ -772,17 +971,39 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             val classes = classesDeferred.await()
             val subjects = subjectsDeferred.await()
             val checks = checksDeferred.await()
-            val fetchedAvatar = avatarDeferred.await()
+            val fetchedProfile = profileDeferred.await()
             val users = usersDeferred.await()
             val unreadNotifications = notificationsDeferred.await()
+            val storageProviderCfg = storageProviderDeferred.await()
+            val mobileAppCfg = mobileAppConfigDeferred.await()
+            val fetchedSnapshots = snapshotsDeferred.await()
 
-            if (fetchedAvatar.isNotBlank() && fetchedAvatar != state.avatarUri) {
-                prefs.saveProfileCustomization(null, fetchedAvatar)
+            fetchedProfile.onSuccess { (serverName, serverAvatar) ->
+                val resolvedName = serverName.ifBlank { activeSession.displayName }
+                val avatarChanged = serverAvatar != state.avatarUri || serverAvatar != activeSession.avatarUrl
+                val nameChanged = serverName.isNotBlank() && serverName != state.customDisplayName
+                if (avatarChanged || nameChanged) {
+                    prefs.saveProfileCustomization(
+                        displayName = if (serverName.isNotBlank()) serverName else null,
+                        avatarUri = serverAvatar
+                    )
+                    prefs.saveSession(
+                        activeSession.copy(
+                            displayName = resolvedName,
+                            avatarUrl = serverAvatar
+                        )
+                    )
+                }
             }
 
             dispatchServerNotifications(config, activeSession, unreadNotifications)
 
             val fetchedReports = reportsRes.getOrElse { _uiState.value.reports }
+            val myServerDates = fetchedReports
+                .filter { it.reportedBy.equals(activeSession.userId, ignoreCase = true) }
+                .flatMap { r -> listOf(r.createdAt.take(10), r.incidentDate.take(10)) }
+            prefs.syncReportActivityDates(activeSession.userId, myServerDates, AcademicWeekEngine.todayIso())
+
             val scopedReports = if (activeSession.role.isAdminOrAbove) {
                 fetchedReports
             } else {
@@ -790,6 +1011,20 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             }
 
             processReportDiffNotifications(activeSession, scopedReports)
+
+            // Check evening 6 PM reminder lazily when active after 6 PM
+            val currentDrafts = draftRepo.listAllDraftsOnce(activeSession.userId, materializeMedia = false)
+            val composerDraft = draftRepo.loadComposerFormDraft(activeSession.userId)?.takeIf { it.hasContent }
+            val (lastDate, firstDate) = prefs.getReportTrackingSnapshot(activeSession.userId, AcademicWeekEngine.todayIso())
+            ComplianceNotificationHelper.notifyEveningStandardReminderIfDue(
+                context = getApplication(),
+                userId = activeSession.userId,
+                role = activeSession.role,
+                hasAnyDraft = currentDrafts.isNotEmpty() || composerDraft != null,
+                lastSubmittedDateIso = lastDate,
+                firstTrackingDateIso = firstDate,
+                forceHourCheck = true
+            )
 
             _uiState.update { current ->
                 val newTerm = if (current.selectedTerm.isBlank()) settings.activeTerm else current.selectedTerm
@@ -811,7 +1046,10 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                     serverCustomChecks = checks,
                     directorateUsers = users,
                     selectedReportForDetail = targetDetail,
-                    pendingNavigationReportId = if (targetDetail?.id == pendingId) null else pendingId
+                    pendingNavigationReportId = if (targetDetail?.id == pendingId) null else pendingId,
+                    storageProviderConfig = storageProviderCfg ?: current.storageProviderConfig,
+                    mobileAppConfig = mobileAppCfg ?: current.mobileAppConfig,
+                    termSnapshots = fetchedSnapshots.ifEmpty { current.termSnapshots }
                 )
             }
         }
@@ -840,7 +1078,7 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                     reportNumber = n.reportNumber.orEmpty(),
                     complianceCheck = n.body
                 )
-                "NEW_SUBMISSION" -> if (session.role.isAdminOrAbove) {
+                "NEW_SUBMISSION" -> if (session.role.isSuperAdmin) {
                     ComplianceNotificationHelper.notifyNewSubmissionForAdmin(
                         context = ctx,
                         dedupKey = n.reportId ?: n.id,
@@ -883,7 +1121,7 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             val prevStatus = previous[report.id]
             val isMine = report.reportedBy.equals(session.userId, ignoreCase = true)
 
-            if (session.role.isAdminOrAbove && prevStatus == null && !isMine) {
+            if (session.role.isSuperAdmin && prevStatus == null && !isMine) {
                 ComplianceNotificationHelper.notifyNewSubmissionForAdmin(
                     context = ctx,
                     dedupKey = report.id,
@@ -996,6 +1234,151 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    fun saveFullFormOfflineDraft(
+        existingDraftId: String?,
+        formDraft: ReportFormDraft,
+        attachments: List<ReportEvidenceAttachment>,
+        onComplete: () -> Unit = {}
+    ) {
+        val userId = preferencesState.value.session?.userId.orEmpty()
+        if (userId.isBlank()) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoading = true) }
+            draftRepo.saveFullFormDraft(
+                userId = userId,
+                existingDraftId = existingDraftId,
+                formDraft = formDraft,
+                attachments = attachments,
+                queueForAutoSubmit = false
+            )
+            _uiState.update {
+                it.copy(
+                    isLoading = false,
+                    showReportForm = false,
+                    reportFormMode = ReportFormMode.STANDARD,
+                    editingReport = null,
+                    convertingDraft = null,
+                    convertingDraftMedia = emptyList()
+                )
+            }
+            notifyMessage("Saved exception form to Offline Drafts.")
+            onComplete()
+        }
+    }
+
+    fun queueReportForAutoSubmit(
+        division: ComplianceDivision,
+        targetType: String,
+        staff: StaffMember?,
+        classroom: Classroom?,
+        subject: SubjectItem?,
+        operationScope: String,
+        specificSubjectText: String,
+        assignedLocation: String,
+        check: ComplianceCheck?,
+        incidentDate: String,
+        exceptionText: String,
+        effectText: String,
+        attachments: List<ReportEvidenceAttachment>,
+        sourceDraft: OfflineDraft?,
+        onComplete: () -> Unit = {}
+    ) {
+        val userId = preferencesState.value.session?.userId.orEmpty()
+        if (userId.isBlank()) return
+
+        val imageCount = attachments.count { it.mediaType.equals("image", ignoreCase = true) }
+        val videoCount = attachments.count { it.mediaType.equals("video", ignoreCase = true) }
+        if (imageCount > MediaUploadLimits.MAX_IMAGES_PER_REPORT) {
+            notifyMessage("Maximum ${MediaUploadLimits.MAX_IMAGES_PER_REPORT} images allowed per exception.", isError = true)
+            return
+        }
+        if (videoCount > MediaUploadLimits.MAX_VIDEOS_PER_REPORT) {
+            notifyMessage("Maximum ${MediaUploadLimits.MAX_VIDEOS_PER_REPORT} videos allowed per exception.", isError = true)
+            return
+        }
+
+        val uiSnapshot = _uiState.value
+        val resolvedStaff = when {
+            division == ComplianceDivision.CDS -> null
+            staff != null && isUuid(staff.id) -> staff
+            staff != null -> uiSnapshot.staffList.firstOrNull {
+                isUuid(it.id) && (
+                    (staff.staffCode.isNotBlank() && it.staffCode.equals(staff.staffCode, true)) ||
+                        it.name.equals(staff.name, true)
+                    )
+            } ?: staff
+            else -> null
+        }
+        val resolvedClass = classroom?.let { cls ->
+            if (isUuid(cls.id)) cls else uiSnapshot.classes.firstOrNull { isUuid(it.id) && it.name.equals(cls.name, true) } ?: cls
+        }
+        val resolvedSubject = subject?.let { subj ->
+            if (isUuid(subj.id)) subj else uiSnapshot.subjects.firstOrNull { isUuid(it.id) && it.name.equals(subj.name, true) } ?: subj
+        }
+
+        val draftPayload = ReportFormDraft(
+            divisionKey = division.key,
+            targetType = targetType,
+            staffId = resolvedStaff?.id,
+            staffCode = resolvedStaff?.staffCode,
+            staffName = resolvedStaff?.name,
+            classId = resolvedClass?.id,
+            className = resolvedClass?.name,
+            subjectId = resolvedSubject?.id,
+            subjectName = resolvedSubject?.name,
+            operationScope = operationScope,
+            opPersonOrLocation = assignedLocation.ifBlank { specificSubjectText },
+            studentNamesArm = if (division == ComplianceDivision.DISCIPLINE) specificSubjectText else "",
+            checkId = check?.id,
+            checkName = check?.name,
+            incidentDate = incidentDate.ifBlank { AcademicWeekEngine.todayIso() },
+            exceptionText = exceptionText.trim(),
+            effectText = effectText.trim(),
+            sourceDraftId = sourceDraft?.id,
+            hasUserEdited = true,
+            updatedAtMillis = System.currentTimeMillis()
+        )
+
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoading = true) }
+            draftRepo.saveFullFormDraft(
+                userId = userId,
+                existingDraftId = sourceDraft?.id,
+                formDraft = draftPayload,
+                attachments = attachments,
+                queueForAutoSubmit = true
+            )
+            draftRepo.clearComposerFormDraft(userId)
+            ComplianceNotificationJobService.scheduleAutoSubmitJob(getApplication())
+            _uiState.update {
+                it.copy(
+                    isLoading = false,
+                    showReportForm = false,
+                    reportFormMode = ReportFormMode.STANDARD,
+                    editingReport = null,
+                    convertingDraft = null,
+                    convertingDraftMedia = emptyList(),
+                    savedFormDraft = null,
+                    showResumeReportPrompt = false
+                )
+            }
+            notifyMessage("Exception queued. It will submit automatically once you are back online.")
+            if (_uiState.value.isOnline) {
+                flushQueuedSubmissionsIfOnline()
+            }
+            onComplete()
+        }
+    }
+
+    fun cancelQueuedDraft(draftId: String) {
+        val userId = preferencesState.value.session?.userId.orEmpty()
+        if (userId.isBlank()) return
+        viewModelScope.launch {
+            draftRepo.setDraftQueuedState(userId, draftId, queued = false)
+            notifyMessage("Moved back to Offline Drafts.")
+        }
+    }
+
     fun deleteDraft(draftId: String) {
         val userId = preferencesState.value.session?.userId.orEmpty()
         if (userId.isBlank()) return
@@ -1032,6 +1415,7 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             it.copy(
                 showResumeReportPrompt = false,
                 showReportForm = true,
+                reportFormMode = ReportFormMode.STANDARD,
                 editingReport = null,
                 convertingDraft = null,
                 convertingDraftMedia = emptyList()
@@ -1092,7 +1476,13 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         val session = state.session ?: return
         val config = state.supabaseConfig
 
-        if (existingReport != null && existingReport.isReviewedFinal && !session.role.isAdminOrAbove) {
+        val isSuperAdmin = session.role.isSuperAdmin
+        val isMine = existingReport?.reportedBy?.equals(session.userId, ignoreCase = true) == true
+        if (existingReport != null && !isSuperAdmin && !isMine) {
+            notifyMessage("Only Super Admins can edit another officer's exception.", isError = true)
+            return
+        }
+        if (existingReport != null && existingReport.isReviewedFinal && !isSuperAdmin) {
             notifyMessage("Accepted or rejected exceptions are locked and cannot be edited.", isError = true)
             return
         }
@@ -1201,6 +1591,7 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                     else -> "application/octet-stream"
                 }
 
+                val reportScope = existingReport?.id?.takeIf { it.isNotBlank() } ?: reportNumber
                 val upResult = when {
                     compressedFile != null && compressedFile.exists() ->
                         remoteRepo.uploadEvidenceFile(
@@ -1208,11 +1599,19 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                             token = activeSession.accessToken,
                             reportNumber = reportNumber,
                             file = compressedFile,
-                            mimeType = compressedMime ?: defaultMime
+                            mimeType = compressedMime ?: defaultMime,
+                            reportId = reportScope
                         )
                     att.pathOrUri.startsWith("/") -> {
                         val rawFile = File(att.pathOrUri)
-                        remoteRepo.uploadEvidenceFile(config, activeSession.accessToken, reportNumber, rawFile, defaultMime)
+                        remoteRepo.uploadEvidenceFile(
+                            config = config,
+                            token = activeSession.accessToken,
+                            reportNumber = reportNumber,
+                            file = rawFile,
+                            mimeType = defaultMime,
+                            reportId = reportScope
+                        )
                     }
                     else ->
                         remoteRepo.uploadEvidenceUri(
@@ -1220,7 +1619,8 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                             token = activeSession.accessToken,
                             reportNumber = reportNumber,
                             uri = Uri.parse(att.pathOrUri),
-                            fallbackMime = defaultMime
+                            fallbackMime = defaultMime,
+                            reportId = reportScope
                         ).map { it.first }
                 }
 
@@ -1243,14 +1643,48 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
 
             _uiState.update { it.copy(compressionLabel = "Saving compliance report...", compressionProgress = 0.98f) }
 
+            val uiSnapshot = _uiState.value
+            val resolvedStaff = when {
+                division == ComplianceDivision.CDS -> null
+                staff != null && isUuid(staff.id) -> staff
+                staff != null -> uiSnapshot.staffList.firstOrNull {
+                    isUuid(it.id) && (
+                        (staff.staffCode.isNotBlank() && it.staffCode.equals(staff.staffCode, true)) ||
+                            it.name.equals(staff.name, true)
+                        )
+                } ?: staff
+                else -> null
+            }
+            val resolvedStaffId = resolvedStaff?.id?.takeIf { isUuid(it) }
+            val effectiveTargetType = when {
+                division == ComplianceDivision.CDS -> "division"
+                division == ComplianceDivision.OPERATIONS && resolvedStaffId == null -> "division"
+                division == ComplianceDivision.DISCIPLINE && (targetType == "division" || resolvedStaffId == null) -> "division"
+                else -> "staff"
+            }
+
+            val resolvedClassId = classroom?.id?.takeIf { isUuid(it) }
+                ?: classroom?.name?.let { cName ->
+                    uiSnapshot.classes.firstOrNull { isUuid(it.id) && it.name.equals(cName, true) }?.id
+                }
+            val resolvedSubjectId = subject?.id?.takeIf { isUuid(it) }
+                ?: subject?.name?.let { sName ->
+                    uiSnapshot.subjects.firstOrNull { isUuid(it.id) && it.name.equals(sName, true) }?.id
+                }
+            val resolvedCheckId = check?.id?.trim()
+                ?.takeIf { it.isNotBlank() && !it.equals("CUSTOM", ignoreCase = true) }
+
             val staffNameVal = when {
-                staff != null -> staff.name
+                resolvedStaff != null -> resolvedStaff.name
                 division == ComplianceDivision.OPERATIONS && specificSubjectText.isNotBlank() -> specificSubjectText.trim()
-                division == ComplianceDivision.DISCIPLINE && targetType == "division" -> "Student Decorum"
+                division == ComplianceDivision.OPERATIONS -> operationScope.ifBlank { "Operation" }
+                division == ComplianceDivision.DISCIPLINE && effectiveTargetType == "division" ->
+                    specificSubjectText.trim().ifBlank { "Student Decorum" }
                 division == ComplianceDivision.CDS -> "CDS Infrastructure"
                 else -> "Staff / Unit"
             }
             val actorDisplayName = state.customDisplayName.ifBlank { activeSession.displayName }.ifBlank { activeSession.email }
+            val safeEffectText = effectText.trim().ifBlank { "Operational or academic compliance impact noted." }
 
             val payload = JSONObject().apply {
                 put("report_number", reportNumber)
@@ -1264,26 +1698,26 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                 put("week_number", existingReport?.weekNumber ?: activeWeek)
                 put("term", existingReport?.term ?: settings.activeTerm)
                 put("division", division.dbValue)
-                put("department", staff?.department ?: division.dbValue)
-                put("category", check?.category ?: operationScope.ifBlank { division.label })
-                put("target_type", targetType)
-                put("check_id", check?.id ?: "CUSTOM")
+                put("department", resolvedStaff?.department ?: division.dbValue)
+                put("category", check?.name?.ifBlank { operationScope.ifBlank { division.label } } ?: operationScope.ifBlank { division.label })
+                put("target_type", effectiveTargetType)
+                if (resolvedCheckId != null) put("check_id", resolvedCheckId) else put("check_id", JSONObject.NULL)
                 put("compliance_check", check?.name ?: "General Compliance")
                 put("exception", exceptionText.trim())
                 put("exception_text", exceptionText.trim())
-                put("effect", effectText.trim())
-                put("effect_text", effectText.trim())
+                put("effect", safeEffectText)
+                put("effect_text", safeEffectText)
                 put("severity", "MEDIUM")
-                put("staff_id", staff?.id ?: JSONObject.NULL)
+                put("staff_id", resolvedStaffId ?: JSONObject.NULL)
                 put("staff_name", staffNameVal)
-                put("staff_code", staff?.staffCode ?: JSONObject.NULL)
-                put("staff_category", staff?.category ?: division.label)
-                put("staff_group", staff?.staffGroup ?: operationScope.ifBlank { division.label })
-                put("role", staff?.role ?: JSONObject.NULL)
+                put("staff_code", resolvedStaff?.staffCode ?: JSONObject.NULL)
+                put("staff_category", resolvedStaff?.category ?: division.label)
+                put("staff_group", resolvedStaff?.staffGroup ?: operationScope.ifBlank { division.label })
+                put("role", resolvedStaff?.role ?: JSONObject.NULL)
                 put("assigned_location", assignedLocation.ifBlank { classroom?.name ?: "" })
-                put("class_id", classroom?.id ?: JSONObject.NULL)
+                put("class_id", resolvedClassId ?: JSONObject.NULL)
                 put("class_name", classroom?.name ?: JSONObject.NULL)
-                put("subject_id", subject?.id ?: JSONObject.NULL)
+                put("subject_id", resolvedSubjectId ?: JSONObject.NULL)
                 put("subject", subject?.name ?: JSONObject.NULL)
                 put("evidence_url", finalEvidenceUrl ?: JSONObject.NULL)
                 put("evidence_type", finalEvidenceType)
@@ -1312,12 +1746,13 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                     draftRepo.deleteDraft(activeSession.userId, sourceDraft.id, deleteMediaFile = cleanDraftMediaOnComplete)
                 }
                 if (existingReport == null) {
+                    prefs.saveLastSubmittedReportDate(activeSession.userId, AcademicWeekEngine.todayIso())
                     draftRepo.clearComposerFormDraft(activeSession.userId)
                     remoteRepo.insertNotificationBestEffort(
                         config = config,
                         token = activeSession.accessToken,
                         recipientUserId = null,
-                        recipientRole = "admin",
+                        recipientRole = "super_admin",
                         type = "NEW_SUBMISSION",
                         title = "New Compliance Exception",
                         body = "$actorDisplayName has submitted a new exception (${saved.complianceCheck.ifBlank { saved.reportNumber }}). Please review.",
@@ -1326,6 +1761,16 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                         actorName = actorDisplayName
                     )
                 } else {
+                    val previousCloudPaths = (existingReport.evidenceUrls + listOfNotNull(existingReport.evidenceUrl))
+                        .map { it.trim() }
+                        .filter { it.isNotBlank() }
+                        .distinct()
+                    val removedPaths = previousCloudPaths.filterNot { it in finalUrls }
+                    removedPaths.forEach { oldPath ->
+                        runCatching {
+                            remoteRepo.deleteEvidenceMedia(config, activeSession.accessToken, oldPath)
+                        }
+                    }
                     knownReportSnapshots = (knownReportSnapshots.orEmpty()) + (saved.id to saved.status)
                 }
                 _uiState.update { current ->
@@ -1348,6 +1793,7 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                     )
                 }
                 notifyMessage(if (existingReport != null) "Exception report updated." else "Compliance exception submitted.")
+                refreshAllData(silent = true)
                 onComplete()
             }.onFailure { err ->
                 _uiState.update { it.copy(isLoading = false, compressionLabel = null, compressionProgress = null) }
@@ -1364,7 +1810,13 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
     ) {
         val state = preferencesState.value
         val session = state.session ?: return
-        if (report.isReviewedFinal && !session.role.isAdminOrAbove) {
+        val isSuperAdmin = session.role.isSuperAdmin
+        val isMine = report.reportedBy.equals(session.userId, ignoreCase = true)
+        if (!isSuperAdmin && !isMine) {
+            notifyMessage("Only Super Admins can edit another officer's exception.", isError = true)
+            return
+        }
+        if (report.isReviewedFinal && !isSuperAdmin) {
             notifyMessage("Accepted or rejected exceptions are locked and cannot be modified.", isError = true)
             return
         }
@@ -1595,8 +2047,18 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         val state = preferencesState.value
         val session = state.session ?: return
         viewModelScope.launch {
-            remoteRepo.deleteReport(state.supabaseConfig, session.accessToken, report.id)
+            val activeSession = ensureFreshSession(state.supabaseConfig, session)
+            remoteRepo.deleteReport(state.supabaseConfig, activeSession.accessToken, report.id)
                 .onSuccess {
+                    val mediaToDelete = (report.evidenceUrls + listOfNotNull(report.evidenceUrl))
+                        .map { it.trim() }
+                        .filter { it.isNotBlank() }
+                        .distinct()
+                    mediaToDelete.forEach { mediaPath ->
+                        runCatching {
+                            remoteRepo.deleteEvidenceMedia(state.supabaseConfig, activeSession.accessToken, mediaPath)
+                        }
+                    }
                     _uiState.update { current ->
                         current.copy(
                             reports = current.reports.filterNot { it.id == report.id },
@@ -1613,6 +2075,46 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         val state = preferencesState.value
         val token = state.session?.accessToken.orEmpty()
         return remoteRepo.getSignedEvidenceUrl(state.supabaseConfig, token, storedPath)
+    }
+
+    fun getMediaRequestHeaders(resolvedUrl: String): Map<String, String> {
+        val state = preferencesState.value
+        return if (remoteRepo.isB2FileProxyUrl(state.supabaseConfig, resolvedUrl)) {
+            remoteRepo.buildB2AuthHeaders(state.supabaseConfig, state.session?.accessToken)
+        } else {
+            emptyMap()
+        }
+    }
+
+    fun downloadAndOpenEvidence(context: Context, storedPath: String, fileName: String) {
+        val state = preferencesState.value
+        val session = state.session
+        viewModelScope.launch {
+            val activeSession = if (session != null) ensureFreshSession(state.supabaseConfig, session) else null
+            val token = activeSession?.accessToken.orEmpty()
+            notifyMessage("Downloading evidence...")
+            remoteRepo.downloadEvidenceToCache(state.supabaseConfig, token, storedPath, fileName)
+                .onSuccess { file ->
+                    runCatching {
+                        val authority = "${context.packageName}.fileprovider"
+                        val contentUri = FileProvider.getUriForFile(context, authority, file)
+                        val ext = file.extension.lowercase()
+                        val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
+                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(contentUri, mime)
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        context.startActivity(Intent.createChooser(intent, "Open ${file.name}").apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        })
+                    }.onFailure { err ->
+                        notifyMessage("Saved ${file.name}, but no viewer app found (${err.message ?: "open failed"}).", isError = true)
+                    }
+                }
+                .onFailure { err ->
+                    notifyMessage(err.message ?: "Failed to download evidence.", isError = true)
+                }
+        }
     }
 
     fun addCustomCheck(division: ComplianceDivision, name: String, category: String) {
@@ -1909,27 +2411,217 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    fun exportAnalyticsReport(
+        scope: ReportScope,
+        format: String,
+        term: String,
+        startDate: String = "",
+        endDate: String = ""
+    ) {
+        viewModelScope.launch {
+            exportOfficialReport(scope, format, startDate, endDate, term)
+                .onSuccess { msg -> notifyMessage(msg) }
+                .onFailure { err -> notifyMessage(err.message ?: "$format generation failed.", isError = true) }
+        }
+    }
+
     fun exportOfficialPdf(
         scope: ReportScope,
         term: String,
         startDate: String = "",
         endDate: String = ""
     ) {
-        viewModelScope.launch {
-            val state = _uiState.value
-            val session = preferencesState.value.session
-            val accountReports = if (session == null || session.role.isAdminOrAbove) {
-                state.reports
-            } else {
-                state.reports.filter { it.reportedBy.equals(session.userId, ignoreCase = true) }
-            }
-            val staffMap = AnalysisEngine.buildStaffLookup(state.staffList)
-            val filtered = AnalysisEngine.filterReports(accountReports, term, startDate, endDate)
-                .filter { AnalysisEngine.recordMatchesScope(it, scope, staffMap) }
+        exportAnalyticsReport(scope, "PDF", term, startDate, endDate)
+    }
 
-            val dateLabel = if (startDate.isBlank() && endDate.isBlank()) "All Dates" else "${startDate.ifBlank { "..." }} to ${endDate.ifBlank { "..." }}"
-            PdfReportExporter.exportAndShare(getApplication(), filtered, scope, term, dateLabel)
-                .onFailure { err -> notifyMessage(err.message ?: "PDF generation failed.", isError = true) }
+    suspend fun exportOfficialReport(
+        scope: ReportScope,
+        format: String,
+        startDate: String = "",
+        endDate: String = "",
+        term: String = "ALL"
+    ): Result<String> {
+        val state = _uiState.value
+        val session = preferencesState.value.session
+        val accountReports = if (session == null || session.role.isAdminOrAbove) {
+            state.reports
+        } else {
+            state.reports.filter { it.reportedBy.equals(session.userId, ignoreCase = true) }
+        }
+        val cleanFormat = format.uppercase()
+        val exportResult = if (cleanFormat == "DOCX") {
+            DocxReportExporter.exportAndShareWithResult(
+                context = getApplication(),
+                reports = accountReports,
+                scope = scope,
+                term = term,
+                startDate = startDate,
+                endDate = endDate,
+                staffRoster = state.staffList
+            )
+        } else {
+            val dateLabel = if (startDate.isBlank() && endDate.isBlank()) "All available dates"
+            else "${startDate.ifBlank { "earliest" }} to ${endDate.ifBlank { "latest" }}"
+            PdfReportExporter.exportAndShareWithResult(
+                context = getApplication(),
+                reports = accountReports,
+                scope = scope,
+                term = term,
+                dateLabel = dateLabel,
+                staffRoster = state.staffList,
+                startDate = startDate,
+                endDate = endDate
+            )
+        }
+        return exportResult.map { (_, prepared) ->
+            "Generated ${prepared.filename} (${prepared.records.size} records)."
+        }
+    }
+
+    fun clearPptxExportStatus() {
+        _uiState.update { it.copy(pptxExportSuccessMessage = null, pptxExportError = null) }
+    }
+
+    fun exportCompliancePptx(
+        term: String,
+        sessionLabel: String,
+        reportingPeriod: String,
+        slideConfig: PptxSlideConfig,
+        filteredExceptions: List<ComplianceReport>
+    ) {
+        val prefsState = preferencesState.value
+        val activeSession = prefsState.session ?: return
+        if (!activeSession.role.isAdminOrAbove) {
+            notifyMessage("Only administrators can generate official PowerPoint analysis decks.", isError = true)
+            return
+        }
+        val config = prefsState.supabaseConfig
+        if (!slideConfig.isValid) {
+            _uiState.update {
+                it.copy(pptxExportError = "Please complete all required slide headings before generating the deck.")
+            }
+            return
+        }
+
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(isExportingPptx = true, pptxExportError = null, pptxExportSuccessMessage = null)
+            }
+            val freshSession = ensureFreshSession(config, activeSession)
+            val state = _uiState.value
+
+            val sanitizedPeriod = reportingPeriod.replace(Regex("[^a-zA-Z0-9_-]"), "_")
+            val filename = "JC-BEST-Compliance-Report-$sanitizedPeriod.pptx"
+
+            val templateVars = JSONObject().apply {
+                put("ACADEMIC_SESSION", sessionLabel)
+                put("REPORTING_PERIOD", reportingPeriod)
+                put("ACADEMIC_TERM", term)
+                put("SLIDE_02_HEADING", slideConfig.slide2Heading)
+                put("SLIDE_03_HEADING", slideConfig.slide3Heading)
+                put("SLIDE_04_HEADING", slideConfig.slide4Heading)
+                put("SLIDE_05_HEADING", slideConfig.slide5Heading)
+            }
+
+            val exceptionsJson = JSONArray().apply {
+                filteredExceptions.forEach { r ->
+                    put(
+                        JSONObject().apply {
+                            put("id", r.id)
+                            put("report_number", r.reportNumber)
+                            put("incident_date", r.incidentDate)
+                            put("week_number", r.weekNumber)
+                            put("term", r.term)
+                            put("session", r.session ?: sessionLabel)
+                            put("staff_id", r.staffId ?: JSONObject.NULL)
+                            put("staff_name", r.staffName ?: JSONObject.NULL)
+                            put("staff_code", r.staffCode ?: JSONObject.NULL)
+                            put("staff_category", r.staffCategory ?: JSONObject.NULL)
+                            put("staff_group", r.staffGroup ?: JSONObject.NULL)
+                            put("department", r.department ?: JSONObject.NULL)
+                            put("discipline_group", r.disciplineGroup ?: JSONObject.NULL)
+                            put("school_section", r.schoolSection ?: JSONObject.NULL)
+                            put("class_name", r.className ?: JSONObject.NULL)
+                            put("subject", r.subject ?: JSONObject.NULL)
+                            put("category", r.category)
+                            put("compliance_check", r.complianceCheck)
+                            put("division", r.division)
+                            put("target_type", r.targetType)
+                            put("status", r.status.key)
+                            put("review_status", r.reviewStatus)
+                            put("is_seen", r.isSeen)
+                        }
+                    )
+                }
+            }
+
+            val staffJson = JSONArray().apply {
+                state.staffList.forEach { s ->
+                    put(
+                        JSONObject().apply {
+                            put("id", s.id)
+                            put("staff_number", s.staffNumber)
+                            put("staff_code", s.staffCode)
+                            put("name", s.name)
+                            put("category", s.category)
+                            put("staff_group", s.staffGroup)
+                            put("role", s.role)
+                            put("department", s.department)
+                            put("assigned_location", s.assignedLocation)
+                            put("school_section", s.schoolSection)
+                            put("subjects", s.subjects)
+                            put("is_active", s.isActive)
+                        }
+                    )
+                }
+            }
+
+            val payload = JSONObject().apply {
+                put("term", term)
+                put("session", sessionLabel)
+                put("reportingPeriod", reportingPeriod)
+                put("slide2Heading", slideConfig.slide2Heading)
+                put("slide3Heading", slideConfig.slide3Heading)
+                put("slide4Heading", slideConfig.slide4Heading)
+                put("slide5Heading", slideConfig.slide5Heading)
+                put("templateVariables", templateVars)
+                put("exceptions", exceptionsJson)
+                put("staff", staffJson)
+            }.toString()
+
+            remoteRepo.downloadCompliancePptx(config, freshSession.accessToken, payload, filename)
+                .onSuccess { outFile ->
+                    runCatching {
+                        val ctx = getApplication<Application>()
+                        val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", outFile)
+                        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                            type = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                            putExtra(Intent.EXTRA_STREAM, uri)
+                            putExtra(Intent.EXTRA_SUBJECT, "JC-BEST Official Compliance Presentation - $reportingPeriod")
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        val chooser = Intent.createChooser(shareIntent, "Share Compliance Analysis Presentation (.pptx)").apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        ctx.startActivity(chooser)
+                    }.onFailure { shareErr ->
+                        notifyMessage(shareErr.message ?: "Saved $filename, but no app could open it.", isError = true)
+                    }
+                    _uiState.update {
+                        it.copy(
+                            isExportingPptx = false,
+                            pptxExportSuccessMessage = "Generated $filename"
+                        )
+                    }
+                    notifyMessage("Generated official PowerPoint presentation ($filename).")
+                }
+                .onFailure { err ->
+                    val msg = err.message ?: "Failed to generate PowerPoint presentation."
+                    _uiState.update {
+                        it.copy(isExportingPptx = false, pptxExportError = msg)
+                    }
+                    notifyMessage(msg, isError = true)
+                }
         }
     }
 }

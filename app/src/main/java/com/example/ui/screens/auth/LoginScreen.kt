@@ -74,14 +74,15 @@ import coil.compose.AsyncImage
 import com.example.data.model.SupabaseConfig
 import com.example.domain.BiometricHelper
 import com.example.ui.components.AtmosphericGlassBackground
+import com.example.ui.components.AvatarFallbackMode
 import com.example.ui.components.GlassCard
 import com.example.ui.components.GlowingPrimaryButton
 import com.example.ui.components.MicroLabel
+import com.example.ui.components.ProfileAvatar
 import com.example.ui.components.SchoolCrestBadge
 import com.example.ui.components.SupabaseConnectionDialog
 import com.example.ui.components.glassFieldColors
 import com.example.ui.theme.ComplianceTheme
-import java.io.File
 
 @Composable
 fun LoginScreen(
@@ -94,7 +95,7 @@ fun LoginScreen(
     rememberedEmail: String = "",
     rememberedDisplayName: String = "",
     rememberedAvatarUri: String = "",
-    onSaveSupabaseConfig: (String, String) -> Unit = { _, _ -> },
+    onSaveSupabaseConfig: (String, String, String) -> Unit = { _, _, _ -> },
     activity: FragmentActivity? = null,
     biometricsQuickLoginAvailable: Boolean = false,
     onBiometricSignIn: (String) -> Unit = {},
@@ -171,33 +172,12 @@ fun LoginScreen(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
-                            if (rememberedAvatarUri.isNotBlank()) {
-                                AsyncImage(
-                                    model = if (rememberedAvatarUri.startsWith("/")) File(rememberedAvatarUri) else Uri.parse(rememberedAvatarUri),
-                                    contentDescription = "Remembered Profile Avatar",
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier
-                                        .size(44.dp)
-                                        .clip(CircleShape)
-                                        .border(1.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.7f), CircleShape)
-                                )
-                            } else {
-                                Box(
-                                    modifier = Modifier
-                                        .size(44.dp)
-                                        .clip(CircleShape)
-                                        .background(MaterialTheme.colorScheme.primaryContainer)
-                                        .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.45f), CircleShape),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Person,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier.size(22.dp)
-                                    )
-                                }
-                            }
+                            ProfileAvatar(
+                                avatarUrl = rememberedAvatarUri,
+                                displayName = rememberedDisplayName.ifBlank { rememberedEmail },
+                                size = 44.dp,
+                                fallbackMode = AvatarFallbackMode.INITIALS
+                            )
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
                                     text = rememberedDisplayName.ifBlank { "Saved Officer Session" },
@@ -522,8 +502,8 @@ fun LoginScreen(
         SupabaseConnectionDialog(
             current = supabaseConfig,
             onDismiss = { showConfigDialog = false },
-            onSave = { url, key ->
-                onSaveSupabaseConfig(url, key)
+            onSave = { url, key, apiBase ->
+                onSaveSupabaseConfig(url, key, apiBase)
                 showConfigDialog = false
             }
         )

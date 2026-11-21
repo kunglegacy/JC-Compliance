@@ -15,6 +15,8 @@ fun EvidenceViewerDialog(
     initialIndex: Int = 0,
     showModerationControls: Boolean = true,
     onResolveSignedUrl: suspend (String) -> Result<String>,
+    onResolveHeaders: (String) -> Map<String, String> = { emptyMap() },
+    onDownloadEvidence: ((EvidencePreviewItem) -> Unit)? = null,
     onVerdict: ((EvidencePreviewItem, EvidenceVerdict, String?) -> Unit)? = null,
     onDismiss: () -> Unit
 ) {
@@ -46,6 +48,8 @@ fun EvidenceViewerDialog(
             initialIndex = initialIndex,
             showModerationControls = showModerationControls,
             onResolveSignedUrl = onResolveSignedUrl,
+            onResolveHeaders = onResolveHeaders,
+            onDownloadEvidence = onDownloadEvidence,
             onVerdict = onVerdict,
             onBack = onDismiss
         )

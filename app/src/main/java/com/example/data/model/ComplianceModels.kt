@@ -93,7 +93,9 @@ data class StaffMember(
     val role: String,
     val department: String,
     val assignedLocation: String,
-    val isActive: Boolean = true
+    val isActive: Boolean = true,
+    val schoolSection: String = "",
+    val subjects: String = ""
 )
 
 data class Classroom(
@@ -221,7 +223,10 @@ data class ComplianceReport(
     val resolvedAt: String? = null,
     val isEdited: Boolean = false,
     val editedAt: String? = null,
-    val createdAt: String = ""
+    val createdAt: String = "",
+    val schoolSection: String? = null,
+    val disciplineGroup: String? = null,
+    val session: String? = null
 ) {
     val isPending: Boolean
         get() = status == ReportResolutionStatus.PENDING
@@ -279,6 +284,11 @@ data class DraftMediaItem(
     val capturedAtLabel: String
 )
 
+enum class ReportFormMode {
+    STANDARD,
+    OFFLINE_DRAFT
+}
+
 data class OfflineDraft(
     val id: String,
     val userId: String = "",
@@ -289,8 +299,17 @@ data class OfflineDraft(
     val mediaName: String? = null,
     val mediaItems: List<DraftMediaItem> = emptyList(),
     val incidentDate: String,
-    val createdAtMillis: Long
-)
+    val createdAtMillis: Long,
+    val formDraft: ReportFormDraft? = null,
+    val isQueuedForSubmit: Boolean = false,
+    val queuedAtMillis: Long? = null
+) {
+    val isFormDraft: Boolean
+        get() = formDraft != null
+
+    val hasEvidence: Boolean
+        get() = mediaItems.isNotEmpty() || (!mediaPath.isNullOrBlank() && mediaType != "none")
+}
 
 data class ReportFormDraft(
     val divisionKey: String = ComplianceDivision.ACADEMIC.key,
@@ -322,23 +341,24 @@ data class ReportFormDraft(
     val updatedAtMillis: Long = 0L
 ) {
     val hasContent: Boolean
-        get() = hasUserEdited && (
-            exceptionText.isNotBlank() ||
-                effectText.isNotBlank() ||
-                opPersonOrLocation.isNotBlank() ||
-                studentNamesArm.isNotBlank() ||
-                staffSearch.isNotBlank() ||
-                !staffId.isNullOrBlank() ||
-                !classId.isNullOrBlank() ||
-                !subjectId.isNullOrBlank() ||
-                !checkId.isNullOrBlank() ||
-                selectedDraftMedia.isNotEmpty() ||
-                !localMediaPath.isNullOrBlank() ||
-                (evidenceType != "none" && !evidenceName.isNullOrBlank()) ||
-                divisionKey != ComplianceDivision.ACADEMIC.key ||
-                targetType != "staff" ||
-                operationScope != "Maintenance"
-            )
+        get() = hasUserEdited && hasAnyDraftContent
+
+    val hasAnyDraftContent: Boolean
+        get() = exceptionText.isNotBlank() ||
+            effectText.isNotBlank() ||
+            opPersonOrLocation.isNotBlank() ||
+            studentNamesArm.isNotBlank() ||
+            staffSearch.isNotBlank() ||
+            !staffId.isNullOrBlank() ||
+            !classId.isNullOrBlank() ||
+            !subjectId.isNullOrBlank() ||
+            !checkId.isNullOrBlank() ||
+            selectedDraftMedia.isNotEmpty() ||
+            !localMediaPath.isNullOrBlank() ||
+            (evidenceType != "none" && !evidenceName.isNullOrBlank()) ||
+            divisionKey != ComplianceDivision.ACADEMIC.key ||
+            targetType != "staff" ||
+            operationScope != "Maintenance"
 }
 
 data class SystemSettings(
@@ -369,7 +389,7 @@ enum class ReportScope(val key: String, val label: String) {
     SECURITY("Security", "Security"),
     TRANSPORT("Transport", "Transport"),
     MINDERS("Minders", "Minders"),
-    HOSTEL_KITCHEN("Hostel / Kitchen", "Hostel / Kitchen"),
+    HOSTEL_KITCHEN("Hostel/Kitchen", "Hostel/Kitchen"),
     CDS("CDS", "CDS")
 }
 
@@ -445,9 +465,23 @@ data class BiometricStatus(
     val message: String
 )
 
+data class StorageProviderConfig(
+    val provider: String = "backblaze_b2",
+    val bucketName: String = "JC-Best-Compliance",
+    val isPrivate: Boolean = true
+)
+
+data class MobileAppConfig(
+    val latestVersion: String = "",
+    val downloadUrl: String = "",
+    val releaseNotes: String = "",
+    val minVersion: String = ""
+)
+
 data class SupabaseConfig(
     val url: String,
-    val anonKey: String
+    val anonKey: String,
+    val apiBaseUrl: String = ""
 ) {
     val isConfigured: Boolean
         get() = url.isNotBlank() &&
@@ -457,4 +491,17 @@ data class SupabaseConfig(
             !anonKey.contains("your_key_here", ignoreCase = true) &&
             !anonKey.contains("your-anon", ignoreCase = true) &&
             !anonKey.contains("placeholder", ignoreCase = true)
+
+    val normalizedApiBaseUrl: String
+        get() = apiBaseUrl.trim().trimEnd('/')
+
+    val isB2Configured: Boolean
+        get() = isConfigured &&
+            normalizedApiBaseUrl.isNotBlank() &&
+            (normalizedApiBaseUrl.startsWith("https://", ignoreCase = true) ||
+                normalizedApiBaseUrl.startsWith("http://", ignoreCase = true)) &&
+            !normalizedApiBaseUrl.contains("your-web-backend", ignoreCase = true) &&
+            !normalizedApiBaseUrl.contains("example.com", ignoreCase = true) &&
+            !normalizedApiBaseUrl.contains("placeholder", ignoreCase = true)
 }
+

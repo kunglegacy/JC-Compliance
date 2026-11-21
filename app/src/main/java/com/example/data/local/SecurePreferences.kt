@@ -50,6 +50,7 @@ class SecurePreferences(private val context: Context) {
     private object Keys {
         val SUPABASE_URL = stringPreferencesKey("supabase_url")
         val SUPABASE_ANON_KEY = stringPreferencesKey("supabase_anon_key")
+        val API_BASE_URL = stringPreferencesKey("api_base_url")
         val DEVICE_ID = stringPreferencesKey("device_id")
 
         val ACCESS_TOKEN = stringPreferencesKey("access_token")
@@ -80,6 +81,8 @@ class SecurePreferences(private val context: Context) {
         val LAST_ACTIVE_MILLIS = longPreferencesKey("last_active_millis")
         val MANUALLY_LOCKED = booleanPreferencesKey("manually_locked")
         val CUSTOM_CHECKS_JSON = stringPreferencesKey("custom_checks_json")
+        val LAST_REPORT_DATE_PREFIX = "last_report_date_"
+        val FIRST_ACTIVITY_DATE_PREFIX = "first_activity_date_"
     }
 
     private val vault = EncryptedAuthStore(context)
@@ -102,6 +105,8 @@ class SecurePreferences(private val context: Context) {
             !v.contains("your-project-id", ignoreCase = true) &&
             !v.contains("your_key_here", ignoreCase = true) &&
             !v.contains("your-anon", ignoreCase = true) &&
+            !v.contains("your-web-backend", ignoreCase = true) &&
+            !v.contains("example.com", ignoreCase = true) &&
             !v.contains("placeholder", ignoreCase = true)
     }
 
@@ -114,6 +119,11 @@ class SecurePreferences(private val context: Context) {
             ?: System.getenv("VITE_SUPABASE_PUBLISHABLE_KEY")
             ?: System.getenv("SUPABASE_ANON_KEY")
             ?: System.getenv("SUPABASE_KEY")).orEmpty()
+        val envApiBase = (System.getenv("API_BASE_URL")
+            ?: System.getenv("EXPO_PUBLIC_API_BASE_URL")
+            ?: System.getenv("VITE_API_BASE_URL")
+            ?: System.getenv("NEXT_PUBLIC_API_BASE_URL")
+            ?: System.getenv("WEB_APP_URL")).orEmpty()
 
         val buildUrl = firstValid(
             readBuildConfig("CI_SUPABASE_URL"),
@@ -128,11 +138,22 @@ class SecurePreferences(private val context: Context) {
             readBuildConfig("SUPABASE_ANON_KEY"),
             envKey
         )
+        val buildApiBase = firstValid(
+            readBuildConfig("CI_API_BASE_URL"),
+            readBuildConfig("API_BASE_URL"),
+            readBuildConfig("EXPO_PUBLIC_API_BASE_URL"),
+            readBuildConfig("VITE_API_BASE_URL"),
+            readBuildConfig("NEXT_PUBLIC_API_BASE_URL"),
+            readBuildConfig("WEB_APP_URL"),
+            envApiBase
+        )
 
         val storedUrl = prefs[Keys.SUPABASE_URL].orEmpty()
         val storedKey = prefs[Keys.SUPABASE_ANON_KEY].orEmpty()
+        val storedApiBase = prefs[Keys.API_BASE_URL].orEmpty()
         val effectiveUrl = firstValid(storedUrl, buildUrl).trimEnd('/')
         val effectiveKey = firstValid(storedKey, buildKey)
+        val effectiveApiBase = firstValid(storedApiBase, buildApiBase).trimEnd('/')
 
         val userId = prefs[Keys.USER_ID].orEmpty()
         val email = prefs[Keys.USER_EMAIL].orEmpty()
@@ -160,7 +181,7 @@ class SecurePreferences(private val context: Context) {
         val persistedManualLock = (prefs[Keys.MANUALLY_LOCKED] ?: false) || vault.isAppLockedSync()
 
         AppPreferencesState(
-            supabaseConfig = SupabaseConfig(effectiveUrl, effectiveKey),
+            supabaseConfig = SupabaseConfig(effectiveUrl, effectiveKey, effectiveApiBase),
             session = session,
             themePreference = if (prefs[Keys.THEME_PREF].isNullOrBlank()) ThemePreference.DARK else ThemePreference.fromKey(prefs[Keys.THEME_PREF]),
             accentPalette = if (prefs[Keys.ACCENT_PALETTE].isNullOrBlank()) AccentPalette.SOLAR else AccentPalette.fromKey(prefs[Keys.ACCENT_PALETTE]),
@@ -188,10 +209,16 @@ class SecurePreferences(private val context: Context) {
         return created
     }
 
-    suspend fun saveSupabaseConfig(url: String, anonKey: String) {
+    suspend fun saveSupabaseConfig(url: String, anonKey: String, apiBaseUrl: String = "") {
         context.dataStore.edit {
             it[Keys.SUPABASE_URL] = url.trim().trimEnd('/')
             it[Keys.SUPABASE_ANON_KEY] = anonKey.trim()
+            val cleanApiBase = apiBaseUrl.trim().trimEnd('/')
+            if (isValidNonPlaceholder(cleanApiBase)) {
+                it[Keys.API_BASE_URL] = cleanApiBase
+            } else if (apiBaseUrl.isBlank()) {
+                it.remove(Keys.API_BASE_URL)
+            }
         }
     }
 
@@ -230,9 +257,13 @@ class SecurePreferences(private val context: Context) {
             // Persist remembered profile & avatar across sign-out for the current device account
             if (session.email.isNotBlank()) it[Keys.REMEMBERED_EMAIL] = session.email
             if (session.displayName.isNotBlank()) it[Keys.REMEMBERED_DISPLAY_NAME] = session.displayName
-            if (session.avatarUrl.isNotBlank()) {
-                it[Keys.AVATAR_URI] = session.avatarUrl
-                it[Keys.REMEMBERED_AVATAR_URI] = session.avatarUrl
+            val cleanAvatar = session.avatarUrl.trim()
+            if (cleanAvatar.isNotBlank()) {
+                it[Keys.AVATAR_URI] = cleanAvatar
+                it[Keys.REMEMBERED_AVATAR_URI] = cleanAvatar
+            } else {
+                it.remove(Keys.AVATAR_URI)
+                it.remove(Keys.REMEMBERED_AVATAR_URI)
             }
         }
     }
@@ -287,8 +318,14 @@ class SecurePreferences(private val context: Context) {
                 it[Keys.REMEMBERED_DISPLAY_NAME] = displayName.trim()
             }
             if (avatarUri != null) {
-                it[Keys.AVATAR_URI] = avatarUri
-                it[Keys.REMEMBERED_AVATAR_URI] = avatarUri
+                val cleanAvatar = avatarUri.trim()
+                if (cleanAvatar.isNotBlank()) {
+                    it[Keys.AVATAR_URI] = cleanAvatar
+                    it[Keys.REMEMBERED_AVATAR_URI] = cleanAvatar
+                } else {
+                    it.remove(Keys.AVATAR_URI)
+                    it.remove(Keys.REMEMBERED_AVATAR_URI)
+                }
             }
         }
     }
@@ -349,6 +386,54 @@ class SecurePreferences(private val context: Context) {
     suspend fun setManuallyLocked(locked: Boolean) {
         vault.setAppLockedSync(locked)
         context.dataStore.edit { it[Keys.MANUALLY_LOCKED] = locked }
+    }
+
+    suspend fun saveLastSubmittedReportDate(userId: String, dateIso: String) {
+        if (userId.isBlank() || !dateIso.matches(Regex("^\\d{4}-\\d{2}-\\d{2}$"))) return
+        val key = stringPreferencesKey("${Keys.LAST_REPORT_DATE_PREFIX}$userId")
+        context.dataStore.edit { prefs ->
+            val current = prefs[key].orEmpty()
+            if (current.isBlank() || dateIso >= current) {
+                prefs[key] = dateIso
+            }
+        }
+    }
+
+    suspend fun syncReportActivityDates(userId: String, candidateDatesIso: Collection<String>, todayIso: String) {
+        if (userId.isBlank()) return
+        val lastKey = stringPreferencesKey("${Keys.LAST_REPORT_DATE_PREFIX}$userId")
+        val firstKey = stringPreferencesKey("${Keys.FIRST_ACTIVITY_DATE_PREFIX}$userId")
+        val maxCandidate = candidateDatesIso
+            .map { it.trim().take(10) }
+            .filter { it.matches(Regex("^\\d{4}-\\d{2}-\\d{2}$")) }
+            .maxOrNull()
+        context.dataStore.edit { prefs ->
+            if (prefs[firstKey].isNullOrBlank()) {
+                prefs[firstKey] = todayIso
+            }
+            if (!maxCandidate.isNullOrBlank()) {
+                val existing = prefs[lastKey].orEmpty()
+                if (existing.isBlank() || maxCandidate >= existing) {
+                    prefs[lastKey] = maxCandidate
+                }
+            }
+        }
+    }
+
+    suspend fun getReportTrackingSnapshot(userId: String, todayIso: String): Pair<String?, String> {
+        if (userId.isBlank()) return null to todayIso
+        val lastKey = stringPreferencesKey("${Keys.LAST_REPORT_DATE_PREFIX}$userId")
+        val firstKey = stringPreferencesKey("${Keys.FIRST_ACTIVITY_DATE_PREFIX}$userId")
+        val prefs = context.dataStore.data.first()
+        val firstExisting = prefs[firstKey]
+        val resolvedFirst = if (!firstExisting.isNullOrBlank()) {
+            firstExisting
+        } else {
+            context.dataStore.edit { it[firstKey] = todayIso }
+            todayIso
+        }
+        val lastDate = prefs[lastKey]?.takeIf { it.matches(Regex("^\\d{4}-\\d{2}-\\d{2}$")) }
+        return lastDate to resolvedFirst
     }
 
     suspend fun addCustomCheck(check: ComplianceCheck) {

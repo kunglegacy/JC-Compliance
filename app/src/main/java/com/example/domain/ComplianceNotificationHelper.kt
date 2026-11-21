@@ -13,6 +13,12 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.example.MainActivity
 import com.example.R
+import com.example.data.model.OfflineDraft
+import com.example.data.model.ReportFormDraft
+import com.example.data.model.UserRole
+import java.time.DayOfWeek
+import java.time.LocalDate
+import java.util.Calendar
 
 object ComplianceNotificationHelper {
 
@@ -24,9 +30,11 @@ object ComplianceNotificationHelper {
 
     private const val PREFS_NAME = "jcbest_notif_delivery_prefs"
     private const val KEY_DELIVERED_IDS = "delivered_keys"
-    private const val KEY_LAST_DRAFT_REMINDER_AT = "last_draft_reminder_at"
-    private const val KEY_LAST_DRAFT_SIGNATURE = "last_draft_signature"
-    private const val DRAFT_COOLDOWN_MS = 4L * 60L * 60L * 1000L // 4 hours per unchanged draft set
+    private const val KEY_LAST_DRAFT_REMINDER_AT_PREFIX = "last_draft_reminder_at_"
+    private const val KEY_LAST_DRAFT_SIGNATURE_PREFIX = "last_draft_signature_"
+    private const val KEY_LAST_EVENING_REMINDER_DATE_PREFIX = "last_evening_reminder_date_"
+    private const val DRAFT_GLOBAL_COOLDOWN_MS = 6L * 60L * 60L * 1000L      // Never spam more than once in 6 hours
+    private const val DRAFT_SIGNATURE_COOLDOWN_MS = 12L * 60L * 60L * 1000L  // Wait 12 hours before re-notifying same drafts
 
     fun ensureChannels(context: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
@@ -43,10 +51,10 @@ object ComplianceNotificationHelper {
 
         val draftChannel = NotificationChannel(
             CHANNEL_DRAFTS,
-            "Unattended Draft Reminders",
+            "Draft & Daily Compliance Reminders",
             NotificationManager.IMPORTANCE_DEFAULT
         ).apply {
-            description = "Reminders when saved drafts or unfinished exception reports are waiting to be submitted."
+            description = "Dynamic draft completion reminders and evening compliance check-ins."
         }
 
         nm.createNotificationChannel(alertsChannel)
@@ -108,6 +116,48 @@ object ComplianceNotificationHelper {
         markDelivered(context, "accepted_$dedupKey")
     }
 
+    fun notifyOfflineQueuedSubmitted(
+        context: Context,
+        draftId: String,
+        reportId: String?,
+        reportNumber: String,
+        complianceCheck: String
+    ) {
+        if (!canPostNew(context, "offline_sent_$draftId")) return
+        val label = complianceCheck.ifBlank { reportNumber.ifBlank { "Exception Report" } }
+        postNotification(
+            context = context,
+            channelId = CHANNEL_EXCEPTIONS,
+            notificationId = ("offline_sent_$draftId").hashCode(),
+            title = "Offline Exception Submitted",
+            body = "Your offline report ($label) has been successfully submitted automatically now that your device is back online.",
+            targetTab = "my-exceptions",
+            reportId = reportId,
+            priority = NotificationCompat.PRIORITY_HIGH
+        )
+        markDelivered(context, "offline_sent_$draftId")
+    }
+
+    fun notifyOfflineQueuedBatchSubmitted(
+        context: Context,
+        submittedCount: Int,
+        latestReportId: String?
+    ) {
+        if (submittedCount <= 0) return
+        if (!hasNotificationPermission(context)) return
+        ensureChannels(context)
+        postNotification(
+            context = context,
+            channelId = CHANNEL_EXCEPTIONS,
+            notificationId = ("offline_batch_${System.currentTimeMillis() / 10_000L}").hashCode(),
+            title = "$submittedCount Offline Exceptions Submitted",
+            body = "Your $submittedCount queued compliance reports have been submitted automatically now that your device is back online.",
+            targetTab = "my-exceptions",
+            reportId = latestReportId,
+            priority = NotificationCompat.PRIORITY_HIGH
+        )
+    }
+
     fun notifyNewSubmissionForAdmin(
         context: Context,
         dedupKey: String,
@@ -156,47 +206,184 @@ object ComplianceNotificationHelper {
     fun notifyDraftReminderIfDue(
         context: Context,
         userId: String,
-        offlineDraftCount: Int,
-        hasUnfinishedFormDraft: Boolean
+        drafts: List<OfflineDraft>,
+        unfinishedFormDraft: ReportFormDraft?
     ) {
         if (userId.isBlank()) return
-        if (offlineDraftCount <= 0 && !hasUnfinishedFormDraft) return
+        val unqueuedDrafts = drafts.filterNot { it.isQueuedForSubmit }
+        val composerHasContent = unfinishedFormDraft?.hasContent == true
+        if (unqueuedDrafts.isEmpty() && !composerHasContent) return
         if (!hasNotificationPermission(context)) return
 
-        val signature = "$userId:$offlineDraftCount:$hasUnfinishedFormDraft"
+        // Quiet hours guard (do not buzz users late at night or very early morning)
+        val cal = Calendar.getInstance()
+        val hour = cal.get(Calendar.HOUR_OF_DAY)
+        if (hour < 7 || hour >= 22) return
+
+        var withEvidence = unqueuedDrafts.count { it.hasEvidence }
+        var withoutEvidence = unqueuedDrafts.count { !it.hasEvidence }
+        if (composerHasContent && unfinishedFormDraft != null) {
+            val composerHasEvidence = unfinishedFormDraft.selectedDraftMedia.isNotEmpty() ||
+                !unfinishedFormDraft.localMediaPath.isNullOrBlank() ||
+                (unfinishedFormDraft.evidenceType != "none" && !unfinishedFormDraft.evidenceName.isNullOrBlank())
+            if (composerHasEvidence) withEvidence++ else withoutEvidence++
+        }
+
+        val signature = "w$withEvidence:wo$withoutEvidence"
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val lastAt = prefs.getLong(KEY_LAST_DRAFT_REMINDER_AT, 0L)
-        val lastSig = prefs.getString(KEY_LAST_DRAFT_SIGNATURE, "").orEmpty()
+        val lastAtKey = "${KEY_LAST_DRAFT_REMINDER_AT_PREFIX}$userId"
+        val lastSigKey = "${KEY_LAST_DRAFT_SIGNATURE_PREFIX}$userId"
+        val lastAt = prefs.getLong(lastAtKey, 0L)
+        val lastSig = prefs.getString(lastSigKey, "").orEmpty()
         val now = System.currentTimeMillis()
-        if (lastSig == signature && (now - lastAt) < DRAFT_COOLDOWN_MS) return
+
+        val elapsed = now - lastAt
+        if (elapsed < DRAFT_GLOBAL_COOLDOWN_MS) return
+        if (lastSig == signature && elapsed < DRAFT_SIGNATURE_COOLDOWN_MS) return
 
         ensureChannels(context)
-        val summary = when {
-            offlineDraftCount > 0 && hasUnfinishedFormDraft ->
-                "$offlineDraftCount offline draft${if (offlineDraftCount > 1) "s" else ""} and an unfinished exception report"
-            offlineDraftCount > 1 ->
-                "$offlineDraftCount unattended offline drafts"
-            offlineDraftCount == 1 ->
-                "1 unattended offline draft"
-            else ->
-                "an unfinished exception report"
+        val (title, body) = when {
+            withoutEvidence > 0 && withEvidence == 0 -> {
+                if (withoutEvidence == 1) {
+                    "Unfinished Draft Without Evidence" to
+                        "You have a saved exception report draft that does not have evidence yet. Please attach evidence and complete it."
+                } else {
+                    "Unfinished Drafts Without Evidence" to
+                        "You have $withoutEvidence unfinished exception report drafts without evidence. Please attach evidence and complete them."
+                }
+            }
+            withEvidence > 0 && withoutEvidence == 0 -> {
+                if (withEvidence == 1) {
+                    "Unfinished Draft With Evidence" to
+                        "You have an unfinished exception draft with evidence attached. Please review and finish submitting it."
+                } else {
+                    "Unfinished Drafts With Evidence" to
+                        "You have $withEvidence unfinished exception drafts with evidence attached. Please review and finish submitting them."
+                }
+            }
+            else -> {
+                val total = withEvidence + withoutEvidence
+                "Unfinished Exception Drafts ($total)" to
+                    "You have $withEvidence unfinished draft${if (withEvidence > 1) "s" else ""} with evidence and $withoutEvidence without evidence. Please review and complete your pending reports."
+            }
         }
 
         postNotification(
             context = context,
             channelId = CHANNEL_DRAFTS,
             notificationId = ("draft_$userId").hashCode(),
-            title = "Unfinished Exception Draft",
-            body = "You have $summary waiting to be completed and submitted.",
+            title = title,
+            body = body,
             targetTab = "my-exceptions",
             reportId = null,
             priority = NotificationCompat.PRIORITY_DEFAULT
         )
 
         prefs.edit()
-            .putLong(KEY_LAST_DRAFT_REMINDER_AT, now)
-            .putString(KEY_LAST_DRAFT_SIGNATURE, signature)
+            .putLong(lastAtKey, now)
+            .putString(lastSigKey, signature)
             .apply()
+    }
+
+    fun notifyEveningStandardReminderIfDue(
+        context: Context,
+        userId: String,
+        role: UserRole,
+        hasAnyDraft: Boolean,
+        lastSubmittedDateIso: String?,
+        firstTrackingDateIso: String,
+        forceHourCheck: Boolean = true
+    ) {
+        if (userId.isBlank()) return
+        if (role != UserRole.STANDARD) return
+        if (hasAnyDraft) return
+        if (!hasNotificationPermission(context)) return
+
+        val cal = Calendar.getInstance()
+        val dayOfWeek = cal.get(Calendar.DAY_OF_WEEK)
+        // Strictly Monday through Friday only; exclude Saturdays and Sundays
+        if (dayOfWeek == Calendar.SATURDAY || dayOfWeek == Calendar.SUNDAY) return
+
+        val hour = cal.get(Calendar.HOUR_OF_DAY)
+        if (forceHourCheck && (hour < 18 || hour >= 23)) return
+
+        val today = LocalDate.now()
+        if (today.dayOfWeek == DayOfWeek.SATURDAY || today.dayOfWeek == DayOfWeek.SUNDAY) return
+
+        val todayIso = today.toString()
+        if (lastSubmittedDateIso == todayIso) return
+
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val dedupPrefKey = "${KEY_LAST_EVENING_REMINDER_DATE_PREFIX}$userId"
+        if (prefs.getString(dedupPrefKey, "") == todayIso) return
+
+        val missedWeekdays = countMissedWeekdays(
+            today = today,
+            lastSubmittedDateIso = lastSubmittedDateIso,
+            firstTrackingDateIso = firstTrackingDateIso
+        )
+
+        val (title, body) = if (missedWeekdays <= 1) {
+            "Daily Compliance Check-In" to
+                "You have not reported any compliance exceptions today. Please submit an exception report if any observations are available."
+        } else {
+            val daysText = numberToWords(missedWeekdays)
+            "Compliance Reporting Reminder" to
+                "You have not submitted any compliance exceptions for $daysText consecutive weekdays. Please submit an exception report if any issues are available."
+        }
+
+        ensureChannels(context)
+        postNotification(
+            context = context,
+            channelId = CHANNEL_DRAFTS,
+            notificationId = ("evening_std_$userId").hashCode(),
+            title = title,
+            body = body,
+            targetTab = "my-exceptions",
+            reportId = null,
+            priority = NotificationCompat.PRIORITY_DEFAULT
+        )
+
+        prefs.edit().putString(dedupPrefKey, todayIso).apply()
+    }
+
+    private fun countMissedWeekdays(
+        today: LocalDate,
+        lastSubmittedDateIso: String?,
+        firstTrackingDateIso: String
+    ): Int = runCatching {
+        val startDate = if (!lastSubmittedDateIso.isNullOrBlank()) {
+            LocalDate.parse(lastSubmittedDateIso).plusDays(1)
+        } else {
+            LocalDate.parse(firstTrackingDateIso.ifBlank { today.toString() })
+        }
+        if (startDate.isAfter(today)) return@runCatching 1
+
+        // Clamp scan window to 30 days max
+        val boundedStart = if (startDate.isBefore(today.minusDays(30))) today.minusDays(30) else startDate
+        var cursor = boundedStart
+        var count = 0
+        while (!cursor.isAfter(today)) {
+            if (cursor.dayOfWeek != DayOfWeek.SATURDAY && cursor.dayOfWeek != DayOfWeek.SUNDAY) {
+                count++
+            }
+            cursor = cursor.plusDays(1)
+        }
+        count.coerceAtLeast(1)
+    }.getOrDefault(1)
+
+    private fun numberToWords(n: Int): String = when (n) {
+        1 -> "one"
+        2 -> "two"
+        3 -> "three"
+        4 -> "four"
+        5 -> "five"
+        6 -> "six"
+        7 -> "seven"
+        8 -> "eight"
+        9 -> "nine"
+        10 -> "ten"
+        else -> n.toString()
     }
 
     fun seedSeenKeys(context: Context, keys: Collection<String>) {

@@ -1,5 +1,6 @@
 package com.example.ui.screens.account
 
+import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -32,13 +33,16 @@ import androidx.compose.material.icons.filled.AccessTime
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.CloudDone
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -58,23 +62,25 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.fragment.app.FragmentActivity
-import coil.compose.AsyncImage
 import com.example.data.local.AppPreferencesState
 import com.example.data.model.AccentPalette
 import com.example.data.model.LockPolicy
+import com.example.data.model.MobileAppConfig
+import com.example.data.model.StorageProviderConfig
 import com.example.data.model.ThemePreference
 import com.example.domain.BiometricHelper
 import com.example.ui.components.AtmosphericGlassBackground
+import com.example.ui.components.AvatarFallbackMode
 import com.example.ui.components.GlassCard
 import com.example.ui.components.GlassIconHalo
 import com.example.ui.components.GlowingPrimaryButton
 import com.example.ui.components.MicroLabel
+import com.example.ui.components.ProfileAvatar
 import com.example.ui.components.SubScreenTopRow
 import com.example.ui.components.VideoStyleChecklistRow
 import com.example.ui.components.glassFieldColors
@@ -85,7 +91,12 @@ import kotlinx.coroutines.launch
 fun SettingsScreen(
     activity: FragmentActivity,
     prefsState: AppPreferencesState,
-    onSaveIdentity: (String, String?) -> Unit,
+    isLoading: Boolean = false,
+    onUploadAvatar: (Uri) -> Unit,
+    onRemoveAvatar: () -> Unit,
+    onSaveDisplayName: (String) -> Unit,
+    onResolveSignedUrl: (suspend (String) -> Result<String>)? = null,
+    onGetMediaHeaders: ((String) -> Map<String, String>)? = null,
     onSetAutoFill: (Boolean) -> Unit,
     onSetTheme: (ThemePreference) -> Unit,
     onSetAccent: (AccentPalette) -> Unit,
@@ -95,6 +106,8 @@ fun SettingsScreen(
     onSetBiometricsEnabled: (Boolean) -> Unit,
     onNotify: (String, Boolean) -> Unit,
     onWillLaunchExternalPicker: () -> Unit = {},
+    mobileAppConfig: MobileAppConfig? = null,
+    storageProviderConfig: StorageProviderConfig? = null,
     onBack: () -> Unit
 ) {
     BackHandler { onBack() }
@@ -102,13 +115,13 @@ fun SettingsScreen(
     val scope = rememberCoroutineScope()
     val ext = ComplianceTheme.extended
     val session = prefsState.session
+    val currentAvatarPath = session?.avatarUrl?.takeIf { it.isNotBlank() } ?: prefsState.avatarUri
 
     var displayName by remember(prefsState.customDisplayName, session?.displayName) {
         mutableStateOf(
             prefsState.customDisplayName.ifBlank { session?.displayName.orEmpty() }
         )
     }
-    var localAvatarUri by remember(prefsState.avatarUri) { mutableStateOf(prefsState.avatarUri) }
 
     var showBiometricPasswordDialog by remember { mutableStateOf(false) }
     var bioPasswordInput by remember { mutableStateOf("") }
@@ -120,8 +133,7 @@ fun SettingsScreen(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri ->
         if (uri != null) {
-            localAvatarUri = uri.toString()
-            onSaveIdentity(displayName, uri.toString())
+            onUploadAvatar(uri)
         }
     }
 
@@ -167,50 +179,65 @@ fun SettingsScreen(
                     }
                 }
 
-                // 1. Frosted Profile Identity
+                // 1. Frosted Profile Identity & Single Unified Avatar Uploader
                 item {
                     GlassCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 24.dp, contentPadding = 16.dp) {
                         MicroLabel("Profile Identity")
                         Spacer(Modifier.height(12.dp))
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                            Box(
-                                modifier = Modifier
-                                    .size(62.dp)
-                                    .clip(CircleShape)
-                                    .background(MaterialTheme.colorScheme.primaryContainer)
-                                    .border(1.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.6f), CircleShape)
-                                    .clickable {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(14.dp)
+                        ) {
+                            ProfileAvatar(
+                                avatarUrl = currentAvatarPath,
+                                displayName = displayName.ifBlank { session?.displayName.orEmpty() },
+                                size = 64.dp,
+                                borderColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.65f),
+                                fallbackMode = AvatarFallbackMode.INITIALS,
+                                onResolveSignedUrl = onResolveSignedUrl,
+                                getAuthHeaders = onGetMediaHeaders,
+                                testTag = "settings_profile_avatar"
+                            )
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = {
                                         onWillLaunchExternalPicker()
-                                        avatarPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                                        avatarPicker.launch(
+                                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                        )
                                     },
-                                contentAlignment = Alignment.Center
-                            ) {
-                                if (localAvatarUri.isNotBlank()) {
-                                    AsyncImage(
-                                        model = Uri.parse(localAvatarUri),
-                                        contentDescription = "Avatar",
-                                        contentScale = ContentScale.Crop,
-                                        modifier = Modifier.fillMaxSize()
-                                    )
-                                } else {
-                                    Icon(Icons.Default.Person, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                                    enabled = !isLoading,
+                                    shape = CircleShape,
+                                    modifier = Modifier.testTag("settings_change_avatar_button")
+                                ) {
+                                    Icon(Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(if (currentAvatarPath.isBlank()) "Choose Photo" else "Change Photo")
                                 }
-                            }
-                            OutlinedButton(
-                                onClick = {
-                                    onWillLaunchExternalPicker()
-                                    avatarPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-                                },
-                                shape = CircleShape,
-                                modifier = Modifier.testTag("settings_change_avatar_button")
-                            ) {
-                                Icon(Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(Modifier.width(6.dp))
-                                Text("Choose Photo")
+                                if (currentAvatarPath.isNotBlank()) {
+                                    OutlinedButton(
+                                        onClick = onRemoveAvatar,
+                                        enabled = !isLoading,
+                                        shape = CircleShape,
+                                        colors = ButtonDefaults.outlinedButtonColors(
+                                            contentColor = ext.rose
+                                        ),
+                                        border = BorderStroke(1.dp, ext.rose.copy(alpha = 0.45f)),
+                                        modifier = Modifier.testTag("settings_remove_avatar_button")
+                                    ) {
+                                        Icon(Icons.Default.DeleteOutline, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(6.dp))
+                                        Text("Remove Photo")
+                                    }
+                                }
                             }
                         }
 
-                        Spacer(Modifier.height(12.dp))
+                        Spacer(Modifier.height(14.dp))
                         OutlinedTextField(
                             value = displayName,
                             onValueChange = { displayName = it },
@@ -224,12 +251,13 @@ fun SettingsScreen(
                         )
                         Spacer(Modifier.height(12.dp))
                         GlowingPrimaryButton(
-                            onClick = { onSaveIdentity(displayName, localAvatarUri) },
+                            onClick = { onSaveDisplayName(displayName) },
+                            enabled = !isLoading && displayName.isNotBlank(),
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .testTag("settings_save_identity_button")
                         ) {
-                            Text("Save Profile Identity", fontWeight = FontWeight.ExtraBold)
+                            Text("Save Display Name", fontWeight = FontWeight.ExtraBold)
                         }
                     }
                 }
@@ -320,8 +348,9 @@ fun SettingsScreen(
                         icon = Icons.Default.AutoAwesome,
                         iconTint = ext.solarGold,
                         title = "Auto-Fill Templates",
-                        subtitle = "Populate standard exception & effect narratives automatically",
-                        selected = prefsState.autoFillEnabled
+                        subtitle = "Show Auto-Fill button in report form (tap button to fill manually)",
+                        selected = prefsState.autoFillEnabled,
+                        onClick = { onSetAutoFill(!prefsState.autoFillEnabled) }
                     ) {
                         Switch(
                             checked = prefsState.autoFillEnabled,
@@ -407,6 +436,79 @@ fun SettingsScreen(
                                         contentDescription = "Selected",
                                         tint = if (ext.isDark) Color(0xFF0A0C10) else Color.White,
                                         modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 5. Cloud Storage & Dynamic APK Update Info (Server-Managed)
+                if (mobileAppConfig != null && mobileAppConfig.downloadUrl.isNotBlank()) {
+                    item {
+                        GlassCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 24.dp, contentPadding = 16.dp) {
+                            MicroLabel("Mobile Release Channel")
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                text = if (mobileAppConfig.latestVersion.isNotBlank()) {
+                                    "JC-Best Compliance APK v${mobileAppConfig.latestVersion}"
+                                } else {
+                                    "Official Directorate APK Download"
+                                },
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                            if (mobileAppConfig.releaseNotes.isNotBlank()) {
+                                Spacer(Modifier.height(4.dp))
+                                Text(
+                                    text = mobileAppConfig.releaseNotes,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            OutlinedButton(
+                                onClick = {
+                                    runCatching {
+                                        activity.startActivity(
+                                            Intent(Intent.ACTION_VIEW, Uri.parse(mobileAppConfig.downloadUrl))
+                                        )
+                                    }.onFailure {
+                                        onNotify("Unable to open release download link.", true)
+                                    }
+                                },
+                                shape = CircleShape,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("settings_download_apk_button")
+                            ) {
+                                Icon(Icons.Default.Download, contentDescription = null)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Check / Download APK Release", fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                }
+
+                if (storageProviderConfig != null) {
+                    item {
+                        GlassCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 22.dp, contentPadding = 14.dp) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.CloudDone,
+                                    contentDescription = null,
+                                    tint = ext.emerald,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Column {
+                                    MicroLabel("Unified Evidence Storage")
+                                    Text(
+                                        text = "${storageProviderConfig.bucketName} • Private B2 Proxy Sync",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
                             }

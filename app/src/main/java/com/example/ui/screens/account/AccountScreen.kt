@@ -25,7 +25,6 @@ import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
@@ -40,20 +39,19 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import coil.compose.AsyncImage
 import com.example.data.model.SystemSettings
 import com.example.data.model.UserSession
 import com.example.ui.components.AtmosphericGlassBackground
+import com.example.ui.components.AvatarFallbackMode
 import com.example.ui.components.GlassCard
 import com.example.ui.components.MicroLabel
+import com.example.ui.components.ProfileAvatar
 import com.example.ui.components.StatusPill
 import com.example.ui.components.VideoStyleChecklistRow
 import com.example.ui.theme.ComplianceTheme
-import java.io.File
 
 @Composable
 fun AccountScreen(
@@ -61,6 +59,8 @@ fun AccountScreen(
     displayName: String,
     avatarUri: String,
     settings: SystemSettings,
+    onResolveSignedUrl: (suspend (String) -> Result<String>)? = null,
+    onGetMediaHeaders: ((String) -> Map<String, String>)? = null,
     onOpenSettings: () -> Unit,
     onOpenChangePassword: () -> Unit,
     onOpenAdminPanel: () -> Unit,
@@ -111,33 +111,18 @@ fun AccountScreen(
                                 },
                             contentAlignment = Alignment.Center
                         ) {
-                            if (avatarUri.isNotBlank()) {
-                                AsyncImage(
-                                    model = if (avatarUri.startsWith("/")) File(avatarUri) else Uri.parse(avatarUri),
-                                    contentDescription = "Profile Avatar",
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier
-                                        .size(62.dp)
-                                        .clip(CircleShape)
-                                        .border(1.5.dp, glowColor.copy(alpha = 0.7f), CircleShape)
-                                )
-                            } else {
-                                Box(
-                                    modifier = Modifier
-                                        .size(62.dp)
-                                        .clip(CircleShape)
-                                        .background(MaterialTheme.colorScheme.primaryContainer)
-                                        .border(1.5.dp, glowColor.copy(alpha = 0.6f), CircleShape),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Person,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier.size(30.dp)
-                                    )
-                                }
-                            }
+                            ProfileAvatar(
+                                avatarUrl = avatarUri,
+                                displayName = resolvedName,
+                                size = 62.dp,
+                                borderColor = glowColor.copy(alpha = 0.7f),
+                                accentColor = glowColor,
+                                fallbackMode = AvatarFallbackMode.INITIALS,
+                                onResolveSignedUrl = onResolveSignedUrl,
+                                getAuthHeaders = onGetMediaHeaders,
+                                onClick = onOpenSettings,
+                                testTag = "account_hero_avatar"
+                            )
                         }
 
                         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {

@@ -12,9 +12,12 @@ import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import com.example.data.model.ComplianceDivision
 import com.example.data.model.DraftMediaItem
 import com.example.data.model.OfflineDraft
+import com.example.data.model.ReportEvidenceAttachment
 import com.example.data.model.ReportFormDraft
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -39,7 +42,10 @@ data class DraftEntity(
     val mediaName: String?,
     val mediaItemsJson: String = "[]",
     val incidentDate: String,
-    val createdAtMillis: Long
+    val createdAtMillis: Long,
+    val formDataJson: String = "",
+    val isQueuedForSubmit: Boolean = false,
+    val queuedAtMillis: Long = 0L
 ) {
     companion object {
         fun encodeMediaItems(items: List<DraftMediaItem>): String {
@@ -97,6 +103,9 @@ interface DraftDao {
     @Query("SELECT * FROM offline_drafts WHERE userId = :userId ORDER BY createdAtMillis DESC")
     suspend fun listForUser(userId: String): List<DraftEntity>
 
+    @Query("SELECT * FROM offline_drafts WHERE userId = :userId AND isQueuedForSubmit = 1 ORDER BY queuedAtMillis ASC")
+    suspend fun listQueuedForUser(userId: String): List<DraftEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(entity: DraftEntity)
 
@@ -107,13 +116,21 @@ interface DraftDao {
     suspend fun deleteByIdForUser(id: String, userId: String)
 }
 
-@Database(entities = [DraftEntity::class], version = 3, exportSchema = false)
+@Database(entities = [DraftEntity::class], version = 4, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun draftDao(): DraftDao
 
     companion object {
         @Volatile
         private var instance: AppDatabase? = null
+
+        private val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE offline_drafts ADD COLUMN formDataJson TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE offline_drafts ADD COLUMN isQueuedForSubmit INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE offline_drafts ADD COLUMN queuedAtMillis INTEGER NOT NULL DEFAULT 0")
+            }
+        }
 
         fun getInstance(context: Context): AppDatabase {
             return instance ?: synchronized(this) {
@@ -122,6 +139,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "jcbest_compliance_local.db"
                 )
+                    .addMigrations(MIGRATION_3_4)
                     .fallbackToDestructiveMigration(true)
                     .build()
                     .also { instance = it }
@@ -246,6 +264,11 @@ class DraftRepository(private val context: Context) {
         val resolvedPrimary = rawPrimary?.let { resolveReadablePath(entity.userId, it, materializeMedia) }
             ?: resolvedItems.firstOrNull()?.pathOrUri
 
+        val rawFormJson = entity.formDataJson.takeIf { it.isNotBlank() }?.let { vault.decryptDraftText(it) }
+        val decodedFormDraft = rawFormJson?.takeIf { it.isNotBlank() }?.let {
+            decodeFormDraftJson(entity.userId, it, materializeMedia)
+        }
+
         return OfflineDraft(
             id = entity.id,
             userId = entity.userId,
@@ -256,8 +279,142 @@ class DraftRepository(private val context: Context) {
             mediaName = entity.mediaName?.let { vault.decryptDraftText(it) },
             mediaItems = resolvedItems,
             incidentDate = vault.decryptDraftText(entity.incidentDate),
-            createdAtMillis = entity.createdAtMillis
+            createdAtMillis = entity.createdAtMillis,
+            formDraft = decodedFormDraft,
+            isQueuedForSubmit = entity.isQueuedForSubmit,
+            queuedAtMillis = entity.queuedAtMillis.takeIf { it > 0L }
         )
+    }
+
+    suspend fun listAllDraftsOnce(userId: String, materializeMedia: Boolean = false): List<OfflineDraft> =
+        withContext(Dispatchers.IO) {
+            if (userId.isBlank()) return@withContext emptyList()
+            dao.listForUser(userId).map { toDecryptedModel(it, materializeMedia = materializeMedia) }
+        }
+
+    suspend fun listQueuedForAutoSubmit(userId: String): List<OfflineDraft> =
+        withContext(Dispatchers.IO) {
+            if (userId.isBlank()) return@withContext emptyList()
+            dao.listQueuedForUser(userId).map { toDecryptedModel(it, materializeMedia = true) }
+        }
+
+    suspend fun saveFullFormDraft(
+        userId: String,
+        existingDraftId: String?,
+        formDraft: ReportFormDraft,
+        attachments: List<ReportEvidenceAttachment>,
+        queueForAutoSubmit: Boolean = false
+    ): OfflineDraft = withContext(Dispatchers.IO) {
+        val now = System.currentTimeMillis()
+        val existingEntity = existingDraftId?.takeIf { it.isNotBlank() }?.let { dao.getByIdForUser(it, userId) }
+        val id = existingEntity?.id ?: "draft_${UUID.randomUUID().toString().take(12)}"
+
+        val storedMediaItems = mutableListOf<DraftMediaItem>()
+        attachments.forEachIndexed { index, att ->
+            if (att.isExistingCloud) return@forEachIndexed
+            val pathOrUri = att.pathOrUri.trim()
+            if (pathOrUri.isBlank()) return@forEachIndexed
+            val mediaType = att.mediaType.ifBlank { "image" }
+            val stamp = DraftEntity.formatDraftDateTime(now)
+            val encryptedBucketPath = when {
+                pathOrUri.startsWith("/") && pathOrUri.endsWith(".enc") -> pathOrUri
+                pathOrUri.startsWith("/") -> {
+                    val bucketCandidate = toBucketPathIfExists(userId, pathOrUri)
+                    if (bucketCandidate.endsWith(".enc") && File(bucketCandidate).exists()) {
+                        bucketCandidate
+                    } else {
+                        val f = File(pathOrUri)
+                        if (f.exists()) storeMediaEncrypted(userId, "${id}_${now}_$index", f) ?: pathOrUri
+                        else pathOrUri
+                    }
+                }
+                pathOrUri.startsWith("content://") -> {
+                    val uri = Uri.parse(pathOrUri)
+                    val safeName = (att.displayName.ifBlank { resolveFileName(uri) ?: "evidence_$index" })
+                        .replace(Regex("[^a-zA-Z0-9._-]"), "_")
+                    val tempFile = File(context.cacheDir, "uri_tmp_${now}_${index}_$safeName")
+                    val copied = runCatching {
+                        context.contentResolver.openInputStream(uri)?.use { input ->
+                            tempFile.outputStream().use { output -> input.copyTo(output) }
+                        }
+                        tempFile.exists() && tempFile.length() > 0L
+                    }.getOrDefault(false)
+                    if (copied) {
+                        val stored = storeMediaEncrypted(userId, "${id}_${now}_$index", tempFile)
+                        runCatching { tempFile.delete() }
+                        stored ?: pathOrUri
+                    } else {
+                        pathOrUri
+                    }
+                }
+                else -> pathOrUri
+            }
+            storedMediaItems.add(
+                DraftMediaItem(
+                    id = att.id.ifBlank { "dm_${now}_$index" },
+                    pathOrUri = encryptedBucketPath,
+                    mediaType = mediaType,
+                    capturedAtLabel = att.displayName.ifBlank { stamp }
+                )
+            )
+        }
+
+        val normalizedFormDraft = formDraft.copy(
+            sourceDraftId = id,
+            selectedDraftMedia = storedMediaItems,
+            localMediaPath = storedMediaItems.firstOrNull()?.pathOrUri,
+            evidenceType = storedMediaItems.firstOrNull()?.mediaType ?: "none",
+            evidenceName = when {
+                storedMediaItems.isEmpty() -> null
+                storedMediaItems.size == 1 -> storedMediaItems.first().capturedAtLabel
+                else -> "${storedMediaItems.size} items"
+            },
+            hasUserEdited = true,
+            updatedAtMillis = now
+        )
+
+        val divLabel = ComplianceDivision.fromAny(formDraft.divisionKey)?.label ?: "Compliance"
+        val resolvedTitle = listOfNotNull(
+            formDraft.checkName?.takeIf { it.isNotBlank() },
+            formDraft.staffName?.takeIf { it.isNotBlank() }
+        ).joinToString(" • ").ifBlank { "$divLabel Offline Draft" }
+        val primaryStored = storedMediaItems.firstOrNull()?.pathOrUri
+        val primaryType = storedMediaItems.firstOrNull()?.mediaType ?: "none"
+        val primaryName = storedMediaItems.firstOrNull()?.capturedAtLabel
+
+        val formJsonRaw = encodeFormDraftJson(userId, normalizedFormDraft)
+
+        val entity = DraftEntity(
+            id = id,
+            userId = userId,
+            title = vault.encryptDraftText(resolvedTitle),
+            notes = vault.encryptDraftText(formDraft.exceptionText.trim()),
+            mediaPath = primaryStored?.let { vault.encryptDraftText(it) },
+            mediaType = primaryType,
+            mediaName = primaryName?.let { vault.encryptDraftText(it) },
+            mediaItemsJson = vault.encryptDraftText(DraftEntity.encodeMediaItems(storedMediaItems)),
+            incidentDate = vault.encryptDraftText(formDraft.incidentDate.ifBlank { AcademicWeekEngine.todayIso() }),
+            createdAtMillis = existingEntity?.createdAtMillis ?: now,
+            formDataJson = vault.encryptDraftText(formJsonRaw),
+            isQueuedForSubmit = queueForAutoSubmit,
+            queuedAtMillis = if (queueForAutoSubmit) now else 0L
+        )
+        dao.upsert(entity)
+        toDecryptedModel(entity, materializeMedia = true)
+    }
+
+    suspend fun setDraftQueuedState(
+        userId: String,
+        draftId: String,
+        queued: Boolean
+    ): OfflineDraft? = withContext(Dispatchers.IO) {
+        val existing = dao.getByIdForUser(draftId, userId) ?: return@withContext null
+        val updated = existing.copy(
+            isQueuedForSubmit = queued,
+            queuedAtMillis = if (queued) System.currentTimeMillis() else 0L
+        )
+        dao.upsert(updated)
+        toDecryptedModel(updated, materializeMedia = true)
     }
 
     suspend fun saveDraft(
@@ -458,11 +615,21 @@ class DraftRepository(private val context: Context) {
 
     suspend fun saveComposerFormDraft(userId: String, draft: ReportFormDraft) = withContext(Dispatchers.IO) {
         if (userId.isBlank()) return@withContext
+        vault.saveEncryptedFormDraft(userId, encodeFormDraftJson(userId, draft))
+    }
+
+    suspend fun loadComposerFormDraft(userId: String): ReportFormDraft? = withContext(Dispatchers.IO) {
+        if (userId.isBlank()) return@withContext null
+        val raw = vault.loadEncryptedFormDraft(userId) ?: return@withContext null
+        decodeFormDraftJson(userId, raw, materializeMedia = true)
+    }
+
+    private fun encodeFormDraftJson(userId: String, draft: ReportFormDraft): String {
         val storedMediaItems = draft.selectedDraftMedia.map { item ->
             item.copy(pathOrUri = toBucketPathIfExists(userId, item.pathOrUri))
         }
         val storedLocalPath = draft.localMediaPath?.let { toBucketPathIfExists(userId, it) }
-        val json = JSONObject().apply {
+        return JSONObject().apply {
             put("divisionKey", draft.divisionKey)
             put("targetType", draft.targetType)
             put("classTierFilter", draft.classTierFilter)
@@ -491,12 +658,9 @@ class DraftRepository(private val context: Context) {
             put("hasUserEdited", draft.hasUserEdited)
             put("updatedAtMillis", draft.updatedAtMillis)
         }.toString()
-        vault.saveEncryptedFormDraft(userId, json)
     }
 
-    suspend fun loadComposerFormDraft(userId: String): ReportFormDraft? = withContext(Dispatchers.IO) {
-        if (userId.isBlank()) return@withContext null
-        val raw = vault.loadEncryptedFormDraft(userId) ?: return@withContext null
+    private fun decodeFormDraftJson(userId: String, raw: String, materializeMedia: Boolean): ReportFormDraft? =
         runCatching {
             val o = JSONObject(raw)
             fun optNullStr(k: String): String? =
@@ -504,15 +668,15 @@ class DraftRepository(private val context: Context) {
 
             val rawItems = DraftEntity.decodeMediaItems(o.optString("selectedDraftMediaJson", "[]"))
             val resolvedItems = rawItems.mapNotNull { item ->
-                val resolved = resolveReadablePath(userId, item.pathOrUri, materializeMedia = true)
-                if (resolved.startsWith("/") && !File(resolved).exists()) null
+                val resolved = resolveReadablePath(userId, item.pathOrUri, materializeMedia)
+                if (materializeMedia && resolved.startsWith("/") && !File(resolved).exists()) null
                 else item.copy(pathOrUri = resolved)
             }
 
             val rawLocalPath = optNullStr("localMediaPath")
             val resolvedLocalPath = rawLocalPath?.let { path ->
-                val res = resolveReadablePath(userId, path, materializeMedia = true)
-                if (res.startsWith("/") && !File(res).exists()) null else res
+                val res = resolveReadablePath(userId, path, materializeMedia)
+                if (materializeMedia && res.startsWith("/") && !File(res).exists()) null else res
             }
             val rawEvType = o.optString("evidenceType", "none")
             val validEvType = if (rawLocalPath != null && resolvedLocalPath == null && resolvedItems.isEmpty()) "none" else rawEvType
@@ -547,7 +711,6 @@ class DraftRepository(private val context: Context) {
                 updatedAtMillis = o.optLong("updatedAtMillis", 0L)
             )
         }.getOrNull()
-    }
 
     suspend fun clearComposerFormDraft(userId: String) = withContext(Dispatchers.IO) {
         if (userId.isBlank()) return@withContext

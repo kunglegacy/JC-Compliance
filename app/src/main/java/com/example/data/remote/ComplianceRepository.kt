@@ -1,7 +1,11 @@
 package com.example.data.remote
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
 import android.provider.OpenableColumns
 import com.example.data.local.AcademicWeekEngine
 import com.example.data.local.ComplianceTaxonomy
@@ -11,26 +15,57 @@ import com.example.data.model.ComplianceCheck
 import com.example.data.model.ComplianceDivision
 import com.example.data.model.ComplianceReport
 import com.example.data.model.DirectorateUser
+import com.example.data.model.MobileAppConfig
 import com.example.data.model.ReportResolutionStatus
 import com.example.data.model.StaffMember
+import com.example.data.model.StorageProviderConfig
 import com.example.data.model.SubjectItem
 import com.example.data.model.SupabaseConfig
 import com.example.data.model.SystemSettings
+import com.example.data.model.TermAnalysisSnapshot
 import com.example.data.model.UserRole
 import com.example.data.model.UserSession
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.net.URLDecoder
 import java.net.URLEncoder
+import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 class ComplianceRepository(
     private val context: Context,
     private val api: SupabaseApiClient = SupabaseApiClient()
 ) {
+    private data class CachedSignedUrl(val url: String, val expiresAtMs: Long)
+    private val signedUrlCache = ConcurrentHashMap<String, CachedSignedUrl>()
+    private val signedUrlTtlMs = 45L * 60L * 1000L // Cache 60m B2/Supabase signed URLs cleanly for 45m
     private fun enc(value: String): String = URLEncoder.encode(value, "UTF-8")
+
+    private fun dec(value: String): String = runCatching {
+        URLDecoder.decode(value, "UTF-8")
+    }.getOrDefault(value)
+
+    fun buildB2AuthHeaders(config: SupabaseConfig, token: String?): Map<String, String> {
+        val bearer = token?.takeIf { it.isNotBlank() } ?: config.anonKey
+        return mapOf(
+            "Authorization" to "Bearer $bearer",
+            "x-supabase-url" to config.url.trimEnd('/'),
+            "x-supabase-anon-key" to config.anonKey
+        )
+    }
+
+    fun isB2FileProxyUrl(config: SupabaseConfig, url: String): Boolean {
+        val base = config.normalizedApiBaseUrl
+        val lower = url.trim().lowercase(Locale.US)
+        if (lower.startsWith("/api/storage/b2/file")) return true
+        if (base.isNotBlank() && lower.startsWith("${base.lowercase(Locale.US)}/api/storage/b2/file")) return true
+        return false
+    }
 
     private val missingColRegex1 = Regex("'([a-zA-Z0-9_]+)'\\s+column", RegexOption.IGNORE_CASE)
     private val missingColRegex2 = Regex("column\\s+\"?([a-zA-Z0-9_]+)\"?", RegexOption.IGNORE_CASE)
@@ -110,8 +145,11 @@ class ComplianceRepository(
             return Result.failure(Exception("This account has been suspended. Contact the Directorate Administrator."))
         }
 
-        val rawAvatar = roleInfo.avatarUrl.ifBlank { metaAvatar }
-        val resolvedAvatar = resolveAvatarDisplayUrl(config, accessToken, rawAvatar)
+        val canonicalAvatar = normalizeCanonicalAvatarPath(roleInfo.avatarUrl.ifBlank { metaAvatar })
+        if (canonicalAvatar.isNotBlank()) {
+            // Warm in-memory signed URL cache on sign-in while storing canonical relative path in session
+            runCatching { getSignedEvidenceUrl(config, accessToken, canonicalAvatar) }
+        }
 
         return Result.success(
             UserSession(
@@ -125,7 +163,7 @@ class ComplianceRepository(
                 status = roleInfo.status,
                 isVerified = roleInfo.isVerified,
                 isOwner = roleInfo.isOwner,
-                avatarUrl = resolvedAvatar
+                avatarUrl = canonicalAvatar
             )
         )
     }
@@ -170,102 +208,219 @@ class ComplianceRepository(
         else Result.failure(Exception(res.errorMessage ?: "Unable to update password."))
     }
 
+    fun normalizeCanonicalAvatarPath(rawPath: String): String {
+        val raw = rawPath.trim()
+        if (raw.isBlank() || raw.equals("null", ignoreCase = true)) return ""
+        return when (val ref = parseMediaReference(raw)) {
+            is ParsedMediaRef.B2Object -> ref.objectPath.trimStart('/')
+            is ParsedMediaRef.SupabaseLegacy -> {
+                if (raw.startsWith("http://", true) || raw.startsWith("https://", true)) raw.substringBefore('?')
+                else ref.objectPath.trimStart('/')
+            }
+            is ParsedMediaRef.DirectUrl -> raw
+        }
+    }
+
     suspend fun updateDisplayNameOnServer(
         config: SupabaseConfig,
         session: UserSession,
         newDisplayName: String
-    ) {
+    ): Result<Unit> {
+        val cleanName = newDisplayName.trim()
+        val nowIso = java.time.Instant.now().toString()
         val userPayload = JSONObject().apply {
-            put("data", JSONObject().apply { put("display_name", newDisplayName.trim()) })
+            put("data", JSONObject().apply { put("display_name", cleanName) })
         }.toString()
-        api.requestJson(config, "PUT", "/auth/v1/user", userPayload, session.accessToken)
+        val authRes = api.requestJson(config, "PUT", "/auth/v1/user", userPayload, session.accessToken)
 
-        val rolePayload = JSONObject().apply { put("display_name", newDisplayName.trim()) }.toString()
-        api.requestJson(
-            config,
-            "PATCH",
-            "/rest/v1/user_roles?user_id=eq.${enc(session.userId)}",
-            rolePayload,
-            session.accessToken
+        val rolePayload = JSONObject().apply {
+            put("display_name", cleanName)
+            put("avatar_updated_at", nowIso)
+        }
+        var roleRes = requestWithMissingColumnRetry(
+            config = config,
+            method = "PATCH",
+            path = "/rest/v1/user_roles?user_id=eq.${enc(session.userId)}",
+            payloadObj = rolePayload,
+            token = session.accessToken,
+            extraHeaders = mapOf("Prefer" to "return=representation")
         )
+        val updatedRows = if (roleRes.isSuccess) api.parseJsonArraySafe(roleRes.body).length() else 0
+        if (!roleRes.isSuccess || updatedRows == 0) {
+            val rpcPayload = JSONObject().apply {
+                put("p_display_name", cleanName)
+                put("p_clear_avatar", false)
+            }.toString()
+            roleRes = api.requestJson(config, "POST", "/rest/v1/rpc/update_my_profile", rpcPayload, session.accessToken)
+        }
+        return if (roleRes.isSuccess || authRes.isSuccess) Result.success(Unit)
+        else Result.failure(Exception(roleRes.errorMessage ?: authRes.errorMessage ?: "Unable to update display name."))
     }
 
     suspend fun uploadProfileAvatar(
         config: SupabaseConfig,
         session: UserSession,
-        avatarFile: File
+        avatarFile: File,
+        previousAvatarPath: String = ""
     ): Result<String> = withContext(Dispatchers.IO) {
+        if (!config.isB2Configured) {
+            return@withContext Result.failure(
+                Exception("Web storage backend URL (API_BASE_URL) is not configured. Open Connection Setup to enter it.")
+            )
+        }
         val bytes = runCatching { avatarFile.readBytes() }.getOrElse {
             return@withContext Result.failure(Exception("Unable to read compressed profile photo."))
         }
-        val objectPath = "evidence/avatars/${session.userId}/avatar_${System.currentTimeMillis()}.jpg"
-        val uploadRes = api.uploadBinary(config, "compliance-evidence", objectPath, bytes, "image/jpeg", session.accessToken)
-        if (!uploadRes.isSuccess) {
-            return@withContext Result.failure(Exception(uploadRes.errorMessage ?: "Unable to upload profile avatar."))
+        if (bytes.isEmpty()) {
+            return@withContext Result.failure(Exception("Compressed profile photo is empty."))
         }
 
-        // Persist canonical storage path in auth user_metadata and user_roles
+        val fileName = "avatar_${System.currentTimeMillis()}.jpg"
+        val objectKey = "avatars/${session.userId}/$fileName"
+        val uploadEndpoint = "${config.normalizedApiBaseUrl}/api/storage/b2/upload"
+        val uploadHeaders = buildB2AuthHeaders(config, session.accessToken) + mapOf(
+            "x-object-path" to enc(objectKey),
+            "x-content-type" to "image/jpeg",
+            "x-file-name" to enc(fileName),
+            "x-category" to "avatar",
+            "x-uploaded-by" to session.userId
+        )
+
+        val uploadRes = api.postRawBytesToUrl(uploadEndpoint, bytes, uploadHeaders)
+        if (!uploadRes.isSuccess) {
+            return@withContext Result.failure(
+                Exception(uploadRes.errorMessage ?: "Failed to upload profile photo to Backblaze B2.")
+            )
+        }
+
+        val obj = api.parseJsonObjectSafe(uploadRes.body)
+        val canonicalObjectKey = normalizeCanonicalAvatarPath(
+            obj.optCleanString("path").ifBlank { objectKey }
+        ).ifBlank { objectKey }
+
+        // Persist ONLY canonical relative B2 object path in public.user_roles and Supabase auth metadata
+        val nowIso = java.time.Instant.now().toString()
+        val rolePayload = JSONObject().apply {
+            put("avatar_url", canonicalObjectKey)
+            put("avatar_updated_at", nowIso)
+        }
+        var roleRes = requestWithMissingColumnRetry(
+            config = config,
+            method = "PATCH",
+            path = "/rest/v1/user_roles?user_id=eq.${enc(session.userId)}",
+            payloadObj = rolePayload,
+            token = session.accessToken,
+            extraHeaders = mapOf("Prefer" to "return=representation")
+        )
+        val updatedRows = if (roleRes.isSuccess) api.parseJsonArraySafe(roleRes.body).length() else 0
+        if (!roleRes.isSuccess || updatedRows == 0) {
+            val rpcPayload = JSONObject().apply {
+                put("p_avatar_url", canonicalObjectKey)
+                put("p_clear_avatar", false)
+            }.toString()
+            roleRes = api.requestJson(config, "POST", "/rest/v1/rpc/update_my_profile", rpcPayload, session.accessToken)
+        }
+        if (!roleRes.isSuccess) {
+            // Roll back uploaded orphan if DB write failed
+            runCatching { deleteEvidenceMedia(config, session.accessToken, canonicalObjectKey) }
+            return@withContext Result.failure(
+                Exception(roleRes.errorMessage ?: "Unable to save profile photo to database.")
+            )
+        }
+
         val userPayload = JSONObject().apply {
-            put("data", JSONObject().apply { put("avatar_url", objectPath) })
+            put("data", JSONObject().apply { put("avatar_url", canonicalObjectKey) })
         }.toString()
         api.requestJson(config, "PUT", "/auth/v1/user", userPayload, session.accessToken)
 
-        val rolePayload = JSONObject().apply { put("avatar_url", objectPath) }.toString()
-        api.requestJson(
-            config,
-            "PATCH",
-            "/rest/v1/user_roles?user_id=eq.${enc(session.userId)}",
-            rolePayload,
-            session.accessToken
-        )
+        // Clean up previous avatar object in B2 & public.storage_objects so orphans do not accumulate
+        val normalizedPrev = normalizeCanonicalAvatarPath(previousAvatarPath)
+        if (normalizedPrev.isNotBlank() && normalizedPrev != canonicalObjectKey) {
+            signedUrlCache.remove(normalizedPrev)
+            runCatching { deleteEvidenceMedia(config, session.accessToken, normalizedPrev) }
+        }
 
-        val signedUrl = resolveAvatarDisplayUrl(config, session.accessToken, objectPath)
-        Result.success(signedUrl.ifBlank { objectPath })
+        // Pre-warm signed URL cache cleanly
+        runCatching { getSignedEvidenceUrl(config, session.accessToken, canonicalObjectKey) }
+        Result.success(canonicalObjectKey)
     }
 
-    suspend fun fetchProfileAvatarUrl(
+    suspend fun removeProfileAvatar(
+        config: SupabaseConfig,
+        session: UserSession,
+        previousAvatarPath: String = ""
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        val nowIso = java.time.Instant.now().toString()
+        val rolePayload = JSONObject().apply {
+            put("avatar_url", JSONObject.NULL)
+            put("avatar_updated_at", nowIso)
+        }
+        var roleRes = requestWithMissingColumnRetry(
+            config = config,
+            method = "PATCH",
+            path = "/rest/v1/user_roles?user_id=eq.${enc(session.userId)}",
+            payloadObj = rolePayload,
+            token = session.accessToken,
+            extraHeaders = mapOf("Prefer" to "return=representation")
+        )
+        val updatedRows = if (roleRes.isSuccess) api.parseJsonArraySafe(roleRes.body).length() else 0
+        if (!roleRes.isSuccess || updatedRows == 0) {
+            val rpcPayload = JSONObject().apply {
+                put("p_clear_avatar", true)
+            }.toString()
+            roleRes = api.requestJson(config, "POST", "/rest/v1/rpc/update_my_profile", rpcPayload, session.accessToken)
+        }
+        if (!roleRes.isSuccess) {
+            return@withContext Result.failure(
+                Exception(roleRes.errorMessage ?: "Unable to clear profile photo in database.")
+            )
+        }
+
+        val userPayload = JSONObject().apply {
+            put("data", JSONObject().apply { put("avatar_url", JSONObject.NULL) })
+        }.toString()
+        api.requestJson(config, "PUT", "/auth/v1/user", userPayload, session.accessToken)
+
+        val normalizedPrev = normalizeCanonicalAvatarPath(previousAvatarPath)
+        if (normalizedPrev.isNotBlank()) {
+            signedUrlCache.remove(normalizedPrev)
+            runCatching { deleteEvidenceMedia(config, session.accessToken, normalizedPrev) }
+        }
+        Result.success(Unit)
+    }
+
+    suspend fun fetchCurrentUserProfile(
         config: SupabaseConfig,
         session: UserSession
-    ): String {
+    ): Result<Pair<String, String>> {
         val roleRes = api.requestJson(
             config,
             "GET",
-            "/rest/v1/user_roles?user_id=eq.${enc(session.userId)}&select=avatar_url",
+            "/rest/v1/user_roles?user_id=eq.${enc(session.userId)}&select=avatar_url,display_name",
             accessToken = session.accessToken
         )
-        var rawPath = ""
         if (roleRes.isSuccess) {
             val arr = api.parseJsonArraySafe(roleRes.body)
             if (arr.length() > 0) {
-                rawPath = arr.getJSONObject(0).optString("avatar_url").takeIf { it != "null" }.orEmpty()
+                val obj = arr.getJSONObject(0)
+                val name = obj.optCleanString("display_name")
+                val canonicalAvatar = normalizeCanonicalAvatarPath(obj.optCleanString("avatar_url"))
+                return Result.success(name to canonicalAvatar)
             }
         }
-        if (rawPath.isBlank()) {
-            val userRes = api.requestJson(config, "GET", "/auth/v1/user", accessToken = session.accessToken)
-            if (userRes.isSuccess) {
-                val uObj = api.parseJsonObjectSafe(userRes.body)
-                val meta = uObj.optJSONObject("user_metadata") ?: JSONObject()
-                rawPath = meta.optString("avatar_url").takeIf { it != "null" }.orEmpty()
-            }
+        val userRes = api.requestJson(config, "GET", "/auth/v1/user", accessToken = session.accessToken)
+        if (userRes.isSuccess) {
+            val uObj = api.parseJsonObjectSafe(userRes.body)
+            val meta = uObj.optJSONObject("user_metadata") ?: JSONObject()
+            val name = meta.optCleanString("display_name").ifBlank { meta.optCleanString("full_name") }
+            val canonicalAvatar = normalizeCanonicalAvatarPath(meta.optCleanString("avatar_url"))
+            return Result.success(name to canonicalAvatar)
         }
-        return resolveAvatarDisplayUrl(config, session.accessToken, rawPath)
-    }
-
-    private suspend fun resolveAvatarDisplayUrl(
-        config: SupabaseConfig,
-        token: String,
-        rawPath: String
-    ): String {
-        val trimmed = rawPath.trim()
-        if (trimmed.isBlank() || trimmed == "null") return ""
-        if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) return trimmed
-        if (trimmed.startsWith("evidence/")) {
-            return getSignedEvidenceUrl(config, token, trimmed).getOrDefault(trimmed)
-        }
-        return trimmed
+        return Result.failure(Exception(roleRes.errorMessage ?: userRes.errorMessage ?: "Unable to fetch profile."))
     }
 
     suspend fun signOut(config: SupabaseConfig, accessToken: String) {
+        signedUrlCache.clear()
         api.requestJson(config, "POST", "/auth/v1/logout?scope=local", "{}", accessToken)
     }
 
@@ -429,50 +584,99 @@ class ComplianceRepository(
     }
 
     suspend fun purgeEvidenceBucket(config: SupabaseConfig, token: String): Result<Int> {
-        val listPayload = JSONObject().apply {
-            put("prefix", "evidence")
-            put("limit", 1000)
-        }.toString()
-        val listRes = api.requestJson(config, "POST", "/storage/v1/object/list/compliance-evidence", listPayload, token)
-        if (!listRes.isSuccess) {
-            return Result.failure(Exception(listRes.errorMessage ?: "Unable to inspect evidence bucket."))
+        if (!config.isB2Configured) {
+            return Result.failure(
+                Exception("Web storage backend URL (API_BASE_URL) is not configured. Open Connection Setup to configure it.")
+            )
         }
-        val items = api.parseJsonArraySafe(listRes.body)
-        val prefixes = mutableListOf<String>()
-        for (i in 0 until items.length()) {
-            val item = items.optJSONObject(i) ?: continue
-            val name = item.optString("name")
-            if (name.isNotBlank()) {
-                prefixes.add("evidence/$name")
-            }
+        val queryRes = api.requestJson(
+            config = config,
+            method = "GET",
+            path = "/rest/v1/storage_objects?is_deleted=eq.false&select=*",
+            accessToken = token
+        )
+        if (!queryRes.isSuccess) {
+            return Result.failure(Exception(queryRes.errorMessage ?: "Unable to query storage_objects inventory."))
         }
-        if (prefixes.isEmpty()) return Result.success(0)
+        val items = api.parseJsonArraySafe(queryRes.body)
+        if (items.length() == 0) return Result.success(0)
 
         var deleted = 0
-        for (prefix in prefixes) {
-            val subPayload = JSONObject().apply {
-                put("prefix", prefix)
-                put("limit", 200)
-            }.toString()
-            val subRes = api.requestJson(config, "POST", "/storage/v1/object/list/compliance-evidence", subPayload, token)
-            if (subRes.isSuccess) {
-                val subArr = api.parseJsonArraySafe(subRes.body)
-                val pathsToDelete = mutableListOf<String>()
-                for (j in 0 until subArr.length()) {
-                    val subItem = subArr.optJSONObject(j) ?: continue
-                    val n = subItem.optString("name")
-                    if (n.isNotBlank()) pathsToDelete.add("$prefix/$n")
-                }
-                if (pathsToDelete.isNotEmpty()) {
-                    val delPayload = JSONObject().apply {
-                        put("prefixes", JSONArray(pathsToDelete))
-                    }.toString()
-                    val delRes = api.requestJson(config, "DELETE", "/storage/v1/object/compliance-evidence", delPayload, token)
-                    if (delRes.isSuccess) deleted += pathsToDelete.size
-                }
+        for (i in 0 until items.length()) {
+            val row = items.optJSONObject(i) ?: continue
+            val objectPath = row.optCleanString("object_path")
+                .ifBlank { row.optCleanString("path") }
+                .ifBlank { row.optCleanString("file_path") }
+                .ifBlank { row.optCleanString("storage_path") }
+            if (objectPath.isBlank()) continue
+            val delRes = deleteEvidenceMedia(config, token, objectPath)
+            if (delRes.isSuccess) {
+                deleted++
             }
         }
         return Result.success(deleted)
+    }
+
+    suspend fun fetchStorageProviderConfig(
+        config: SupabaseConfig,
+        token: String
+    ): StorageProviderConfig? {
+        val res = api.requestJson(
+            config = config,
+            method = "POST",
+            path = "/rest/v1/rpc/get_storage_provider_config",
+            bodyJson = "{}",
+            accessToken = token
+        )
+        if (!res.isSuccess) return null
+        val obj = when {
+            res.body.trim().startsWith("[") -> api.parseJsonArraySafe(res.body).optJSONObject(0)
+            else -> api.parseJsonObjectSafe(res.body)
+        } ?: return null
+        return StorageProviderConfig(
+            provider = obj.optCleanString("provider").ifBlank { "backblaze_b2" },
+            bucketName = obj.optCleanString("bucket_name").ifBlank { "JC-Best-Compliance" },
+            isPrivate = obj.optBoolean("is_private", true)
+        )
+    }
+
+    suspend fun fetchMobileAppConfig(
+        config: SupabaseConfig,
+        token: String
+    ): MobileAppConfig? {
+        val res = api.requestJson(
+            config = config,
+            method = "POST",
+            path = "/rest/v1/rpc/get_mobile_app_config",
+            bodyJson = "{}",
+            accessToken = token
+        )
+        if (res.isSuccess) {
+            val obj = when {
+                res.body.trim().startsWith("[") -> api.parseJsonArraySafe(res.body).optJSONObject(0)
+                else -> api.parseJsonObjectSafe(res.body)
+            }
+            if (obj != null) {
+                val url = obj.optCleanString("download_url")
+                    .ifBlank { obj.optCleanString("apk_url") }
+                    .ifBlank { obj.optCleanString("release_url") }
+                val version = obj.optCleanString("latest_version")
+                    .ifBlank { obj.optCleanString("version_name") }
+                    .ifBlank { obj.optCleanString("version") }
+                val notes = obj.optCleanString("release_notes")
+                    .ifBlank { obj.optCleanString("notes") }
+                val minVer = obj.optCleanString("min_version")
+                if (url.isNotBlank() || version.isNotBlank()) {
+                    return MobileAppConfig(
+                        latestVersion = version,
+                        downloadUrl = url,
+                        releaseNotes = notes,
+                        minVersion = minVer
+                    )
+                }
+            }
+        }
+        return null
     }
 
     // ---------------------------------------------------------------------
@@ -513,7 +717,9 @@ class ComplianceRepository(
             role = o.optString("role").ifBlank { "Teacher" },
             department = dept,
             assignedLocation = o.optString("assigned_location"),
-            isActive = activeFlag
+            isActive = activeFlag,
+            schoolSection = o.optCleanString("school_section"),
+            subjects = o.optCleanString("subjects")
         )
     }
 
@@ -817,7 +1023,7 @@ class ComplianceRepository(
                     isOwner = isOwner,
                     isFounder = o.optBoolean("is_founder", false) || isOwner,
                     createdAt = o.optCleanString("created_at"),
-                    avatarUrl = o.optCleanString("avatar_url")
+                    avatarUrl = normalizeCanonicalAvatarPath(o.optCleanString("avatar_url"))
                 )
             )
         }
@@ -1202,7 +1408,10 @@ class ComplianceRepository(
             resolvedAt = o.optCleanString("resolved_at").takeIf { it.isNotBlank() },
             isEdited = o.optBoolean("is_edited", false),
             editedAt = o.optCleanString("edited_at").takeIf { it.isNotBlank() },
-            createdAt = o.optCleanString("created_at")
+            createdAt = o.optCleanString("created_at"),
+            schoolSection = o.optCleanString("school_section").takeIf { it.isNotBlank() },
+            disciplineGroup = o.optCleanString("discipline_group").takeIf { it.isNotBlank() },
+            session = o.optCleanString("session").takeIf { it.isNotBlank() }
         )
     }
 
@@ -1216,58 +1425,145 @@ class ComplianceRepository(
         }
     }
 
+    private suspend fun executeReportMutationWithRetry(
+        config: SupabaseConfig,
+        method: String,
+        path: String,
+        payload: JSONObject,
+        token: String,
+        maxRetries: Int = 16
+    ): Pair<ApiResult, JSONObject> {
+        val current = JSONObject(payload.toString())
+        val optionalCols = listOf(
+            "role", "staff_group", "department", "assigned_location", "staff_category",
+            "check_id", "class_id", "subject_id", "reporter_id", "reporting_officer",
+            "evidence_name", "evidence_urls", "evidence_types", "evidence_notes",
+            "pending_at", "pending_by", "is_edited", "edited_at",
+            "date", "exception_text", "effect_text", "violation_level"
+        )
+        var res = api.requestJson(
+            config,
+            method,
+            path,
+            current.toString(),
+            token,
+            mapOf("Prefer" to "return=representation")
+        )
+        var attempts = 0
+        var divisionToggled = false
+        while (!res.isSuccess && attempts < maxRetries) {
+            val msg = res.errorMessage.orEmpty()
+            val msgLow = msg.lowercase()
+            var changed = false
+
+            // 1. Check PostgREST missing column / schema cache mismatch
+            val match = missingColRegex1.find(msg) ?: missingColRegex2.find(msg)
+            val regexCol = match?.groupValues?.getOrNull(1)?.trim()
+            if (!regexCol.isNullOrBlank() && current.has(regexCol)) {
+                current.remove(regexCol)
+                changed = true
+            } else {
+                for (col in optionalCols) {
+                    if (current.has(col) && msgLow.contains(col) &&
+                        (msgLow.contains("column") || msgLow.contains("schema cache") || msgLow.contains("could not find"))
+                    ) {
+                        current.remove(col)
+                        changed = true
+                    }
+                }
+            }
+
+            // 2. Check Foreign Key (23503) or Invalid UUID (22P02) on optional relation columns
+            if (!changed && (msgLow.contains("foreign key") || msgLow.contains("23503") || msgLow.contains("22p02") || msgLow.contains("invalid input syntax for type uuid"))) {
+                when {
+                    msgLow.contains("check_id") && current.has("check_id") -> {
+                        current.remove("check_id")
+                        changed = true
+                    }
+                    msgLow.contains("class_id") && current.has("class_id") -> {
+                        current.remove("class_id")
+                        changed = true
+                    }
+                    msgLow.contains("subject_id") && current.has("subject_id") -> {
+                        current.remove("subject_id")
+                        changed = true
+                    }
+                    msgLow.contains("reporter_id") && current.has("reporter_id") -> {
+                        current.remove("reporter_id")
+                        changed = true
+                    }
+                }
+            }
+
+            // 3. Legacy Operation vs Operations division check compatibility
+            if (!changed && !divisionToggled && msgLow.contains("division_check")) {
+                val curDiv = current.optString("division", "")
+                if (curDiv.equals("Operation", ignoreCase = true)) {
+                    current.put("division", "Operations")
+                    divisionToggled = true
+                    changed = true
+                } else if (curDiv.equals("Operations", ignoreCase = true)) {
+                    current.put("division", "Operation")
+                    divisionToggled = true
+                    changed = true
+                }
+            }
+
+            if (!changed) break
+            attempts++
+            res = api.requestJson(
+                config,
+                method,
+                path,
+                current.toString(),
+                token,
+                mapOf("Prefer" to "return=representation")
+            )
+        }
+        return res to current
+    }
+
     suspend fun createReport(
         config: SupabaseConfig,
         session: UserSession,
         payload: JSONObject
     ): Result<ComplianceReport> {
-        val current = JSONObject(payload.toString())
-        val optionalCols = listOf(
-            "role", "staff_group", "department", "assigned_location",
-            "evidence_name", "evidence_urls", "evidence_types", "evidence_notes",
-            "pending_at", "pending_by", "is_edited", "edited_at"
-        )
-
-        var res = api.requestJson(
-            config,
-            "POST",
-            "/rest/v1/compliance_reports",
-            current.toString(),
-            session.accessToken,
-            mapOf("Prefer" to "return=representation")
+        val (res, submitted) = executeReportMutationWithRetry(
+            config = config,
+            method = "POST",
+            path = "/rest/v1/compliance_reports",
+            payload = payload,
+            token = session.accessToken
         )
 
         if (!res.isSuccess) {
-            val errLow = res.errorMessage.orEmpty().lowercase()
-            var stripped = false
-            optionalCols.forEach { col ->
-                if (errLow.contains(col)) {
-                    current.remove(col)
-                    stripped = true
-                }
+            val rawErr = res.errorMessage.orEmpty()
+            val friendly = when {
+                rawErr.contains("chk_compliance_reports_staff_integrity", ignoreCase = true) ->
+                    "Staff selection or Operation division constraint check failed on the database. Ensure a staff member is selected for Academic reports."
+                rawErr.contains("42501") || rawErr.contains("row-level security", ignoreCase = true) ->
+                    "Permission denied by server security policy. Please sign out and sign back in."
+                else -> rawErr.ifBlank { "Failed to submit compliance report." }
             }
-            if (!stripped && (errLow.contains("column") || errLow.contains("schema cache"))) {
-                optionalCols.forEach { current.remove(it) }
-                stripped = true
-            }
-            if (stripped) {
-                res = api.requestJson(
-                    config,
-                    "POST",
-                    "/rest/v1/compliance_reports",
-                    current.toString(),
-                    session.accessToken,
-                    mapOf("Prefer" to "return=representation")
-                )
-            }
+            return Result.failure(Exception(friendly))
         }
 
-        if (!res.isSuccess) {
-            return Result.failure(Exception(res.errorMessage ?: "Failed to submit compliance report."))
-        }
         val arr = api.parseJsonArraySafe(res.body)
-        return if (arr.length() > 0) Result.success(parseReport(arr.getJSONObject(0)))
-        else Result.failure(Exception("Report saved but response could not be parsed."))
+        if (arr.length() > 0) {
+            return Result.success(parseReport(arr.getJSONObject(0)))
+        }
+
+        val obj = api.parseJsonObjectSafe(res.body)
+        if (obj.length() > 0 && obj.has("report_number")) {
+            return Result.success(parseReport(obj))
+        }
+
+        // HTTP 2xx with empty body (e.g. restrictive SELECT RETURNING policy): build local optimistic model
+        val fallback = JSONObject(submitted.toString()).apply {
+            if (optString("id").isBlank()) put("id", java.util.UUID.randomUUID().toString())
+            if (optString("created_at").isBlank()) put("created_at", java.time.Instant.now().toString())
+        }
+        return Result.success(parseReport(fallback))
     }
 
     suspend fun updateReport(
@@ -1276,50 +1572,25 @@ class ComplianceRepository(
         reportId: String,
         updates: JSONObject
     ): Result<ComplianceReport> {
-        val current = JSONObject(updates.toString())
-        val optionalCols = listOf(
-            "role", "staff_group", "department", "assigned_location",
-            "evidence_name", "evidence_urls", "evidence_types", "evidence_notes",
-            "pending_at", "pending_by", "is_edited", "edited_at"
+        val (res, _) = executeReportMutationWithRetry(
+            config = config,
+            method = "PATCH",
+            path = "/rest/v1/compliance_reports?id=eq.${enc(reportId)}",
+            payload = updates,
+            token = token
         )
-        var res = api.requestJson(
-            config,
-            "PATCH",
-            "/rest/v1/compliance_reports?id=eq.${enc(reportId)}",
-            current.toString(),
-            token,
-            mapOf("Prefer" to "return=representation")
-        )
-        if (!res.isSuccess) {
-            val errLow = res.errorMessage.orEmpty().lowercase()
-            var stripped = false
-            optionalCols.forEach { col ->
-                if (errLow.contains(col)) {
-                    current.remove(col)
-                    stripped = true
-                }
-            }
-            if (!stripped && (errLow.contains("column") || errLow.contains("schema cache"))) {
-                optionalCols.forEach { current.remove(it) }
-                stripped = true
-            }
-            if (stripped) {
-                res = api.requestJson(
-                    config,
-                    "PATCH",
-                    "/rest/v1/compliance_reports?id=eq.${enc(reportId)}",
-                    current.toString(),
-                    token,
-                    mapOf("Prefer" to "return=representation")
-                )
-            }
-        }
         if (!res.isSuccess) {
             return Result.failure(Exception(res.errorMessage ?: "Failed to update report."))
         }
         val arr = api.parseJsonArraySafe(res.body)
-        return if (arr.length() > 0) Result.success(parseReport(arr.getJSONObject(0)))
-        else Result.failure(Exception("Report update returned no data."))
+        if (arr.length() > 0) {
+            return Result.success(parseReport(arr.getJSONObject(0)))
+        }
+        val obj = api.parseJsonObjectSafe(res.body)
+        if (obj.length() > 0 && (obj.has("id") || obj.has("report_number"))) {
+            return Result.success(parseReport(obj))
+        }
+        return Result.failure(Exception("Report update returned no data."))
     }
 
     suspend fun setReportSeenState(
@@ -1423,8 +1694,13 @@ class ComplianceRepository(
                 val o = arr.optJSONObject(i) ?: continue
                 val recipientUid = o.optCleanString("recipient_user_id").takeIf { it.isNotBlank() }
                 val recipientRole = o.optCleanString("recipient_role").ifBlank { "user" }
+                val notifType = o.optCleanString("type")
                 val forCurrentUser = when {
                     recipientUid != null && recipientUid.equals(session.userId, true) -> true
+                    recipientRole.equals("super_admin", true) && session.role.isSuperAdmin -> true
+                    notifType.equals("NEW_SUBMISSION", true) ->
+                        session.role.isSuperAdmin &&
+                            (recipientRole.equals("super_admin", true) || recipientRole.equals("admin", true))
                     recipientRole.equals("admin", true) && session.role.isAdminOrAbove -> true
                     else -> false
                 }
@@ -1491,17 +1767,28 @@ class ComplianceRepository(
     }
 
     // ---------------------------------------------------------------------
-    // STORAGE (EVIDENCE)
+    // STORAGE (BACKBLAZE B2 VIA WEB PROXY + LEGACY SUPABASE FALLBACK)
     // ---------------------------------------------------------------------
     suspend fun uploadEvidenceFile(
         config: SupabaseConfig,
         token: String,
         reportNumber: String,
         file: File,
-        mimeType: String
+        mimeType: String,
+        reportId: String? = null
     ): Result<String> = withContext(Dispatchers.IO) {
         val bytes = file.readBytes()
-        uploadEvidenceBytes(config, token, reportNumber, bytes, file.name, mimeType)
+        uploadBytesToB2(
+            config = config,
+            token = token,
+            reportScopeId = reportId?.takeIf { it.isNotBlank() } ?: reportNumber,
+            bytes = bytes,
+            fileName = file.name,
+            mimeType = mimeType,
+            category = "evidence",
+            reportId = reportId ?: reportNumber,
+            generateThumbnail = true
+        )
     }
 
     suspend fun uploadEvidenceUri(
@@ -1509,34 +1796,281 @@ class ComplianceRepository(
         token: String,
         reportNumber: String,
         uri: Uri,
-        fallbackMime: String
+        fallbackMime: String,
+        reportId: String? = null
     ): Result<Triple<String, String, String>> = withContext(Dispatchers.IO) {
         val mime = context.contentResolver.getType(uri) ?: fallbackMime
         val name = resolveUriDisplayName(uri) ?: "evidence_${System.currentTimeMillis()}"
         val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
             ?: return@withContext Result.failure(Exception("Unable to read selected evidence file."))
-        val uploadRes = uploadEvidenceBytes(config, token, reportNumber, bytes, name, mime)
+        val uploadRes = uploadBytesToB2(
+            config = config,
+            token = token,
+            reportScopeId = reportId?.takeIf { it.isNotBlank() } ?: reportNumber,
+            bytes = bytes,
+            fileName = name,
+            mimeType = mime,
+            category = "evidence",
+            reportId = reportId ?: reportNumber,
+            generateThumbnail = true
+        )
         uploadRes.map { path -> Triple(path, name, mime) }
     }
 
-    private suspend fun uploadEvidenceBytes(
+    private suspend fun uploadBytesToB2(
         config: SupabaseConfig,
         token: String,
-        reportNumber: String,
+        reportScopeId: String,
         bytes: ByteArray,
         fileName: String,
-        mimeType: String
-    ): Result<String> {
+        mimeType: String,
+        category: String = "evidence",
+        reportId: String? = null,
+        generateThumbnail: Boolean = true
+    ): Result<String> = withContext(Dispatchers.IO) {
+        if (!config.isB2Configured) {
+            return@withContext Result.failure(
+                Exception("Web storage backend URL (API_BASE_URL) is not configured. Open Connection Setup to configure it.")
+            )
+        }
         val maxBytes = 50 * 1024 * 1024
         if (bytes.size > maxBytes) {
-            return Result.failure(Exception("Evidence file exceeds 50 MB upload limit."))
+            return@withContext Result.failure(Exception("Evidence file exceeds 50 MB upload limit."))
         }
-        val safeName = fileName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
-        val rand = UUID.randomUUID().toString().replace("-", "").take(12)
-        val path = "evidence/$reportNumber/$rand/$safeName"
-        val res = api.uploadBinary(config, "compliance-evidence", path, bytes, mimeType, token)
-        return if (res.isSuccess) Result.success(path)
-        else Result.failure(Exception(res.errorMessage ?: "Failed to upload evidence."))
+
+        val cleanScope = reportScopeId
+            .trim()
+            .replace(Regex("[^a-zA-Z0-9._-]"), "_")
+            .ifBlank { "audit" }
+        val random16Hex = UUID.randomUUID().toString().replace("-", "").take(16).lowercase(Locale.US)
+        val dotIdx = fileName.lastIndexOf('.')
+        val rawBase = if (dotIdx > 0) fileName.substring(0, dotIdx) else fileName
+        val rawExt = if (dotIdx > 0 && dotIdx < fileName.length - 1) fileName.substring(dotIdx + 1) else ""
+        val sanitizedBaseName = rawBase
+            .trim()
+            .replace(Regex("[^a-zA-Z0-9._-]"), "_")
+            .trim('_', '.')
+            .ifBlank { "file" }
+            .take(64)
+        val ext = rawExt.lowercase(Locale.US).replace(Regex("[^a-z0-9]"), "").ifBlank {
+            mimeToExtension(mimeType)
+        }
+
+        val objectPath = "evidence/$cleanScope/$random16Hex/$sanitizedBaseName.$ext"
+        val uploadEndpoint = "${config.normalizedApiBaseUrl}/api/storage/b2/upload"
+        val baseHeaders = buildB2AuthHeaders(config, token)
+        val uploadHeaders = baseHeaders + buildMap {
+            put("x-object-path", enc(objectPath))
+            put("x-content-type", mimeType)
+            put("x-file-name", enc("$sanitizedBaseName.$ext"))
+            put("x-category", category)
+            if (!reportId.isNullOrBlank()) {
+                put("x-report-id", reportId)
+            }
+        }
+
+        val res = api.postRawBytesToUrl(uploadEndpoint, bytes, uploadHeaders)
+        if (!res.isSuccess) {
+            return@withContext Result.failure(Exception(res.errorMessage ?: "Failed to upload evidence to Backblaze B2."))
+        }
+
+        // Best-effort companion WebP thumbnail for images/videos (matches web admin convention)
+        if (generateThumbnail && (mimeType.startsWith("image/", true) || mimeType.startsWith("video/", true))) {
+            runCatching {
+                val thumbBytes = createWebpThumbnailBytes(bytes, mimeType)
+                if (thumbBytes != null && thumbBytes.isNotEmpty()) {
+                    val thumbPath = "evidence/$cleanScope/$random16Hex/thumb_$sanitizedBaseName.webp"
+                    val thumbHeaders = baseHeaders + buildMap {
+                        put("x-object-path", enc(thumbPath))
+                        put("x-content-type", "image/webp")
+                        put("x-file-name", enc("thumb_$sanitizedBaseName.webp"))
+                        put("x-category", "thumbnail")
+                        if (!reportId.isNullOrBlank()) {
+                            put("x-report-id", reportId)
+                        }
+                    }
+                    api.postRawBytesToUrl(uploadEndpoint, thumbBytes, thumbHeaders)
+                }
+            }
+        }
+
+        val obj = api.parseJsonObjectSafe(res.body)
+        val returnedProxy = obj.optCleanString("proxyUrl")
+        val returnedPath = obj.optCleanString("path").ifBlank { objectPath }
+        val canonicalProxyUrl = when {
+            returnedProxy.startsWith("/api/storage/b2/file") -> returnedProxy
+            else -> "/api/storage/b2/file?path=${enc(returnedPath)}"
+        }
+        Result.success(canonicalProxyUrl)
+    }
+
+    private fun createWebpThumbnailBytes(bytes: ByteArray, mimeType: String): ByteArray? {
+        val rawBitmap: Bitmap? = when {
+            mimeType.startsWith("image/", true) -> {
+                val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOpts)
+                val maxSide = maxOf(boundsOpts.outWidth, boundsOpts.outHeight).coerceAtLeast(1)
+                val sampleSize = (maxSide / 320).coerceAtLeast(1)
+                val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts)
+            }
+            mimeType.startsWith("video/", true) -> {
+                val tmp = File.createTempFile("thumb_src_", ".mp4", context.cacheDir)
+                try {
+                    tmp.writeBytes(bytes)
+                    val retriever = MediaMetadataRetriever()
+                    try {
+                        retriever.setDataSource(tmp.absolutePath)
+                        retriever.getFrameAtTime(200_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                            ?: retriever.frameAtTime
+                    } finally {
+                        runCatching { retriever.release() }
+                    }
+                } finally {
+                    tmp.delete()
+                }
+            }
+            else -> null
+        }
+        if (rawBitmap == null) return null
+
+        val maxDim = 320f
+        val scale = minOf(maxDim / rawBitmap.width.coerceAtLeast(1), maxDim / rawBitmap.height.coerceAtLeast(1), 1f)
+        val thumbBitmap = if (scale < 1f) {
+            Bitmap.createScaledBitmap(
+                rawBitmap,
+                (rawBitmap.width * scale).toInt().coerceAtLeast(1),
+                (rawBitmap.height * scale).toInt().coerceAtLeast(1),
+                true
+            )
+        } else rawBitmap
+
+        return try {
+            ByteArrayOutputStream().use { baos ->
+                val format = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    Bitmap.CompressFormat.WEBP_LOSSY
+                } else {
+                    @Suppress("DEPRECATION")
+                    Bitmap.CompressFormat.WEBP
+                }
+                thumbBitmap.compress(format, 75, baos)
+                baos.toByteArray()
+            }
+        } finally {
+            if (thumbBitmap !== rawBitmap) thumbBitmap.recycle()
+            rawBitmap.recycle()
+        }
+    }
+
+    private fun mimeToExtension(mimeType: String): String = when (mimeType.lowercase(Locale.US).substringBefore(';').trim()) {
+        "image/webp" -> "webp"
+        "image/png" -> "png"
+        "image/gif" -> "gif"
+        "image/heic" -> "heic"
+        "video/mp4" -> "mp4"
+        "video/webm" -> "webm"
+        "video/quicktime" -> "mov"
+        "audio/mp4", "audio/m4a", "audio/aac" -> "m4a"
+        "audio/mpeg" -> "mp3"
+        "audio/wav" -> "wav"
+        "application/pdf" -> "pdf"
+        else -> "jpg"
+    }
+
+    sealed class ParsedMediaRef {
+        data class SupabaseLegacy(val bucket: String, val objectPath: String, val alreadySignedUrl: String? = null) : ParsedMediaRef()
+        data class B2Object(val objectPath: String, val isBareRelativeEvidence: Boolean = false) : ParsedMediaRef()
+        data class DirectUrl(val url: String) : ParsedMediaRef()
+    }
+
+    fun parseMediaReference(storedPathOrUrl: String): ParsedMediaRef {
+        val raw = storedPathOrUrl.trim()
+        val lower = raw.lowercase(Locale.US)
+
+        // 1. Legacy Supabase Storage URLs
+        val supaMarker = "/storage/v1/object/"
+        val supaIdx = lower.indexOf(supaMarker)
+        if (lower.contains("supabase.co/storage/v1/object/") || supaIdx >= 0) {
+            if (lower.contains("token=") || lower.contains("/storage/v1/object/public/")) {
+                if (raw.startsWith("http://") || raw.startsWith("https://")) {
+                    return ParsedMediaRef.SupabaseLegacy("compliance-evidence", "", alreadySignedUrl = raw)
+                }
+            }
+            val afterMarker = raw.substring(supaIdx + supaMarker.length).trimStart('/')
+            val withoutMode = when {
+                afterMarker.startsWith("public/") -> afterMarker.removePrefix("public/")
+                afterMarker.startsWith("sign/") -> afterMarker.removePrefix("sign/")
+                afterMarker.startsWith("authenticated/") -> afterMarker.removePrefix("authenticated/")
+                else -> afterMarker
+            }.substringBefore('?')
+            val slashIdx = withoutMode.indexOf('/')
+            if (slashIdx > 0 && slashIdx < withoutMode.length - 1) {
+                val bucket = withoutMode.substring(0, slashIdx)
+                val objPath = dec(withoutMode.substring(slashIdx + 1))
+                return ParsedMediaRef.SupabaseLegacy(bucket, objPath)
+            }
+        }
+
+        // 2. Proxy URL: /api/storage/b2/file?path=... or full https://host/api/storage/b2/file?path=...
+        if (lower.contains("/api/storage/b2/file")) {
+            val extracted = extractQueryParam(raw, "path")
+            if (extracted.isNotBlank()) {
+                return ParsedMediaRef.B2Object(extracted.trimStart('/'))
+            }
+        }
+
+        // 3. b2:// scheme: b2://JC-Best-Compliance/evidence/... or b2://JC-Best-Compliance/avatars/...
+        if (lower.startsWith("b2://")) {
+            val withoutScheme = raw.substring(5).trimStart('/')
+            val evIdx = withoutScheme.indexOf("evidence/")
+            val avIdx = withoutScheme.indexOf("avatars/")
+            val objectPath = when {
+                evIdx >= 0 -> withoutScheme.substring(evIdx)
+                avIdx >= 0 -> withoutScheme.substring(avIdx)
+                withoutScheme.contains("/") -> withoutScheme.substringAfter("/")
+                else -> withoutScheme
+            }
+            return ParsedMediaRef.B2Object(objectPath.trimStart('/'))
+        }
+
+        // 4. Direct B2 friendly URL without Authorization token: https://.../file/<bucket>/<path>
+        if ((lower.startsWith("http://") || lower.startsWith("https://")) && lower.contains("/file/")) {
+            if (lower.contains("authorization=")) {
+                return ParsedMediaRef.DirectUrl(raw)
+            }
+            val afterFile = raw.substring(lower.indexOf("/file/") + 6).substringBefore('?')
+            val slashIdx = afterFile.indexOf('/')
+            if (slashIdx > 0 && slashIdx < afterFile.length - 1) {
+                val objPath = dec(afterFile.substring(slashIdx + 1)).trimStart('/')
+                return ParsedMediaRef.B2Object(objPath)
+            }
+        }
+
+        // 5. Generic full HTTP/HTTPS URL
+        if (lower.startsWith("http://") || lower.startsWith("https://")) {
+            return ParsedMediaRef.DirectUrl(raw)
+        }
+
+        // 6. Bare relative object path (e.g. avatars/... or evidence/...)
+        val trimmedPath = raw.trimStart('/')
+        return ParsedMediaRef.B2Object(
+            objectPath = trimmedPath,
+            isBareRelativeEvidence = trimmedPath.startsWith("evidence/", ignoreCase = true)
+        )
+    }
+
+    private fun extractQueryParam(url: String, key: String): String {
+        val qIdx = url.indexOf('?')
+        if (qIdx < 0 || qIdx >= url.length - 1) return ""
+        val query = url.substring(qIdx + 1)
+        for (pair in query.split('&')) {
+            val eqIdx = pair.indexOf('=')
+            val k = if (eqIdx >= 0) pair.substring(0, eqIdx) else pair
+            if (k == key && eqIdx >= 0) {
+                return dec(pair.substring(eqIdx + 1))
+            }
+        }
+        return ""
     }
 
     suspend fun getSignedEvidenceUrl(
@@ -1544,31 +2078,176 @@ class ComplianceRepository(
         token: String,
         storedPathOrUrl: String
     ): Result<String> {
-        if (storedPathOrUrl.startsWith("http://") || storedPathOrUrl.startsWith("https://")) {
-            return Result.success(storedPathOrUrl)
+        val raw = storedPathOrUrl.trim()
+        if (raw.isBlank()) return Result.failure(Exception("Evidence path is empty."))
+
+        val now = System.currentTimeMillis()
+        signedUrlCache[raw]?.let { cached ->
+            if (cached.expiresAtMs > now && cached.url.isNotBlank()) {
+                return Result.success(cached.url)
+            }
         }
-        val cleanPath = storedPathOrUrl.trimStart('/')
+
+        val resolvedResult: Result<String> = when (val ref = parseMediaReference(raw)) {
+            is ParsedMediaRef.DirectUrl -> Result.success(ref.url)
+            is ParsedMediaRef.SupabaseLegacy -> signSupabaseLegacyObject(config, token, ref)
+            is ParsedMediaRef.B2Object -> {
+                val cleanObjPath = ref.objectPath.trimStart('/')
+                signedUrlCache[cleanObjPath]?.let { cached ->
+                    if (cached.expiresAtMs > now && cached.url.isNotBlank()) {
+                        return Result.success(cached.url)
+                    }
+                }
+                if (config.isB2Configured) {
+                    val endpoint = "${config.normalizedApiBaseUrl}/api/storage/b2/signed-url"
+                    val payload = JSONObject().apply {
+                        put("path", cleanObjPath)
+                        put("expiresIn", 3600)
+                    }.toString()
+                    val res = api.postJsonToUrl(endpoint, payload, buildB2AuthHeaders(config, token))
+                    if (res.isSuccess) {
+                        val obj = api.parseJsonObjectSafe(res.body)
+                        val returned = obj.optCleanString("signedUrl")
+                            .ifBlank { obj.optCleanString("signedURL") }
+                            .ifBlank { obj.optCleanString("url") }
+                        if (returned.isNotBlank()) {
+                            val resolved = when {
+                                returned.startsWith("http://") || returned.startsWith("https://") -> returned
+                                returned.startsWith("/") -> "${config.normalizedApiBaseUrl}$returned"
+                                else -> "${config.normalizedApiBaseUrl}/$returned"
+                            }
+                            signedUrlCache[raw] = CachedSignedUrl(resolved, now + signedUrlTtlMs)
+                            signedUrlCache[cleanObjPath] = CachedSignedUrl(resolved, now + signedUrlTtlMs)
+                            return Result.success(resolved)
+                        }
+                    }
+                    // If bare legacy evidence path isn't in B2 (404), fall back to legacy Supabase Storage
+                    if (ref.isBareRelativeEvidence && res.code == 404) {
+                        val legacyTry = signSupabaseLegacyObject(
+                            config,
+                            token,
+                            ParsedMediaRef.SupabaseLegacy("compliance-evidence", cleanObjPath)
+                        )
+                        if (legacyTry.isSuccess) {
+                            val u = legacyTry.getOrThrow()
+                            signedUrlCache[raw] = CachedSignedUrl(u, now + signedUrlTtlMs)
+                            return legacyTry
+                        }
+                    }
+                    // Fallback to authenticated proxy streaming URL on shared web backend
+                    val proxyFallback = "${config.normalizedApiBaseUrl}/api/storage/b2/file?path=${enc(cleanObjPath)}"
+                    Result.success(proxyFallback)
+                } else if (ref.isBareRelativeEvidence) {
+                    signSupabaseLegacyObject(
+                        config,
+                        token,
+                        ParsedMediaRef.SupabaseLegacy("compliance-evidence", cleanObjPath)
+                    )
+                } else {
+                    Result.failure(
+                        Exception("Web storage backend URL (API_BASE_URL) is not configured to view B2 media.")
+                    )
+                }
+            }
+        }
+        resolvedResult.onSuccess { url ->
+            if (url.isNotBlank() && !isB2FileProxyUrl(config, url)) {
+                signedUrlCache[raw] = CachedSignedUrl(url, now + signedUrlTtlMs)
+            }
+        }
+        return resolvedResult
+    }
+
+    private suspend fun signSupabaseLegacyObject(
+        config: SupabaseConfig,
+        token: String,
+        ref: ParsedMediaRef.SupabaseLegacy
+    ): Result<String> {
+        if (!ref.alreadySignedUrl.isNullOrBlank()) return Result.success(ref.alreadySignedUrl)
+        val cleanPath = ref.objectPath.trimStart('/')
+        if (cleanPath.isBlank()) return Result.failure(Exception("Empty legacy storage path."))
         val payload = JSONObject().apply { put("expiresIn", 3600) }.toString()
         val res = api.requestJson(
             config,
             "POST",
-            "/storage/v1/object/sign/compliance-evidence/$cleanPath",
+            "/storage/v1/object/sign/${ref.bucket}/$cleanPath",
             payload,
             token
         )
         if (!res.isSuccess) {
-            return Result.failure(Exception(res.errorMessage ?: "Unable to authorize evidence view."))
+            return Result.failure(Exception(res.errorMessage ?: "Unable to authorize legacy evidence view."))
         }
         val obj = api.parseJsonObjectSafe(res.body)
         val signedPath = obj.optString("signedURL").ifBlank { obj.optString("signedUrl") }
         if (signedPath.isBlank()) {
-            return Result.failure(Exception("No signed URL returned from storage."))
+            return Result.failure(Exception("No signed URL returned from legacy storage."))
         }
         val fullUrl = if (signedPath.startsWith("http")) signedPath else {
             val base = config.url.trimEnd('/')
             if (signedPath.startsWith("/")) "$base/storage/v1$signedPath" else "$base/storage/v1/$signedPath"
         }
         return Result.success(fullUrl)
+    }
+
+    suspend fun downloadEvidenceToCache(
+        config: SupabaseConfig,
+        token: String,
+        storedPathOrUrl: String,
+        suggestedName: String
+    ): Result<File> = withContext(Dispatchers.IO) {
+        val safeName = suggestedName
+            .replace(Regex("[^a-zA-Z0-9._-]"), "_")
+            .ifBlank { "evidence_${System.currentTimeMillis()}" }
+        val ref = parseMediaReference(storedPathOrUrl)
+        val downloadDir = File(context.cacheDir, "evidence_downloads")
+
+        when (ref) {
+            is ParsedMediaRef.B2Object -> {
+                if (config.isB2Configured) {
+                    val url = "${config.normalizedApiBaseUrl}/api/storage/b2/file?path=${enc(ref.objectPath)}&download=1"
+                    val headers = buildB2AuthHeaders(config, token)
+                    val ext = ref.objectPath.substringAfterLast('.', "").takeIf { it.length in 2..5 }
+                    val fileName = if (!safeName.contains('.') && !ext.isNullOrBlank()) "$safeName.$ext" else safeName
+                    val direct = api.downloadToFile(url, File(downloadDir, fileName), headers)
+                    if (direct.isSuccess) return@withContext direct
+                }
+                val signed = getSignedEvidenceUrl(config, token, storedPathOrUrl).getOrElse {
+                    return@withContext Result.failure(it)
+                }
+                val extraHeaders = if (isB2FileProxyUrl(config, signed)) buildB2AuthHeaders(config, token) else emptyMap()
+                api.downloadToFile(signed, File(downloadDir, safeName), extraHeaders)
+            }
+            else -> {
+                val signed = getSignedEvidenceUrl(config, token, storedPathOrUrl).getOrElse {
+                    return@withContext Result.failure(it)
+                }
+                api.downloadToFile(signed, File(downloadDir, safeName))
+            }
+        }
+    }
+
+    suspend fun deleteEvidenceMedia(
+        config: SupabaseConfig,
+        token: String,
+        pathOrUrl: String
+    ): Result<Unit> {
+        val raw = pathOrUrl.trim()
+        if (raw.isBlank()) return Result.success(Unit)
+        val ref = parseMediaReference(raw)
+        if (ref is ParsedMediaRef.SupabaseLegacy || ref is ParsedMediaRef.DirectUrl) {
+            return Result.success(Unit)
+        }
+        if (!config.isB2Configured) {
+            return Result.failure(Exception("Web storage backend URL (API_BASE_URL) is not configured."))
+        }
+        val objectPath = (ref as ParsedMediaRef.B2Object).objectPath
+        val payload = JSONObject().apply {
+            put("path", objectPath)
+        }.toString()
+        val endpoint = "${config.normalizedApiBaseUrl}/api/storage/b2/delete"
+        val res = api.postJsonToUrl(endpoint, payload, buildB2AuthHeaders(config, token))
+        return if (res.isSuccess) Result.success(Unit)
+        else Result.failure(Exception(res.errorMessage ?: "Failed to delete B2 storage object."))
     }
 
     private fun resolveUriDisplayName(uri: Uri): String? {
@@ -1591,4 +2270,85 @@ class ComplianceRepository(
         val hex = UUID.randomUUID().toString().replace("-", "").take(6).uppercase()
         return "JCB-$year-$seq-$hex"
     }
+
+    // ---------------------------------------------------------------------
+    // DURABLE TERM ANALYSIS SNAPSHOTS & PPTX PRESENTATION EXPORT
+    // ---------------------------------------------------------------------
+    suspend fun fetchTermSnapshots(config: SupabaseConfig, token: String): List<TermAnalysisSnapshot> {
+        val res = api.requestJson(
+            config,
+            "GET",
+            "/rest/v1/term_analysis_snapshots?select=*&order=snapshot_version.desc,created_at.desc",
+            accessToken = token
+        )
+        if (!res.isSuccess) return emptyList()
+        val arr = api.parseJsonArraySafe(res.body)
+        return buildList {
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                fun jsonField(key: String): String {
+                    if (o.isNull(key)) return ""
+                    val obj = o.optJSONObject(key)
+                    if (obj != null) return obj.toString()
+                    val jArr = o.optJSONArray(key)
+                    if (jArr != null) return jArr.toString()
+                    return o.optCleanString(key)
+                }
+                add(
+                    TermAnalysisSnapshot(
+                        id = o.optCleanString("id"),
+                        session = o.optCleanString("session"),
+                        term = o.optCleanString("term"),
+                        snapshotVersion = o.optInt("snapshot_version", 1),
+                        officialTermEndDate = o.optCleanString("official_term_end_date").takeIf { it.isNotBlank() },
+                        status = o.optCleanString("status").ifBlank { "DRAFT" },
+                        reconciliationStatus = o.optCleanString("reconciliation_status").ifBlank { "PENDING" },
+                        totalQualifyingExceptions = o.optInt("total_qualifying_exceptions", 0),
+                        academicExceptionsCount = o.optInt("academic_exceptions_count", 0),
+                        operationsExceptionsCount = o.optInt("operations_exceptions_count", 0),
+                        cdsExceptionsCount = o.optInt("cds_exceptions_count", 0),
+                        disciplineExceptionsCount = o.optInt("discipline_exceptions_count", 0),
+                        staffPopulationDenominator = o.optInt("staff_population_denominator", 0),
+                        affectedStaffCount = o.optInt("affected_staff_count", 0),
+                        cleanStaffCount = o.optInt("clean_staff_count", 0),
+                        overallPerHead = o.optDouble("overall_per_head", 0.0).toFloat(),
+                        rawFullSnapshotJson = jsonField("full_snapshot"),
+                        rawSectionMetricsJson = jsonField("section_metrics"),
+                        rawDisciplineMetricsJson = jsonField("discipline_metrics"),
+                        rawClassMetricsJson = jsonField("class_metrics"),
+                        rawCategoryMetricsJson = jsonField("category_metrics"),
+                        rawCategoryPatternsJson = jsonField("category_patterns"),
+                        rawSeverityDistributionJson = jsonField("severity_distribution"),
+                        rawExecutiveSummaryJson = jsonField("executive_summary"),
+                        rawComparisonsJson = jsonField("comparisons"),
+                        rawTrendsJson = jsonField("trends"),
+                        createdAt = o.optCleanString("created_at")
+                    )
+                )
+            }
+        }
+    }
+
+    suspend fun downloadCompliancePptx(
+        config: SupabaseConfig,
+        token: String,
+        payloadJson: String,
+        suggestedFilename: String
+    ): Result<File> {
+        if (!config.isB2Configured) {
+            return Result.failure(
+                Exception("Web backend API URL is not configured. Add it in Account -> Backend Connection to build official .pptx decks.")
+            )
+        }
+        val safeName = suggestedFilename.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        val target = File(File(context.cacheDir, "exports"), safeName)
+        val endpoint = "${config.normalizedApiBaseUrl}/api/reports/compliance-pptx"
+        return api.postJsonDownloadToFile(
+            fullUrl = endpoint,
+            bodyJson = payloadJson,
+            targetFile = target,
+            headers = buildB2AuthHeaders(config, token)
+        )
+    }
 }
+

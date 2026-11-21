@@ -72,6 +72,8 @@ fun ReportDetailSheet(
     report: ComplianceReport,
     userRole: UserRole,
     customChecks: List<ComplianceCheck>,
+    showEditButton: Boolean = userRole.isSuperAdmin || report.canUserEdit,
+    isOwnReport: Boolean = false,
     onDismiss: () -> Unit,
     onToggleSeen: (ComplianceReport) -> Unit,
     onUpdateResolution: (ComplianceReport, ReportResolutionStatus, String) -> Unit,
@@ -79,6 +81,8 @@ fun ReportDetailSheet(
     onEdit: (ComplianceReport) -> Unit,
     onDelete: (ComplianceReport) -> Unit,
     onResolveSignedUrl: suspend (String) -> Result<String>,
+    onResolveMediaHeaders: (String) -> Map<String, String> = { emptyMap() },
+    onDownloadEvidence: ((String, String) -> Unit)? = null,
     onSaveEvidenceFeedback: (ComplianceReport, Int, EvidenceVerdict, String?) -> Unit = { _, _, _, _ -> }
 ) {
     val ext = ComplianceTheme.extended
@@ -254,30 +258,33 @@ fun ReportDetailSheet(
             }
 
             // Action Controls
-            val canEdit = userRole.isAdminOrAbove || report.canUserEdit
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedButton(
-                    onClick = { if (canEdit) onEdit(report) },
-                    enabled = canEdit,
-                    shape = CircleShape,
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(48.dp)
-                        .testTag("edit_report_button")
-                ) {
-                    Icon(if (canEdit) Icons.Default.Edit else Icons.Default.Lock, contentDescription = null)
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        when {
-                            canEdit && report.isActionRequired -> "Update (Action Required)"
-                            canEdit && report.isPending -> "Update (Pending)"
-                            canEdit -> "Edit"
-                            report.isAccepted -> "Accepted (Locked)"
-                            else -> "Rejected (Locked)"
-                        },
-                        maxLines = 1
-                    )
-                }
+            val canEdit = userRole.isSuperAdmin || (showEditButton && isOwnReport && report.canUserEdit)
+            if (showEditButton || userRole.isAdminOrAbove) {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    if (showEditButton) {
+                        OutlinedButton(
+                            onClick = { if (canEdit) onEdit(report) },
+                            enabled = canEdit,
+                            shape = CircleShape,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .testTag("edit_report_button")
+                        ) {
+                            Icon(if (canEdit) Icons.Default.Edit else Icons.Default.Lock, contentDescription = null)
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                when {
+                                    canEdit && report.isActionRequired -> "Update (Action Required)"
+                                    canEdit && report.isPending -> "Update (Pending)"
+                                    canEdit -> "Edit"
+                                    report.isAccepted -> "Accepted (Locked)"
+                                    else -> "Rejected (Locked)"
+                                },
+                                maxLines = 1
+                            )
+                        }
+                    }
 
                 if (userRole.isAdminOrAbove) {
                     val markAsReviewed = !report.isSeen || report.isPending
@@ -306,6 +313,7 @@ fun ReportDetailSheet(
                         )
                     }
                 }
+            }
             }
 
             if (userRole.isAdminOrAbove) {
@@ -436,6 +444,10 @@ fun ReportDetailSheet(
             items = viewerItems,
             showModerationControls = userRole.isAdminOrAbove,
             onResolveSignedUrl = onResolveSignedUrl,
+            onResolveHeaders = onResolveMediaHeaders,
+            onDownloadEvidence = onDownloadEvidence?.let { handler ->
+                { item -> handler(item.storedPath, item.title) }
+            },
             onVerdict = { item, verdict, note ->
                 val idx = viewerItems.indexOfFirst { it.id == item.id }.coerceAtLeast(0)
                 when (verdict) {

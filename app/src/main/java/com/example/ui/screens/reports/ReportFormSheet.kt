@@ -43,6 +43,9 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
@@ -84,6 +87,9 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import coil.compose.AsyncImage
 import com.example.data.local.AcademicWeekEngine
 import com.example.data.local.ComplianceAutoFillEngine
@@ -97,14 +103,18 @@ import com.example.data.model.MediaUploadLimits
 import com.example.data.model.OfflineDraft
 import com.example.data.model.ReportEvidenceAttachment
 import com.example.data.model.ReportFormDraft
+import com.example.data.model.ReportFormMode
 import com.example.data.model.StaffMember
 import com.example.data.model.SubjectItem
+import com.example.domain.BackgroundExecutionHelper
 import com.example.ui.components.GlowingPrimaryButton
 import com.example.ui.components.MicroLabel
 import com.example.ui.components.PreSubmitAuditSheet
 import com.example.ui.components.VideoFrameThumbnail
+import com.example.ui.components.complianceGlassCard
 import com.example.ui.components.glassFieldColors
 import com.example.ui.theme.ComplianceTheme
+import com.example.ui.theme.LocalCompliancePalette
 import kotlinx.coroutines.launch
 import java.io.File
 import java.util.Calendar
@@ -115,6 +125,8 @@ import java.util.Locale
 fun ReportFormSheet(
     editingReport: ComplianceReport?,
     sourceDraft: OfflineDraft?,
+    formMode: ReportFormMode = ReportFormMode.STANDARD,
+    isOnline: Boolean = true,
     staffList: List<StaffMember>,
     classes: List<Classroom>,
     subjects: List<SubjectItem>,
@@ -130,10 +142,30 @@ fun ReportFormSheet(
     initialDraft: ReportFormDraft? = null,
     onDraftChanged: (ReportFormDraft) -> Unit = {},
     onClearDraft: () -> Unit = {},
+    onSaveToOfflineDraft: (draft: ReportFormDraft, attachments: List<ReportEvidenceAttachment>) -> Unit = { _, _ -> },
     onStageMediaFile: suspend (File) -> String? = { it.absolutePath },
     onStageMediaUri: suspend (Uri) -> Pair<String, String>? = { null },
     onResolveSignedUrl: suspend (String) -> Result<String> = { Result.failure(Exception("Unavailable")) },
     onMediaLimitError: (String) -> Unit = {},
+    feedbackMessage: String? = null,
+    isErrorFeedback: Boolean = false,
+    onClearFeedback: () -> Unit = {},
+    onQueueOfflineAutoSubmit: (
+        division: ComplianceDivision,
+        targetType: String,
+        staff: StaffMember?,
+        classroom: Classroom?,
+        subject: SubjectItem?,
+        operationScope: String,
+        specificSubjectText: String,
+        assignedLocation: String,
+        check: ComplianceCheck?,
+        incidentDate: String,
+        exceptionText: String,
+        effectText: String,
+        attachments: List<ReportEvidenceAttachment>,
+        cleanDraftMedia: Boolean
+    ) -> Unit = { _, _, _, _, _, _, _, _, _, _, _, _, _, _ -> },
     onSubmit: (
         division: ComplianceDivision,
         targetType: String,
@@ -153,10 +185,18 @@ fun ReportFormSheet(
 ) {
     val context = LocalContext.current
     val ext = ComplianceTheme.extended
+    val p = LocalCompliancePalette.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val coroutineScope = rememberCoroutineScope()
 
-    val draftToRestore = if (editingReport == null && sourceDraft == null) initialDraft else null
+    val isDraftFormMode = formMode == ReportFormMode.OFFLINE_DRAFT && editingReport == null
+    val draftToRestore = when {
+        editingReport != null -> null
+        sourceDraft?.formDraft != null -> sourceDraft.formDraft
+        sourceDraft != null -> null
+        formMode == ReportFormMode.STANDARD -> initialDraft
+        else -> null
+    }
     var userTouched by remember { mutableStateOf(false) }
 
     var division by remember {
@@ -166,7 +206,11 @@ fun ReportFormSheet(
         )
     }
     var targetType by remember {
-        mutableStateOf(editingReport?.targetType ?: draftToRestore?.targetType ?: "staff")
+        mutableStateOf(
+            editingReport?.targetType
+                ?: draftToRestore?.targetType
+                ?: if (division == ComplianceDivision.CDS || division == ComplianceDivision.OPERATIONS) "division" else "staff"
+        )
     }
     var classTierFilter by remember {
         mutableStateOf(draftToRestore?.classTierFilter ?: "All Tiers")
@@ -251,8 +295,10 @@ fun ReportFormSheet(
     var showBusMenu by remember { mutableStateOf(false) }
     var showCustomCheckDialog by remember { mutableStateOf(false) }
     var showNoEvidenceWarning by remember { mutableStateOf(false) }
+    var showOfflineAutoSubmitConsent by remember { mutableStateOf(false) }
     var cleanDraftMedia by remember { mutableStateOf(true) }
     var mediaLimitBanner by remember { mutableStateOf<String?>(null) }
+    var localValidationError by remember { mutableStateOf<String?>(null) }
 
     // Unified evidence attachments for BOTH Create and Edit modes (Max 4 Images, Max 2 Videos)
     var attachedEvidence by remember(
@@ -353,8 +399,55 @@ fun ReportFormSheet(
         return true
     }
 
-    // Live auto-save composer draft whenever the user edits or selects any field
+    fun buildSnapshotDraft(): ReportFormDraft {
+        val syncedDraftMedia = attachedEvidence
+            .filterNot { it.isExistingCloud }
+            .map {
+                DraftMediaItem(
+                    id = it.id,
+                    pathOrUri = it.pathOrUri,
+                    mediaType = it.mediaType,
+                    capturedAtLabel = it.displayName
+                )
+            }
+        return ReportFormDraft(
+            divisionKey = division.key,
+            targetType = targetType,
+            classTierFilter = classTierFilter,
+            staffSearch = staffSearch,
+            staffId = selectedStaff?.id,
+            staffCode = selectedStaff?.staffCode,
+            staffName = selectedStaff?.name,
+            classId = selectedClass?.id,
+            className = selectedClass?.name,
+            subjectId = selectedSubject?.id,
+            subjectName = selectedSubject?.name,
+            operationScope = operationScope,
+            selectedBus = selectedBus,
+            opPersonOrLocation = opPersonOrLocation,
+            studentNamesArm = studentNamesArm,
+            checkId = selectedCheck?.id,
+            checkName = selectedCheck?.name,
+            incidentDate = incidentDate,
+            exceptionText = exceptionText,
+            effectText = effectText,
+            sourceDraftId = sourceDraft?.id ?: draftToRestore?.sourceDraftId,
+            selectedDraftMedia = syncedDraftMedia,
+            localMediaPath = syncedDraftMedia.firstOrNull()?.pathOrUri,
+            evidenceType = syncedDraftMedia.firstOrNull()?.mediaType ?: "none",
+            evidenceName = when {
+                syncedDraftMedia.isEmpty() -> null
+                syncedDraftMedia.size == 1 -> syncedDraftMedia.first().capturedAtLabel
+                else -> "${syncedDraftMedia.size} items"
+            },
+            hasUserEdited = true,
+            updatedAtMillis = System.currentTimeMillis()
+        )
+    }
+
+    // Live auto-save composer draft ONLY in standard report composer mode
     LaunchedEffect(
+        isDraftFormMode,
         userTouched,
         division, targetType, classTierFilter, staffSearch,
         selectedStaff, selectedClass, selectedSubject,
@@ -362,52 +455,8 @@ fun ReportFormSheet(
         selectedCheck, incidentDate, exceptionText, effectText,
         attachedEvidence
     ) {
-        if (editingReport == null && userTouched) {
-            val syncedDraftMedia = attachedEvidence
-                .filterNot { it.isExistingCloud }
-                .map {
-                    DraftMediaItem(
-                        id = it.id,
-                        pathOrUri = it.pathOrUri,
-                        mediaType = it.mediaType,
-                        capturedAtLabel = it.displayName
-                    )
-                }
-            onDraftChanged(
-                ReportFormDraft(
-                    divisionKey = division.key,
-                    targetType = targetType,
-                    classTierFilter = classTierFilter,
-                    staffSearch = staffSearch,
-                    staffId = selectedStaff?.id,
-                    staffCode = selectedStaff?.staffCode,
-                    staffName = selectedStaff?.name,
-                    classId = selectedClass?.id,
-                    className = selectedClass?.name,
-                    subjectId = selectedSubject?.id,
-                    subjectName = selectedSubject?.name,
-                    operationScope = operationScope,
-                    selectedBus = selectedBus,
-                    opPersonOrLocation = opPersonOrLocation,
-                    studentNamesArm = studentNamesArm,
-                    checkId = selectedCheck?.id,
-                    checkName = selectedCheck?.name,
-                    incidentDate = incidentDate,
-                    exceptionText = exceptionText,
-                    effectText = effectText,
-                    sourceDraftId = sourceDraft?.id ?: draftToRestore?.sourceDraftId,
-                    selectedDraftMedia = syncedDraftMedia,
-                    localMediaPath = syncedDraftMedia.firstOrNull()?.pathOrUri,
-                    evidenceType = syncedDraftMedia.firstOrNull()?.mediaType ?: "none",
-                    evidenceName = when {
-                        syncedDraftMedia.isEmpty() -> null
-                        syncedDraftMedia.size == 1 -> syncedDraftMedia.first().capturedAtLabel
-                        else -> "${syncedDraftMedia.size} items"
-                    },
-                    hasUserEdited = true,
-                    updatedAtMillis = System.currentTimeMillis()
-                )
-            )
+        if (editingReport == null && !isDraftFormMode && userTouched) {
+            onDraftChanged(buildSnapshotDraft())
         }
     }
 
@@ -620,8 +669,8 @@ fun ReportFormSheet(
         }
     }
 
-    fun runAutoFill(force: Boolean = true) {
-        if (!force && !autoFillEnabled) return
+    fun runAutoFill() {
+        if (!autoFillEnabled) return
         val res = ComplianceAutoFillEngine.generate(
             division = division,
             targetType = targetType,
@@ -649,14 +698,25 @@ fun ReportFormSheet(
     }
     val activeStaff = remember(staffList, division, staffSearch) {
         val q = staffSearch.trim().lowercase()
-        staffList.filter { it.isActive }.filter { s ->
-            val deptMatch = when (division) {
-                ComplianceDivision.ACADEMIC -> s.department.contains("academ", true)
-                ComplianceDivision.OPERATIONS -> s.department.contains("oper", true) || s.category.contains("non", true)
+        val onlyActive = staffList.filter { it.isActive }
+        val byDept = onlyActive.filter { s ->
+            when (division) {
+                ComplianceDivision.ACADEMIC ->
+                    s.department.contains("academ", true) ||
+                        s.category.contains("academ", true) ||
+                        s.department.isBlank()
+                ComplianceDivision.OPERATIONS ->
+                    s.department.contains("oper", true) || s.category.contains("non", true)
                 else -> true
             }
-            val qMatch = q.isBlank() || s.name.lowercase().contains(q) || s.staffCode.lowercase().contains(q)
-            deptMatch && qMatch
+        }
+        val basePool = if (byDept.isNotEmpty()) byDept else onlyActive
+        basePool.filter { s ->
+            q.isBlank() ||
+                s.name.lowercase().contains(q) ||
+                s.staffCode.lowercase().contains(q) ||
+                s.staffNumber.lowercase().contains(q) ||
+                s.role.lowercase().contains(q)
         }
     }
 
@@ -680,15 +740,29 @@ fun ReportFormSheet(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = if (editingReport != null) "Edit Exception" else "Log Compliance Exception",
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier.weight(1f),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    if (isDraftFormMode) {
+                        Text(
+                            text = "OFFLINE DRAFT FORM",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = p.tangerine
+                        )
+                    }
+                    Text(
+                        text = when {
+                            editingReport != null -> "Edit Exception"
+                            isDraftFormMode && sourceDraft != null -> "Edit Offline Draft"
+                            isDraftFormMode -> "Add Offline Draft"
+                            else -> "Log Compliance Exception"
+                        },
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(2.dp)
@@ -718,6 +792,8 @@ fun ReportFormSheet(
                                 ).firstOrNull()
                                 attachedEvidence = emptyList()
                                 mediaLimitBanner = null
+                                localValidationError = null
+                                onClearFeedback()
                                 onClearDraft()
                             },
                             modifier = Modifier
@@ -737,6 +813,22 @@ fun ReportFormSheet(
                 }
             }
 
+            if (isDraftFormMode) {
+                Surface(
+                    color = p.tangerine.copy(alpha = if (ext.isDark) 0.16f else 0.10f),
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, p.tangerine.copy(alpha = 0.35f)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "Saved locally on your device—even without media or internet. Edit anytime or complete & submit when ready.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp)
+                    )
+                }
+            }
+
             MicroLabel("Division")
             Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 ComplianceDivision.entries.forEach { div ->
@@ -744,7 +836,9 @@ fun ReportFormSheet(
                         selected = division == div,
                         onClick = {
                             division = div
-                            targetType = if (div == ComplianceDivision.CDS) "division" else "staff"
+                            targetType = if (div == ComplianceDivision.CDS || div == ComplianceDivision.OPERATIONS) "division" else "staff"
+                            localValidationError = null
+                            onClearFeedback()
                             userTouched = true
                         },
                         label = { Text(div.label) },
@@ -770,28 +864,102 @@ fun ReportFormSheet(
                     value = staffSearch,
                     onValueChange = {
                         staffSearch = it
+                        localValidationError = null
                         userTouched = true
                     },
                     label = { Text("Search Staff Roster") },
+                    trailingIcon = if (staffSearch.isNotBlank()) {
+                        {
+                            IconButton(onClick = { staffSearch = "" }) {
+                                Icon(Icons.Default.Close, contentDescription = "Clear staff search")
+                            }
+                        }
+                    } else null,
                     singleLine = true,
                     colors = glassFieldColors(),
                     shape = RoundedCornerShape(16.dp),
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth().testTag("form_staff_search")
                 )
+                if (staffSearch.isNotBlank() && (selectedStaff == null || !selectedStaff!!.name.equals(staffSearch.trim(), true))) {
+                    Surface(
+                        color = ext.glassBottom,
+                        shape = RoundedCornerShape(14.dp),
+                        border = BorderStroke(1.dp, ext.glassRimEnd),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(vertical = 4.dp)) {
+                            if (activeStaff.isEmpty()) {
+                                Text(
+                                    text = "No matching staff found for \"${staffSearch.trim()}\"",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                                )
+                            } else {
+                                activeStaff.take(6).forEach { candidate ->
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable {
+                                                selectedStaff = candidate
+                                                staffSearch = candidate.name
+                                                localValidationError = null
+                                                userTouched = true
+                                            }
+                                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = candidate.name,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                            modifier = Modifier.weight(1f),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        if (candidate.staffCode.isNotBlank()) {
+                                            Text(
+                                                text = candidate.staffCode,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.primary
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 Box {
-                    OutlinedButton(onClick = { showStaffMenu = true }, modifier = Modifier.fillMaxWidth()) {
-                        Text(selectedStaff?.let { "${it.name} (${it.staffCode})" } ?: "Select Staff Member")
+                    OutlinedButton(
+                        onClick = { showStaffMenu = true },
+                        modifier = Modifier.fillMaxWidth().testTag("form_select_staff_button")
+                    ) {
+                        Text(
+                            selectedStaff?.let { "${it.name} (${it.staffCode})" }
+                                ?: "Select Staff Member (${activeStaff.size})"
+                        )
                     }
                     DropdownMenu(expanded = showStaffMenu, onDismissRequest = { showStaffMenu = false }) {
-                        activeStaff.forEach { s ->
+                        if (activeStaff.isEmpty()) {
                             DropdownMenuItem(
-                                text = { Text("${s.name} • ${s.staffCode}") },
-                                onClick = {
-                                    selectedStaff = s
-                                    showStaffMenu = false
-                                    userTouched = true
-                                }
+                                text = { Text("No matching active staff found") },
+                                onClick = { showStaffMenu = false }
                             )
+                        } else {
+                            activeStaff.forEach { s ->
+                                DropdownMenuItem(
+                                    text = { Text("${s.name} • ${s.staffCode}") },
+                                    onClick = {
+                                        selectedStaff = s
+                                        showStaffMenu = false
+                                        localValidationError = null
+                                        userTouched = true
+                                    }
+                                )
+                            }
                         }
                     }
                 }
@@ -955,7 +1123,6 @@ fun ReportFormSheet(
                                     selectedCheck = chk
                                     showCheckMenu = false
                                     userTouched = true
-                                    if (autoFillEnabled && exceptionText.isBlank()) runAutoFill(true)
                                 }
                             )
                         }
@@ -1021,7 +1188,7 @@ fun ReportFormSheet(
 
                 if (autoFillEnabled) {
                     OutlinedButton(
-                        onClick = { runAutoFill(true) },
+                        onClick = { runAutoFill() },
                         modifier = Modifier.testTag("autofill_narrative_button")
                     ) {
                         Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp))
@@ -1290,6 +1457,8 @@ fun ReportFormSheet(
             }
 
             fun performSubmit() {
+                localValidationError = null
+                onClearFeedback()
                 onSubmit(
                     division,
                     targetType,
@@ -1310,23 +1479,102 @@ fun ReportFormSheet(
                 )
             }
 
+            fun validateSubmissionInputs(): String? = when {
+                division == ComplianceDivision.ACADEMIC && selectedStaff == null ->
+                    "Please select a staff member from the Staff Roster."
+                division == ComplianceDivision.DISCIPLINE && targetType == "staff" && selectedStaff == null ->
+                    "Please select a monitoring staff member or switch to Student Decorum."
+                selectedCheck == null ->
+                    "Please select a compliance check."
+                exceptionText.isBlank() ->
+                    "Please enter the observed compliance exception."
+                else -> null
+            }
+
+            val activeSheetError = localValidationError ?: feedbackMessage?.takeIf { isErrorFeedback && it.isNotBlank() }
+            activeSheetError?.let { errText ->
+                Surface(
+                    color = ext.rose.copy(alpha = 0.14f),
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, ext.rose.copy(alpha = 0.45f)),
+                    modifier = Modifier.fillMaxWidth().testTag("report_form_error_banner")
+                ) {
+                    Text(
+                        text = errText,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = ext.rose,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                    )
+                }
+            }
+
             val hasEvidence = attachedEvidence.isNotEmpty()
 
-            GlowingPrimaryButton(
-                onClick = { showNoEvidenceWarning = true },
-                enabled = !isLoading && exceptionText.isNotBlank(),
-                modifier = Modifier.fillMaxWidth().testTag("submit_report_button")
-            ) {
-                Text(
-                    text = if (isLoading) {
-                        compressionLabel ?: "Submitting..."
-                    } else if (editingReport != null) {
-                        "Save Updated Exception"
-                    } else {
-                        "Submit Exception Report"
+            if (isDraftFormMode) {
+                GlowingPrimaryButton(
+                    onClick = {
+                        onClearFeedback()
+                        val snapshot = buildSnapshotDraft()
+                        if (!snapshot.hasAnyDraftContent) {
+                            localValidationError = "Enter an observation, check, staff member, or attachment before saving to Offline Drafts."
+                        } else {
+                            localValidationError = null
+                            onSaveToOfflineDraft(snapshot, attachedEvidence)
+                        }
                     },
-                    fontWeight = FontWeight.ExtraBold
-                )
+                    enabled = !isLoading,
+                    modifier = Modifier.fillMaxWidth().testTag("save_to_drafts_button")
+                ) {
+                    Text(
+                        text = if (isLoading) "Saving Draft..." else if (sourceDraft != null) "Update Offline Draft" else "Save to Offline Drafts",
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = {
+                        onClearFeedback()
+                        localValidationError = validateSubmissionInputs()
+                        if (localValidationError == null) {
+                            showNoEvidenceWarning = true
+                        }
+                    },
+                    enabled = !isLoading,
+                    shape = CircleShape,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("submit_from_draft_form_button")
+                ) {
+                    Text(
+                        text = if (isOnline) "Complete & Submit Now" else "Complete & Submit (Offline)",
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            } else {
+                GlowingPrimaryButton(
+                    onClick = {
+                        onClearFeedback()
+                        localValidationError = validateSubmissionInputs()
+                        if (localValidationError == null) {
+                            showNoEvidenceWarning = true
+                        }
+                    },
+                    enabled = !isLoading,
+                    modifier = Modifier.fillMaxWidth().testTag("submit_report_button")
+                ) {
+                    Text(
+                        text = if (isLoading) {
+                            compressionLabel ?: "Submitting..."
+                        } else if (editingReport != null) {
+                            "Save Updated Exception"
+                        } else {
+                            "Submit Exception Report"
+                        },
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                }
             }
             Spacer(Modifier.height(14.dp))
 
@@ -1352,9 +1600,212 @@ fun ReportFormSheet(
                             onDismiss = { showNoEvidenceWarning = false },
                             onSubmit = {
                                 showNoEvidenceWarning = false
-                                performSubmit()
+                                if (!isOnline && editingReport == null) {
+                                    showOfflineAutoSubmitConsent = true
+                                } else {
+                                    performSubmit()
+                                }
                             }
                         )
+                    }
+                }
+            }
+
+            if (showOfflineAutoSubmitConsent) {
+                val consentLifecycleOwner = LocalLifecycleOwner.current
+                var bgStatus by remember { mutableStateOf(BackgroundExecutionHelper.checkStatus(context)) }
+                DisposableEffect(consentLifecycleOwner, showOfflineAutoSubmitConsent) {
+                    val observer = LifecycleEventObserver { _, event ->
+                        if (event == Lifecycle.Event.ON_RESUME) {
+                            bgStatus = BackgroundExecutionHelper.checkStatus(context)
+                        }
+                    }
+                    consentLifecycleOwner.lifecycle.addObserver(observer)
+                    onDispose { consentLifecycleOwner.lifecycle.removeObserver(observer) }
+                }
+
+                Dialog(
+                    onDismissRequest = { showOfflineAutoSubmitConsent = false },
+                    properties = DialogProperties(usePlatformDefaultWidth = false)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 22.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .complianceGlassCard(28.dp)
+                                .padding(20.dp)
+                                .testTag("offline_autosubmit_consent_dialog"),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Text(
+                                text = "OFFLINE SUBMISSION",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = p.tangerine
+                            )
+                            Text(
+                                text = "You Are Currently Offline",
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = p.textPrimary
+                            )
+                            Text(
+                                text = "Would you like to queue this compliance exception so it automatically submits once your device reconnects to the internet?",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = p.textSecondary
+                            )
+
+                            // Live Background Activity & System Restriction Diagnostic Card
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(18.dp))
+                                    .background(
+                                        if (bgStatus.hasAnyRestriction) p.rose.copy(alpha = 0.13f)
+                                        else p.emerald.copy(alpha = 0.12f)
+                                    )
+                                    .border(
+                                        1.dp,
+                                        if (bgStatus.hasAnyRestriction) p.rose.copy(alpha = 0.45f)
+                                        else p.emerald.copy(alpha = 0.4f),
+                                        RoundedCornerShape(18.dp)
+                                    )
+                                    .padding(12.dp)
+                                    .testTag("background_activity_status_card"),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = if (bgStatus.hasAnyRestriction) Icons.Rounded.WarningAmber else Icons.Rounded.CheckCircle,
+                                        contentDescription = null,
+                                        tint = if (bgStatus.hasAnyRestriction) p.rose else p.emerald,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Text(
+                                        text = BackgroundExecutionHelper.getPrimaryTitle(bgStatus),
+                                        style = MaterialTheme.typography.labelLarge,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        color = if (bgStatus.hasAnyRestriction) p.rose else p.emerald
+                                    )
+                                }
+                                Text(
+                                    text = BackgroundExecutionHelper.getPrimaryDescription(bgStatus),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = p.textPrimary
+                                )
+                                if (bgStatus.hasAnyRestriction) {
+                                    OutlinedButton(
+                                        onClick = {
+                                            onWillLaunchExternalPicker()
+                                            BackgroundExecutionHelper.openRelevantSettings(context, bgStatus)
+                                        },
+                                        shape = CircleShape,
+                                        border = BorderStroke(1.dp, p.rose.copy(alpha = 0.65f)),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(44.dp)
+                                            .testTag("open_background_settings_button")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.Settings,
+                                            contentDescription = null,
+                                            tint = p.rose,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(
+                                            text = BackgroundExecutionHelper.getActionButtonLabel(bgStatus),
+                                            color = p.rose,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                }
+                            }
+
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .background(p.trackFill)
+                                    .border(1.dp, p.borderBottom, RoundedCornerShape(16.dp))
+                                    .padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Text(
+                                    text = "${division.label} • ${selectedCheck?.name ?: "Standard Check"}",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.Bold,
+                                    color = p.textPrimary
+                                )
+                                Text(
+                                    text = "Date: $incidentDate • ${attachedEvidence.size} attachment${if (attachedEvidence.size == 1) "" else "s"}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = p.textSecondary
+                                )
+                            }
+                            GlowingPrimaryButton(
+                                onClick = {
+                                    showOfflineAutoSubmitConsent = false
+                                    onQueueOfflineAutoSubmit(
+                                        division,
+                                        targetType,
+                                        selectedStaff,
+                                        selectedClass,
+                                        selectedSubject,
+                                        operationScope,
+                                        if (division == ComplianceDivision.OPERATIONS) {
+                                            if (operationScope == "Transport") "$selectedBus ($opPersonOrLocation)" else opPersonOrLocation
+                                        } else studentNamesArm,
+                                        opPersonOrLocation,
+                                        selectedCheck,
+                                        incidentDate,
+                                        exceptionText,
+                                        effectText,
+                                        attachedEvidence,
+                                        cleanDraftMedia
+                                    )
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("confirm_offline_autosubmit_button")
+                            ) {
+                                Text(
+                                    text = if (bgStatus.hasAnyRestriction) {
+                                        "Queue Anyway (Sends When Reopened)"
+                                    } else {
+                                        "Yes, Auto-Submit When Online"
+                                    },
+                                    fontWeight = FontWeight.ExtraBold
+                                )
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    showOfflineAutoSubmitConsent = false
+                                    onSaveToOfflineDraft(buildSnapshotDraft(), attachedEvidence)
+                                },
+                                shape = CircleShape,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(48.dp)
+                                    .testTag("save_draft_instead_button")
+                            ) {
+                                Text("Save to Offline Drafts Instead", fontWeight = FontWeight.SemiBold)
+                            }
+                            TextButton(
+                                onClick = { showOfflineAutoSubmitConsent = false },
+                                modifier = Modifier.align(Alignment.CenterHorizontally)
+                            ) {
+                                Text("Keep Editing", color = p.textSecondary)
+                            }
+                        }
                     }
                 }
             }

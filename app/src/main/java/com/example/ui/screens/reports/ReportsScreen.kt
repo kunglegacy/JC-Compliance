@@ -40,7 +40,6 @@ import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.FilterList
-import androidx.compose.material.icons.rounded.PictureAsPdf
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -56,7 +55,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -94,7 +92,7 @@ fun ReportsScreen(
     selectedTerm: String,
     initialScope: ReportScope = ReportScope.ALL,
     onSelectTerm: (String) -> Unit,
-    onExportPdf: (ReportScope, String) -> Unit,
+    onGenerateReport: suspend (ReportScope, String, String, String, String) -> Result<String>,
     onSelectReport: (ComplianceReport) -> Unit
 ) {
     val context = LocalContext.current
@@ -218,33 +216,6 @@ fun ReportsScreen(
                             fontWeight = FontWeight.Bold,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
-                        )
-                    }
-
-                    Row(
-                        modifier = Modifier
-                            .height(42.dp)
-                            .shadow(12.dp, CircleShape, spotColor = p.tangerine.copy(alpha = 0.42f))
-                            .clip(CircleShape)
-                            .background(Brush.horizontalGradient(listOf(p.tangerine, p.tangerineEnd)))
-                            .border(1.dp, Color.White.copy(alpha = 0.28f), CircleShape)
-                            .clickable { onExportPdf(selectedScope, selectedTerm) }
-                            .padding(horizontal = 15.dp)
-                            .testTag("export_reports_pdf_button"),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.PictureAsPdf,
-                            contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Text(
-                            text = "PDF",
-                            color = Color.White,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold
                         )
                     }
                 }
@@ -532,6 +503,16 @@ fun ReportsScreen(
                 contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 112.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
+                item(key = "download_reports_card") {
+                    DownloadReportsCard(
+                        reports = reports,
+                        staffList = staffList,
+                        selectedTerm = selectedTerm,
+                        initialScope = selectedScope,
+                        onGenerateReport = onGenerateReport
+                    )
+                }
+
                 if (viewMode == 0) {
                     if (filteredReports.isEmpty()) {
                         item {

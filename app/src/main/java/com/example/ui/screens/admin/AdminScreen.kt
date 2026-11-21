@@ -66,7 +66,9 @@ fun AdminScreen(
     onForceResetUserPassword: (DirectorateUser) -> Unit,
     onProvisionUser: (String, String, String, String, UserRole, () -> Unit) -> Unit,
     onSaveSystemSettings: (SystemSettings) -> Unit,
-    onPurgeEvidenceBucket: () -> Unit
+    onPurgeEvidenceBucket: () -> Unit,
+    onResolveSignedUrl: (suspend (String) -> Result<String>)? = null,
+    onGetMediaHeaders: ((String) -> Map<String, String>)? = null
 ) {
     when (subScreen) {
         "officer_stats" -> OfficerAnalyticsScreen(
@@ -93,6 +95,8 @@ fun AdminScreen(
             onUpdateEmail = onUpdateUserEmail,
             onForceResetPassword = onForceResetUserPassword,
             onProvisionUser = onProvisionUser,
+            onResolveSignedUrl = onResolveSignedUrl,
+            onGetMediaHeaders = onGetMediaHeaders,
             onBack = { onNavigateSubScreen("hub") }
         )
 

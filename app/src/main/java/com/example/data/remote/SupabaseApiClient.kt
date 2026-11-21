@@ -118,6 +118,124 @@ class SupabaseApiClient {
         }
     }
 
+    suspend fun postRawBytesToUrl(
+        fullUrl: String,
+        bytes: ByteArray,
+        headers: Map<String, String>
+    ): ApiResult = withContext(Dispatchers.IO) {
+        val reqBody = bytes.toRequestBody("application/octet-stream".toMediaType())
+        val builder = Request.Builder()
+            .url(fullUrl)
+            .header("Content-Type", "application/octet-stream")
+            .header("Accept", "application/json")
+        headers.forEach { (k, v) -> builder.header(k, v) }
+        builder.post(reqBody)
+
+        try {
+            client.newCall(builder.build()).execute().use { resp ->
+                val respBody = resp.body?.string().orEmpty()
+                if (resp.isSuccessful) {
+                    ApiResult(true, resp.code, respBody, null)
+                } else {
+                    ApiResult(false, resp.code, respBody, extractError(respBody, resp.code))
+                }
+            }
+        } catch (e: Exception) {
+            ApiResult(false, 0, "", e.message ?: "B2 backend upload failed.")
+        }
+    }
+
+    suspend fun postJsonToUrl(
+        fullUrl: String,
+        bodyJson: String,
+        headers: Map<String, String>
+    ): ApiResult = withContext(Dispatchers.IO) {
+        val reqBody = bodyJson.toRequestBody(jsonMediaType)
+        val builder = Request.Builder()
+            .url(fullUrl)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+        headers.forEach { (k, v) -> builder.header(k, v) }
+        builder.post(reqBody)
+
+        try {
+            client.newCall(builder.build()).execute().use { resp ->
+                val respBody = resp.body?.string().orEmpty()
+                if (resp.isSuccessful) {
+                    ApiResult(true, resp.code, respBody, null)
+                } else {
+                    ApiResult(false, resp.code, respBody, extractError(respBody, resp.code))
+                }
+            }
+        } catch (e: Exception) {
+            ApiResult(false, 0, "", e.message ?: "B2 backend request failed.")
+        }
+    }
+
+    suspend fun downloadToFile(
+        fullUrl: String,
+        targetFile: java.io.File,
+        headers: Map<String, String> = emptyMap()
+    ): Result<java.io.File> = withContext(Dispatchers.IO) {
+        val builder = Request.Builder().url(fullUrl).get()
+        headers.forEach { (k, v) -> builder.header(k, v) }
+        try {
+            client.newCall(builder.build()).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    val err = resp.body?.string().orEmpty()
+                    return@withContext Result.failure(Exception(extractError(err, resp.code)))
+                }
+                val body = resp.body
+                    ?: return@withContext Result.failure(Exception("Empty download response."))
+                targetFile.parentFile?.mkdirs()
+                body.byteStream().use { input ->
+                    targetFile.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                Result.success(targetFile)
+            }
+        } catch (e: Exception) {
+            Result.failure(Exception(e.message ?: "Download failed."))
+        }
+    }
+
+    suspend fun postJsonDownloadToFile(
+        fullUrl: String,
+        bodyJson: String,
+        targetFile: java.io.File,
+        headers: Map<String, String> = emptyMap()
+    ): Result<java.io.File> = withContext(Dispatchers.IO) {
+        val reqBody = bodyJson.toRequestBody(jsonMediaType)
+        val builder = Request.Builder()
+            .url(fullUrl)
+            .header("Content-Type", "application/json")
+            .post(reqBody)
+        headers.forEach { (k, v) -> builder.header(k, v) }
+        try {
+            client.newCall(builder.build()).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    val err = resp.body?.string().orEmpty()
+                    return@withContext Result.failure(Exception(extractError(err, resp.code)))
+                }
+                val body = resp.body
+                    ?: return@withContext Result.failure(Exception("Generated file response was empty."))
+                targetFile.parentFile?.mkdirs()
+                body.byteStream().use { input ->
+                    targetFile.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                if (!targetFile.exists() || targetFile.length() == 0L) {
+                    return@withContext Result.failure(Exception("Generated PowerPoint file was empty."))
+                }
+                Result.success(targetFile)
+            }
+        } catch (e: Exception) {
+            Result.failure(Exception(e.message ?: "Presentation generation failed."))
+        }
+    }
+
     private fun extractError(rawBody: String, statusCode: Int): String {
         if (rawBody.isBlank()) return "Server error ($statusCode)"
         return try {
@@ -145,3 +263,4 @@ class SupabaseApiClient {
         JSONObject()
     }
 }
+

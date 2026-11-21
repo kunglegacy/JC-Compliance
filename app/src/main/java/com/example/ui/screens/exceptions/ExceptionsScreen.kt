@@ -44,6 +44,7 @@ import androidx.compose.material.icons.rounded.AttachFile
 import androidx.compose.material.icons.rounded.CameraAlt
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.CloudUpload
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.EditNote
@@ -53,6 +54,8 @@ import androidx.compose.material.icons.rounded.NotificationsActive
 import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Undo
 import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material3.AlertDialog
@@ -64,6 +67,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -91,6 +95,9 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import coil.compose.AsyncImage
 import com.example.data.model.ComplianceDivision
 import com.example.data.model.ComplianceReport
@@ -100,6 +107,7 @@ import com.example.data.model.OfflineDraft
 import com.example.data.model.ReportFormDraft
 import com.example.data.model.ReportResolutionStatus
 import com.example.domain.AnalysisEngine
+import com.example.domain.BackgroundExecutionHelper
 import com.example.ui.components.LivingAtmosphericBackground
 import com.example.ui.components.StatusGlassChip
 import com.example.ui.components.TangerineGlowButton
@@ -143,10 +151,26 @@ fun ExceptionsScreen(
     onClearFormDraft: () -> Unit = {},
     adminFeedbackByReportId: Map<String, AdminExceptionFeedback> = emptyMap(),
     onShowLimitWarning: (String) -> Unit = {},
-    onWillLaunchExternalPicker: () -> Unit = {}
+    onWillLaunchExternalPicker: () -> Unit = {},
+    isOnline: Boolean = true,
+    onAddOfflineFormDraft: () -> Unit = {},
+    onEditFormDraft: (OfflineDraft) -> Unit = {},
+    onCancelQueuedDraft: (OfflineDraft) -> Unit = {},
+    onRetryQueuedSubmissions: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val p = LocalCompliancePalette.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var bgRestrictionStatus by remember { mutableStateOf(BackgroundExecutionHelper.checkStatus(context)) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                bgRestrictionStatus = BackgroundExecutionHelper.checkStatus(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     // Reset transient UI state whenever logged-in user switches
     var selectedTab by remember(currentUserId) { mutableIntStateOf(0) } // 0 = Offline Drafts, 1 = Submitted
@@ -523,11 +547,137 @@ fun ExceptionsScreen(
 
             if (selectedTab == 0) {
                 // OFFLINE DRAFTS TAB (In-progress Composer Draft + Encrypted Offline Media Drafts, Max 4 Photos & 2 Videos)
+                val hasQueuedDrafts = drafts.any { it.isQueuedForSubmit }
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 112.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
+                    if (hasQueuedDrafts && bgRestrictionStatus.hasAnyRestriction) {
+                        item(key = "queued_bg_restriction_warning") {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(20.dp))
+                                    .background(p.rose.copy(alpha = 0.14f))
+                                    .border(1.dp, p.rose.copy(alpha = 0.48f), RoundedCornerShape(20.dp))
+                                    .clickable {
+                                        onWillLaunchExternalPicker()
+                                        BackgroundExecutionHelper.openRelevantSettings(context, bgRestrictionStatus)
+                                    }
+                                    .padding(horizontal = 14.dp, vertical = 12.dp)
+                                    .testTag("queue_background_restricted_banner"),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.WarningAmber,
+                                    contentDescription = null,
+                                    tint = p.rose,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Text(
+                                        text = BackgroundExecutionHelper.getPrimaryTitle(bgRestrictionStatus),
+                                        color = p.rose,
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.ExtraBold
+                                    )
+                                    Text(
+                                        text = "Queued reports will wait until you reopen the app. Tap to allow background activity.",
+                                        color = p.textPrimary,
+                                        fontSize = 11.sp
+                                    )
+                                }
+                                Row(
+                                    modifier = Modifier
+                                        .clip(CircleShape)
+                                        .background(p.rose)
+                                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Settings,
+                                        contentDescription = null,
+                                        tint = Color.White,
+                                        modifier = Modifier.size(13.dp)
+                                    )
+                                    Text(
+                                        text = "Enable",
+                                        color = Color.White,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    item(key = "add_to_draft_cta") {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .complianceGlassCard(22.dp)
+                                .border(
+                                    1.2.dp,
+                                    Brush.horizontalGradient(
+                                        listOf(
+                                            p.tangerine.copy(alpha = 0.65f),
+                                            p.tangerineEnd.copy(alpha = 0.35f)
+                                        )
+                                    ),
+                                    RoundedCornerShape(22.dp)
+                                )
+                                .clickable(onClick = onAddOfflineFormDraft)
+                                .padding(horizontal = 16.dp, vertical = 14.dp)
+                                .testTag("add_to_draft_button"),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(14.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(44.dp)
+                                    .shadow(10.dp, CircleShape, spotColor = p.tangerine.copy(alpha = 0.4f))
+                                    .clip(CircleShape)
+                                    .background(Brush.horizontalGradient(listOf(p.tangerine, p.tangerineEnd)))
+                                    .border(1.dp, Color.White.copy(alpha = 0.35f), CircleShape),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Add,
+                                    contentDescription = "Add to Draft",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                            }
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                Text(
+                                    text = "+ Add to Draft",
+                                    color = p.textPrimary,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = "Write a full offline exception draft • Evidence optional",
+                                    color = p.textSecondary,
+                                    fontSize = 12.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Icon(
+                                imageVector = Icons.Rounded.EditNote,
+                                contentDescription = null,
+                                tint = p.tangerine,
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
+                    }
+
                     if (savedFormDraft != null && savedFormDraft.hasContent) {
                         item(key = "in_progress_composer_draft") {
                             val divLabel = ComplianceDivision.fromAny(savedFormDraft.divisionKey)?.label ?: "Academic"
@@ -602,9 +752,9 @@ fun ExceptionsScreen(
                     if (drafts.isEmpty() && savedFormDraft?.hasContent != true) {
                         item {
                             GlassEmptyStateCard(
-                                icon = Icons.Rounded.CameraAlt,
-                                title = "No Offline Drafts",
-                                subtitle = "Capture photos or videos above—even offline. Each report supports up to 4 photos and 2 videos."
+                                icon = Icons.Rounded.EditNote,
+                                title = "No Offline Drafts Yet",
+                                subtitle = "Tap \"+ Add to Draft\" above to draft a full report offline, or capture photos/videos—even without internet."
                             )
                         }
                     } else if (drafts.isNotEmpty()) {
@@ -617,14 +767,27 @@ fun ExceptionsScreen(
                             val primaryTime = mediaList.firstOrNull()?.capturedAtLabel
                                 ?: formatDraftTimestamp(draft.incidentDate, draft.mediaPath)
 
+                            val cardAccentBorder = when {
+                                draft.isQueuedForSubmit -> p.tangerine.copy(alpha = 0.55f)
+                                draft.isFormDraft && !draft.hasEvidence -> p.rose.copy(alpha = 0.35f)
+                                draft.isFormDraft -> p.emerald.copy(alpha = 0.35f)
+                                else -> Color.Transparent
+                            }
+
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .complianceGlassCard(24.dp)
-                                    .padding(16.dp),
+                                    .then(
+                                        if (cardAccentBorder != Color.Transparent) {
+                                            Modifier.border(1.dp, cardAccentBorder, RoundedCornerShape(24.dp))
+                                        } else Modifier
+                                    )
+                                    .padding(16.dp)
+                                    .testTag("offline_draft_card_${draft.id}"),
                                 verticalArrangement = Arrangement.spacedBy(12.dp)
                             ) {
-                                // Header: Photo/Video Quota Chips + Date+Time + Delete Draft
+                                // Header: Status / Quota Chips + Date+Time + Delete Draft
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -635,10 +798,32 @@ fun ExceptionsScreen(
                                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                                         modifier = Modifier.weight(1f)
                                     ) {
-                                        StatusGlassChip(
-                                            dotColor = if (exceedsLimit) p.rose else p.emerald,
-                                            text = "${imgCount}/4 Img • ${vidCount}/2 Vid"
-                                        )
+                                        when {
+                                            draft.isQueuedForSubmit -> {
+                                                StatusGlassChip(
+                                                    dotColor = p.tangerine,
+                                                    text = "QUEUED • AUTO-SUBMIT"
+                                                )
+                                            }
+                                            draft.isFormDraft && !draft.hasEvidence -> {
+                                                StatusGlassChip(
+                                                    dotColor = p.rose,
+                                                    text = "DRAFT • NO EVIDENCE"
+                                                )
+                                            }
+                                            draft.isFormDraft -> {
+                                                StatusGlassChip(
+                                                    dotColor = p.emerald,
+                                                    text = "FORM • ${imgCount}/4 Img • ${vidCount}/2 Vid"
+                                                )
+                                            }
+                                            else -> {
+                                                StatusGlassChip(
+                                                    dotColor = if (exceedsLimit) p.rose else p.emerald,
+                                                    text = "${imgCount}/4 Img • ${vidCount}/2 Vid"
+                                                )
+                                            }
+                                        }
                                         Row(
                                             verticalAlignment = Alignment.CenterVertically,
                                             horizontalArrangement = Arrangement.spacedBy(4.dp)
@@ -676,6 +861,40 @@ fun ExceptionsScreen(
                                     }
                                 }
 
+                                // Form Draft Metadata Pills
+                                draft.formDraft?.let { fd ->
+                                    val divLabel = ComplianceDivision.fromAny(fd.divisionKey)?.label ?: "Academic"
+                                    val metaParts = listOfNotNull(
+                                        divLabel,
+                                        fd.staffName?.takeIf { it.isNotBlank() }
+                                            ?: fd.opPersonOrLocation.takeIf { it.isNotBlank() }
+                                            ?: fd.studentNamesArm.takeIf { it.isNotBlank() },
+                                        fd.className?.takeIf { it.isNotBlank() }
+                                    )
+                                    if (metaParts.isNotEmpty()) {
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .horizontalScroll(rememberScrollState()),
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            metaParts.forEach { chipText ->
+                                                Text(
+                                                    text = chipText,
+                                                    color = p.textPrimary,
+                                                    fontSize = 10.sp,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    modifier = Modifier
+                                                        .clip(CircleShape)
+                                                        .background(p.trackFill)
+                                                        .border(1.dp, p.borderBottom, CircleShape)
+                                                        .padding(horizontal = 9.dp, vertical = 4.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+
                                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                     Text(
                                         text = draft.title.ifBlank { "Offline Field Draft" },
@@ -694,9 +913,21 @@ fun ExceptionsScreen(
                                             overflow = TextOverflow.Ellipsis
                                         )
                                     }
+                                    if (draft.isQueuedForSubmit) {
+                                        Text(
+                                            text = if (isOnline) {
+                                                "Connection detected — ready to transmit automatically."
+                                            } else {
+                                                "Waiting for internet. Will submit automatically in background once online."
+                                            },
+                                            color = p.tangerine,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    }
                                 }
 
-                                // Multi-Evidence Thumbnail Strip (Tap to Preview, X triggers Delete Confirmation Card)
+                                // Multi-Evidence Thumbnail Strip
                                 if (mediaList.isNotEmpty()) {
                                     LazyRow(
                                         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -706,67 +937,221 @@ fun ExceptionsScreen(
                                             DraftMediaThumbTile(
                                                 item = item,
                                                 onPreview = { previewModalState = draft to idx },
-                                                onDelete = { pendingDeleteDraftMedia = draft to item }
+                                                onDelete = {
+                                                    if (!draft.isQueuedForSubmit) {
+                                                        pendingDeleteDraftMedia = draft to item
+                                                    }
+                                                }
                                             )
                                         }
                                     }
                                 }
 
-                                // Add More Media Bar (Enforcing max 4 photos & 2 videos)
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    SmallGlassActionChip(
-                                        icon = Icons.Rounded.CameraAlt,
-                                        label = "+ Photo ($imgCount/4)",
-                                        onClick = { requestCameraAndRun("photo", appendTo = draft) },
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    SmallGlassActionChip(
-                                        icon = Icons.Rounded.Videocam,
-                                        label = "+ Video ($vidCount/2)",
-                                        onClick = { requestCameraAndRun("video", appendTo = draft) },
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    SmallGlassActionChip(
-                                        icon = Icons.Rounded.PhotoLibrary,
-                                        label = "+ Gallery",
-                                        onClick = {
-                                            if (imgCount >= MediaUploadLimits.MAX_IMAGES_PER_REPORT && vidCount >= MediaUploadLimits.MAX_VIDEOS_PER_REPORT) {
-                                                onShowLimitWarning("Draft already reached the max 4 photos and 2 videos limit.")
-                                            } else {
-                                                targetDraftForAppend = draft
-                                                onWillLaunchExternalPicker()
-                                                photoPickerLauncher.launch(
-                                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
+                                if (!draft.isQueuedForSubmit) {
+                                    // Add More Media Bar (Enforcing max 4 photos & 2 videos)
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        SmallGlassActionChip(
+                                            icon = Icons.Rounded.CameraAlt,
+                                            label = "+ Photo ($imgCount/4)",
+                                            onClick = { requestCameraAndRun("photo", appendTo = draft) },
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        SmallGlassActionChip(
+                                            icon = Icons.Rounded.Videocam,
+                                            label = "+ Video ($vidCount/2)",
+                                            onClick = { requestCameraAndRun("video", appendTo = draft) },
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        SmallGlassActionChip(
+                                            icon = Icons.Rounded.PhotoLibrary,
+                                            label = "+ Gallery",
+                                            onClick = {
+                                                if (imgCount >= MediaUploadLimits.MAX_IMAGES_PER_REPORT && vidCount >= MediaUploadLimits.MAX_VIDEOS_PER_REPORT) {
+                                                    onShowLimitWarning("Draft already reached the max 4 photos and 2 videos limit.")
+                                                } else {
+                                                    targetDraftForAppend = draft
+                                                    onWillLaunchExternalPicker()
+                                                    photoPickerLauncher.launch(
+                                                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
+                                                    )
+                                                }
+                                            },
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                    }
+
+                                    if (exceedsLimit) {
+                                        Text(
+                                            text = "Exceeds limit (max 4 photos & 2 videos). Trim extra attachments before submitting.",
+                                            color = p.rose,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    }
+                                }
+
+                                // Primary Actions per Draft Type
+                                when {
+                                    draft.isQueuedForSubmit -> {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Row(
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .height(48.dp)
+                                                    .clip(CircleShape)
+                                                    .background(p.trackFill)
+                                                    .border(1.dp, p.borderBottom, CircleShape)
+                                                    .clickable { onCancelQueuedDraft(draft) }
+                                                    .padding(horizontal = 12.dp)
+                                                    .testTag("cancel_queue_draft_${draft.id}"),
+                                                horizontalArrangement = Arrangement.Center,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Rounded.Undo,
+                                                    contentDescription = null,
+                                                    tint = p.textPrimary,
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                                Spacer(Modifier.width(6.dp))
+                                                Text(
+                                                    text = "Move to Draft",
+                                                    color = p.textPrimary,
+                                                    fontSize = 13.sp,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    maxLines = 1
                                                 )
                                             }
-                                        },
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                }
 
-                                if (exceedsLimit) {
-                                    Text(
-                                        text = "Exceeds limit (max 4 photos & 2 videos). Trim extra attachments before submitting.",
-                                        color = p.rose,
-                                        fontSize = 11.sp,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-                                }
-
-                                TangerineGlowButton(
-                                    text = if (exceedsLimit) "Trim & Convert (${mediaList.size} items)" else "Convert to Exception Report",
-                                    onClick = {
-                                        when {
-                                            exceedsLimit -> reviewTrimDraft = draft
-                                            mediaList.isEmpty() -> onConvertDraft(draft)
-                                            else -> onConvertDraftWithMedia(draft, mediaList)
+                                            if (isOnline) {
+                                                Row(
+                                                    modifier = Modifier
+                                                        .weight(1f)
+                                                        .height(48.dp)
+                                                        .shadow(12.dp, CircleShape, spotColor = p.tangerine.copy(alpha = 0.45f))
+                                                        .clip(CircleShape)
+                                                        .background(Brush.horizontalGradient(listOf(p.tangerine, p.tangerineEnd)))
+                                                        .border(1.dp, Color.White.copy(alpha = 0.3f), CircleShape)
+                                                        .clickable(onClick = onRetryQueuedSubmissions)
+                                                        .padding(horizontal = 12.dp)
+                                                        .testTag("retry_queue_draft_${draft.id}"),
+                                                    horizontalArrangement = Arrangement.Center,
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
+                                                    Icon(
+                                                        imageVector = Icons.Rounded.CloudUpload,
+                                                        contentDescription = null,
+                                                        tint = Color.White,
+                                                        modifier = Modifier.size(16.dp)
+                                                    )
+                                                    Spacer(Modifier.width(6.dp))
+                                                    Text(
+                                                        text = "Submit Now",
+                                                        color = Color.White,
+                                                        fontSize = 13.sp,
+                                                        fontWeight = FontWeight.Bold,
+                                                        maxLines = 1
+                                                    )
+                                                }
+                                            }
                                         }
-                                    },
-                                    modifier = Modifier.testTag("convert_draft_${draft.id}")
-                                )
+                                    }
+
+                                    draft.isFormDraft -> {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Row(
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .height(48.dp)
+                                                    .clip(CircleShape)
+                                                    .background(p.trackFill)
+                                                    .border(1.dp, p.borderBottom, CircleShape)
+                                                    .clickable { onEditFormDraft(draft) }
+                                                    .padding(horizontal = 12.dp)
+                                                    .testTag("edit_form_draft_${draft.id}"),
+                                                horizontalArrangement = Arrangement.Center,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Rounded.Edit,
+                                                    contentDescription = null,
+                                                    tint = p.textPrimary,
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                                Spacer(Modifier.width(6.dp))
+                                                Text(
+                                                    text = "Edit Draft",
+                                                    color = p.textPrimary,
+                                                    fontSize = 13.sp,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    maxLines = 1
+                                                )
+                                            }
+
+                                            Row(
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .height(48.dp)
+                                                    .shadow(12.dp, CircleShape, spotColor = p.tangerine.copy(alpha = 0.45f))
+                                                    .clip(CircleShape)
+                                                    .background(Brush.horizontalGradient(listOf(p.tangerine, p.tangerineEnd)))
+                                                    .border(1.dp, Color.White.copy(alpha = 0.3f), CircleShape)
+                                                    .clickable {
+                                                        when {
+                                                            exceedsLimit -> reviewTrimDraft = draft
+                                                            mediaList.isEmpty() -> onConvertDraft(draft)
+                                                            else -> onConvertDraftWithMedia(draft, mediaList)
+                                                        }
+                                                    }
+                                                    .padding(horizontal = 12.dp)
+                                                    .testTag("convert_draft_${draft.id}"),
+                                                horizontalArrangement = Arrangement.Center,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.AutoMirrored.Rounded.Send,
+                                                    contentDescription = null,
+                                                    tint = Color.White,
+                                                    modifier = Modifier.size(15.dp)
+                                                )
+                                                Spacer(Modifier.width(6.dp))
+                                                Text(
+                                                    text = if (exceedsLimit) "Trim (${mediaList.size})" else "Complete & Submit",
+                                                    color = Color.White,
+                                                    fontSize = 13.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                            }
+                                        }
+                                    }
+
+                                    else -> {
+                                        TangerineGlowButton(
+                                            text = if (exceedsLimit) "Trim & Convert (${mediaList.size} items)" else "Convert to Exception Report",
+                                            onClick = {
+                                                when {
+                                                    exceedsLimit -> reviewTrimDraft = draft
+                                                    mediaList.isEmpty() -> onConvertDraft(draft)
+                                                    else -> onConvertDraftWithMedia(draft, mediaList)
+                                                }
+                                            },
+                                            modifier = Modifier.testTag("convert_draft_${draft.id}")
+                                        )
+                                    }
+                                }
                             }
                         }
                     }

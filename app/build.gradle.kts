@@ -43,6 +43,8 @@ android {
         if (v.isNotEmpty() &&
           !v.contains("your-project-id", ignoreCase = true) &&
           !v.contains("your_key_here", ignoreCase = true) &&
+          !v.contains("your-web-backend", ignoreCase = true) &&
+          !v.contains("example.com", ignoreCase = true) &&
           !v.contains("placeholder", ignoreCase = true)
         ) {
           return v.replace("\\", "\\\\").replace("\"", "\\\"")
@@ -59,6 +61,11 @@ android {
       "String",
       "CI_SUPABASE_KEY",
       "\"${resolveCiEnv("VITE_SUPABASE_PUBLISHABLE_KEY", "SUPABASE_PUBLISHABLE_KEY", "VITE_SUPABASE_ANON_KEY", "SUPABASE_ANON_KEY", "SUPABASE_KEY", "ANON_KEY")}\""
+    )
+    buildConfigField(
+      "String",
+      "CI_API_BASE_URL",
+      "\"${resolveCiEnv("API_BASE_URL", "EXPO_PUBLIC_API_BASE_URL", "VITE_API_BASE_URL", "NEXT_PUBLIC_API_BASE_URL", "WEB_APP_URL")}\""
     )
   }
 

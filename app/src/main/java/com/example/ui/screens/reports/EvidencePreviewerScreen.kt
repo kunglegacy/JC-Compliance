@@ -31,6 +31,7 @@ import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.BrokenImage
 import androidx.compose.material.icons.rounded.CenterFocusStrong
 import androidx.compose.material.icons.rounded.Description
+import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.EditNote
 import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.Mic
@@ -120,6 +121,8 @@ fun EvidencePreviewerScreen(
     initialIndex: Int = 0,
     showModerationControls: Boolean = true,
     onResolveSignedUrl: suspend (String) -> Result<String>,
+    onResolveHeaders: (String) -> Map<String, String> = { emptyMap() },
+    onDownloadEvidence: ((EvidencePreviewItem) -> Unit)? = null,
     onVerdict: ((EvidencePreviewItem, EvidenceVerdict, String?) -> Unit)? = null,
     onBack: () -> Unit
 ) {
@@ -187,12 +190,17 @@ fun EvidencePreviewerScreen(
     }
 
     val activeUrl = activeItem?.storedPath?.trim()?.let { resolvedUrls[it] }
+    val activeHeaders = remember(activeUrl, onResolveHeaders) {
+        if (activeUrl.isNullOrBlank()) emptyMap() else onResolveHeaders(activeUrl)
+    }
 
     EvidencePreviewerScaffold(
         items = items,
         activeIndex = activeIndex,
         activeUrl = activeUrl,
+        activeHeaders = activeHeaders,
         resolvedUrls = resolvedUrls,
+        onResolveHeaders = onResolveHeaders,
         isLoading = isLoading,
         errorMessage = errorMessage,
         showModerationControls = showModerationControls,
@@ -204,7 +212,9 @@ fun EvidencePreviewerScreen(
             retryNonce++
         },
         onOpenExternal = {
-            if (!activeUrl.isNullOrBlank()) {
+            if (onDownloadEvidence != null && activeItem != null && activeHeaders.isNotEmpty()) {
+                onDownloadEvidence(activeItem)
+            } else if (!activeUrl.isNullOrBlank()) {
                 runCatching {
                     val uri = toPlayableUri(activeUrl)
                     context.startActivity(
@@ -215,6 +225,9 @@ fun EvidencePreviewerScreen(
                 }
             }
         },
+        onDownload = if (onDownloadEvidence != null && activeItem != null) {
+            { onDownloadEvidence(activeItem) }
+        } else null,
         onVerdict = { verdict, note ->
             if (activeItem != null) {
                 onVerdict?.invoke(activeItem, verdict, note)
@@ -229,13 +242,16 @@ fun EvidencePreviewerScaffold(
     items: List<EvidencePreviewItem>,
     activeIndex: Int,
     activeUrl: String?,
+    activeHeaders: Map<String, String> = emptyMap(),
     resolvedUrls: Map<String, String> = emptyMap(),
+    onResolveHeaders: (String) -> Map<String, String> = { emptyMap() },
     isLoading: Boolean,
     errorMessage: String?,
     showModerationControls: Boolean = true,
     onSelectIndex: (Int) -> Unit,
     onRetry: () -> Unit = {},
     onOpenExternal: () -> Unit,
+    onDownload: (() -> Unit)? = null,
     onVerdict: (EvidenceVerdict, String?) -> Unit,
     onBack: () -> Unit
 ) {
@@ -307,7 +323,11 @@ fun EvidencePreviewerScaffold(
         if (mediaType == "audio" && !activeUrl.isNullOrBlank()) {
             runCatching {
                 val uri = toPlayableUri(activeUrl)
-                audioPlayer.setDataSource(context, uri)
+                if (activeHeaders.isNotEmpty()) {
+                    audioPlayer.setDataSource(context, uri, activeHeaders)
+                } else {
+                    audioPlayer.setDataSource(context, uri)
+                }
                 audioPlayer.setOnPreparedListener { mp ->
                     audioPrepared = true
                     audioDurationMs = mp.duration.coerceAtLeast(1)
@@ -447,7 +467,11 @@ fun EvidencePreviewerScaffold(
                                                         videoError = "Playback failed (code $what/$extra). Try opening externally."
                                                         true
                                                     }
-                                                    setVideoURI(playableUri)
+                                                    if (activeHeaders.isNotEmpty()) {
+                                                        setVideoURI(playableUri, activeHeaders)
+                                                    } else {
+                                                        setVideoURI(playableUri)
+                                                    }
                                                     videoViewRef = this
                                                 }
                                             },
@@ -479,9 +503,12 @@ fun EvidencePreviewerScaffold(
                                 val imageModel = remember(activeUrl) {
                                     toCoilModel(activeUrl)
                                 }
-                                val imageRequest = remember(imageModel, context) {
+                                val imageRequest = remember(imageModel, activeHeaders, context) {
                                     ImageRequest.Builder(context)
                                         .data(imageModel)
+                                        .apply {
+                                            activeHeaders.forEach { (k, v) -> addHeader(k, v) }
+                                        }
                                         .crossfade(true)
                                         .build()
                                 }
@@ -778,6 +805,16 @@ fun EvidencePreviewerScaffold(
                                     onRetry()
                                 }
                             )
+                            if (onDownload != null) {
+                                DropdownMenuItem(
+                                    text = { Text("Download File") },
+                                    leadingIcon = { Icon(Icons.Rounded.Download, contentDescription = null) },
+                                    onClick = {
+                                        showMenu = false
+                                        onDownload()
+                                    }
+                                )
+                            }
                             DropdownMenuItem(
                                 text = { Text("Open Externally") },
                                 leadingIcon = { Icon(Icons.Rounded.OpenInNew, contentDescription = null) },
@@ -853,8 +890,15 @@ fun EvidencePreviewerScaffold(
                                 contentAlignment = Alignment.Center
                             ) {
                                 if (itemType == "image" && !thumbSource.isNullOrBlank()) {
+                                    val thumbHeaders = onResolveHeaders(thumbSource)
+                                    val thumbReq = remember(thumbSource, thumbHeaders, context) {
+                                        ImageRequest.Builder(context)
+                                            .data(toCoilModel(thumbSource))
+                                            .apply { thumbHeaders.forEach { (k, v) -> addHeader(k, v) } }
+                                            .build()
+                                    }
                                     AsyncImage(
-                                        model = toCoilModel(thumbSource),
+                                        model = thumbReq,
                                         contentDescription = item.title,
                                         contentScale = ContentScale.Crop,
                                         modifier = Modifier.fillMaxSize()

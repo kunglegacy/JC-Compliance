@@ -43,7 +43,8 @@ object MediaCompressor {
 
     private const val MAX_IMAGE_DIMENSION = 1200
     private const val TARGET_IMAGE_MAX_BYTES = 180 * 1024 // Compact crisp Web/Audit target (~180 KB)
-    private const val MAX_AVATAR_DIMENSION = 512
+    private const val MAX_AVATAR_DIMENSION = 300
+    private const val TARGET_AVATAR_MAX_BYTES = 98 * 1024 // Strictly under 100 KB square JPEG
     private const val MAX_VIDEO_DIMENSION = 854 // 480p-level 16:9 long edge for fast uploads
     private const val TARGET_VIDEO_BITRATE = 520_000 // ~520 kbps crisp H.264 video
     private const val LONG_VIDEO_BITRATE = 420_000 // ~420 kbps for videos > 30s
@@ -150,17 +151,116 @@ object MediaCompressor {
         res
     }
 
+    /**
+     * Compresses an avatar image to a square JPEG (max 300x300 px, ~75% quality, under 100 KB).
+     */
     suspend fun compressAvatarUri(
         context: Context,
         uri: Uri,
         onProgress: (Float) -> Unit = {}
-    ): Result<CompressedMediaResult> = compressImageUri(
-        context = context,
-        uri = uri,
-        maxDimension = MAX_AVATAR_DIMENSION,
-        targetMaxBytes = 140 * 1024,
-        onProgress = onProgress
-    )
+    ): Result<CompressedMediaResult> = withContext(Dispatchers.IO) {
+        val tempDir = File(context.cacheDir, "compressed_src").apply { if (!exists()) mkdirs() }
+        val tempFile = File(tempDir, "avatar_src_${System.currentTimeMillis()}.jpg")
+        val copied = runCatching {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                FileOutputStream(tempFile).use { output -> input.copyTo(output) }
+            }
+            tempFile.exists() && tempFile.length() > 0L
+        }.getOrDefault(false)
+
+        if (!copied) {
+            return@withContext Result.failure(IllegalStateException("Unable to read selected photo."))
+        }
+        try {
+            compressAvatarFile(context, tempFile, onProgress)
+        } finally {
+            runCatching { tempFile.delete() }
+        }
+    }
+
+    suspend fun compressAvatarFile(
+        context: Context,
+        sourceFile: File,
+        onProgress: (Float) -> Unit = {}
+    ): Result<CompressedMediaResult> = withContext(Dispatchers.IO) {
+        runCatching {
+            onProgress(0.15f)
+            val origSize = sourceFile.length().coerceAtLeast(1L)
+            val orientation = readExifOrientation(sourceFile)
+
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(sourceFile.absolutePath, bounds)
+            val rawW = bounds.outWidth
+            val rawH = bounds.outHeight
+            if (rawW <= 0 || rawH <= 0) {
+                throw IllegalArgumentException("Unable to decode avatar image dimensions.")
+            }
+
+            val sampleSize = calculateInSampleSize(rawW, rawH, MAX_AVATAR_DIMENSION)
+            onProgress(0.35f)
+            val decodeOpts = BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            var bitmap = BitmapFactory.decodeFile(sourceFile.absolutePath, decodeOpts)
+                ?: throw IllegalStateException("Failed to decode avatar image.")
+
+            bitmap = applyExifOrientation(bitmap, orientation)
+
+            // Center-crop to 1:1 square
+            val squareSize = minOf(bitmap.width, bitmap.height)
+            if (bitmap.width != bitmap.height && squareSize > 0) {
+                val x = (bitmap.width - squareSize) / 2
+                val y = (bitmap.height - squareSize) / 2
+                val cropped = Bitmap.createBitmap(bitmap, x, y, squareSize, squareSize)
+                if (cropped != bitmap) bitmap.recycle()
+                bitmap = cropped
+            }
+
+            // Resize to max 300x300 px
+            val targetDim = minOf(bitmap.width, MAX_AVATAR_DIMENSION).coerceAtLeast(1)
+            if (bitmap.width != targetDim || bitmap.height != targetDim) {
+                val scaled = Bitmap.createScaledBitmap(bitmap, targetDim, targetDim, true)
+                if (scaled != bitmap) bitmap.recycle()
+                bitmap = scaled
+            }
+            onProgress(0.65f)
+
+            var quality = 75
+            var bestBytes: ByteArray
+            while (true) {
+                val baos = ByteArrayOutputStream()
+                bitmap.compress(Bitmap.CompressFormat.JPEG, quality, baos)
+                bestBytes = baos.toByteArray()
+                if (bestBytes.size <= TARGET_AVATAR_MAX_BYTES || quality <= 38) break
+                quality -= 7
+            }
+
+            if (bestBytes.size > TARGET_AVATAR_MAX_BYTES && bitmap.width > 220) {
+                val smaller = Bitmap.createScaledBitmap(bitmap, 220, 220, true)
+                val baos2 = ByteArrayOutputStream()
+                smaller.compress(Bitmap.CompressFormat.JPEG, 60, baos2)
+                val candidate = baos2.toByteArray()
+                if (candidate.size < bestBytes.size) {
+                    bestBytes = candidate
+                }
+                if (smaller != bitmap) smaller.recycle()
+            }
+            bitmap.recycle()
+
+            val outDir = File(context.cacheDir, "compressed_media").apply { if (!exists()) mkdirs() }
+            val outFile = File(outDir, "avatar_${System.currentTimeMillis()}.jpg")
+            FileOutputStream(outFile).use { it.write(bestBytes) }
+            onProgress(1f)
+
+            CompressedMediaResult(
+                file = outFile,
+                mimeType = "image/jpeg",
+                originalBytes = origSize,
+                compressedBytes = outFile.length()
+            )
+        }
+    }
 
     suspend fun compressVideoFile(
         context: Context,

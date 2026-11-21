@@ -63,20 +63,20 @@ import com.example.data.model.ThemePreference
 import com.example.data.model.UserRole
 import com.example.domain.AnalysisEngine
 import com.example.ui.components.AuditScoreHeroCard
+import com.example.ui.components.AvatarFallbackMode
 import com.example.ui.components.CircularRingMetricTile
 import com.example.ui.components.EditedBadgePill
 import com.example.ui.components.GlassCircleButton
 import com.example.ui.components.LivingAtmosphericBackground
 import com.example.ui.components.MicroLabel
+import com.example.ui.components.ProfileAvatar
 import com.example.ui.components.ResolutionBadge
-import com.example.ui.components.SchoolCrestBadge
 import com.example.ui.components.SeenBadge
 import com.example.ui.components.StatusGlassChip
 import com.example.ui.components.complianceGlassCard
 import com.example.ui.theme.ComplianceTheme
 import com.example.ui.theme.JCBestTheme
 import com.example.ui.theme.LocalCompliancePalette
-import java.io.File
 
 @Composable
 fun OverviewScreen(
@@ -94,14 +94,14 @@ fun OverviewScreen(
     userRole: UserRole = UserRole.ADMIN,
     currentUserId: String = "",
     avatarUri: String = "",
-    onResolveSignedUrl: (suspend (String) -> Result<String>)? = null
+    onResolveSignedUrl: (suspend (String) -> Result<String>)? = null,
+    onGetMediaHeaders: ((String) -> Map<String, String>)? = null,
+    onOpenProfileSettings: (() -> Unit)? = null
 ) {
     val p = LocalCompliancePalette.current
     val ext = ComplianceTheme.extended
-    val isAdmin = userRole.isAdminOrAbove
-    val scopedReports = remember(reports, isAdmin, currentUserId) {
-        if (isAdmin) reports
-        else if (currentUserId.isNotBlank()) reports.filter { it.reportedBy.equals(currentUserId, ignoreCase = true) }
+    val scopedReports = remember(reports, currentUserId) {
+        if (currentUserId.isNotBlank()) reports.filter { it.reportedBy.equals(currentUserId, ignoreCase = true) }
         else reports
     }
     val staffMap = remember(staffList) { AnalysisEngine.buildStaffLookup(staffList) }
@@ -114,10 +114,6 @@ fun OverviewScreen(
     val summary = remember(scopedReports, staffList, selectedTerm) {
         AnalysisEngine.calculateAnalysisSummary(scopedReports, staffList, selectedTerm, "", "")
     }
-    val staffAffectedCount = remember(termReports, staffList) {
-        AnalysisEngine.calculateStaffAggregates(termReports, staffList).size
-    }
-
     val actualTotal = termReports.size
     val actualSeen = remember(termReports) { termReports.count { it.isSeen } }
     val actualUnseen = remember(termReports) { termReports.count { !it.isSeen } }
@@ -131,9 +127,6 @@ fun OverviewScreen(
     }
     val activeRatio = remember(actualTotal, summary.activeCases) {
         if (actualTotal > 0) summary.activeCases.toFloat() / actualTotal.toFloat() else 0f
-    }
-    val staffRatio = remember(staffList.size, staffAffectedCount) {
-        if (staffList.isNotEmpty()) (staffAffectedCount.toFloat() / staffList.size.toFloat()).coerceIn(0f, 1f) else 0.25f
     }
 
     LivingAtmosphericBackground {
@@ -150,20 +143,18 @@ fun OverviewScreen(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    if (avatarUri.isNotBlank()) {
-                        AsyncImage(
-                            model = if (avatarUri.startsWith("/")) File(avatarUri) else Uri.parse(avatarUri),
-                            contentDescription = "Profile Avatar",
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier
-                                .size(46.dp)
-                                .clip(CircleShape)
-                                .border(1.5.dp, p.tangerine.copy(alpha = 0.7f), CircleShape)
-                                .testTag("overview_header_avatar")
-                        )
-                    } else {
-                        SchoolCrestBadge(size = 46.dp)
-                    }
+                    ProfileAvatar(
+                        avatarUrl = avatarUri,
+                        displayName = displayName,
+                        size = 46.dp,
+                        borderColor = p.tangerine.copy(alpha = 0.7f),
+                        accentColor = p.tangerine,
+                        fallbackMode = AvatarFallbackMode.SCHOOL_CREST,
+                        onResolveSignedUrl = onResolveSignedUrl,
+                        getAuthHeaders = onGetMediaHeaders,
+                        onClick = onOpenProfileSettings,
+                        testTag = "overview_header_avatar"
+                    )
                     Spacer(Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
@@ -210,7 +201,7 @@ fun OverviewScreen(
                     scorePercent = reviewPct,
                     passed = actualSeen,
                     flagged = actualUnseen,
-                    eyebrow = if (isAdmin) "AUDIT COMPLIANCE SCORE" else "MY ACCOUNT EXCEPTION SCORE"
+                    eyebrow = "MY ACCOUNT EXCEPTION SCORE"
                 )
             }
 
@@ -252,7 +243,7 @@ fun OverviewScreen(
             // Circular Glass Division Icon Pills Row
             item {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    MicroLabel(if (isAdmin) "Divisional Quick Filter" else "My Exceptions by Division")
+                    MicroLabel("My Exceptions by Division")
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -274,7 +265,7 @@ fun OverviewScreen(
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
                         CircularRingMetricTile(
-                            title = if (isAdmin) "Exceptions" else "My Exceptions",
+                            title = "My Exceptions",
                             value = "${summary.totalExceptions}",
                             subtitle = if (selectedTerm == "ALL") "All sessions" else selectedTerm,
                             progress = if (summary.totalExceptions > 0) 0.85f else 0.12f,
@@ -282,27 +273,15 @@ fun OverviewScreen(
                             ringColor = p.tangerine,
                             modifier = Modifier.weight(1f)
                         )
-                        if (isAdmin) {
-                            CircularRingMetricTile(
-                                title = "Staff Cited",
-                                value = "$staffAffectedCount",
-                                subtitle = "Active roster scope",
-                                progress = staffRatio,
-                                icon = Icons.Default.Groups,
-                                ringColor = ext.indigo,
-                                modifier = Modifier.weight(1f)
-                            )
-                        } else {
-                            CircularRingMetricTile(
-                                title = "Open Cases",
-                                value = "${summary.activeCases}",
-                                subtitle = "Awaiting acceptance",
-                                progress = activeRatio,
-                                icon = Icons.Default.Groups,
-                                ringColor = ext.indigo,
-                                modifier = Modifier.weight(1f)
-                            )
-                        }
+                        CircularRingMetricTile(
+                            title = "Open Cases",
+                            value = "${summary.activeCases}",
+                            subtitle = "Awaiting acceptance",
+                            progress = activeRatio,
+                            icon = Icons.Default.Groups,
+                            ringColor = ext.indigo,
+                            modifier = Modifier.weight(1f)
+                        )
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
                         CircularRingMetricTile(

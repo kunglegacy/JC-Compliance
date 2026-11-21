@@ -2,18 +2,22 @@ package com.example.domain
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.pdf.PdfDocument
 import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
 import androidx.core.content.FileProvider
-import com.example.data.local.AcademicWeekEngine
+import com.example.R
 import com.example.data.model.ComplianceReport
 import com.example.data.model.ReportScope
+import com.example.data.model.StaffMember
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -30,25 +34,111 @@ object PdfReportExporter {
         reports: List<ComplianceReport>,
         scope: ReportScope,
         term: String,
-        dateLabel: String
-    ): Result<File> = withContext(Dispatchers.IO) {
+        dateLabel: String,
+        staffRoster: List<StaffMember> = emptyList(),
+        startDate: String = "",
+        endDate: String = ""
+    ): Result<File> {
+        return exportAndShareWithResult(
+            context = context,
+            reports = reports,
+            scope = scope,
+            term = term,
+            dateLabel = dateLabel,
+            staffRoster = staffRoster,
+            startDate = startDate,
+            endDate = endDate
+        ).map { it.first }
+    }
+
+    suspend fun exportAndShareWithResult(
+        context: Context,
+        reports: List<ComplianceReport>,
+        scope: ReportScope,
+        term: String = "ALL",
+        dateLabel: String = "",
+        staffRoster: List<StaffMember> = emptyList(),
+        startDate: String = "",
+        endDate: String = ""
+    ): Result<Pair<File, PreparedExportDataset>> = withContext(Dispatchers.IO) {
+        var document: PdfDocument? = null
+        var crestBitmap: Bitmap? = null
         try {
-            val document = PdfDocument()
-            val titlePaint = Paint().apply {
+            val staffMap = AnalysisEngine.buildStaffLookup(staffRoster)
+            val filteredInput = if (dateLabel.isNotBlank() && startDate.isBlank() && endDate.isBlank()) {
+                reports
+            } else {
+                reports
+            }
+            val prepared = ReportExportData.prepareDataset(
+                scope = scope,
+                format = "PDF",
+                records = filteredInput,
+                staffRoster = staffRoster,
+                startDate = startDate,
+                endDate = endDate,
+                term = term
+            )
+
+            val displayPeriod = when {
+                startDate.isNotBlank() || endDate.isNotBlank() -> prepared.periodDisplay
+                dateLabel.isNotBlank() -> dateLabel
+                else -> prepared.periodDisplay
+            }
+
+            crestBitmap = runCatching {
+                BitmapFactory.decodeResource(context.resources, R.drawable.ic_jcbest_crest)
+            }.getOrNull()
+
+            document = PdfDocument()
+
+            val schoolPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.parseColor("#0F172A")
-                textSize = 16f
+                textSize = 14.5f
+                textAlign = Paint.Align.CENTER
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             }
-            val subPaint = Paint().apply {
-                color = Color.parseColor("#475569")
-                textSize = 10f
+            val directoratePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#334155")
+                textSize = 8.8f
+                textAlign = Paint.Align.CENTER
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            }
+            val docTitlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#1E3A8A")
+                textSize = 11f
+                textAlign = Paint.Align.CENTER
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            }
+            val metaLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#0F172A")
+                textSize = 8.5f
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            }
+            val metaAccentPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#1E3A8A")
+                textSize = 8.5f
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            }
+            val metaValuePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#334155")
+                textSize = 8.5f
+            }
+            val metaStatusPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#16A34A")
+                textSize = 8.5f
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            }
+            val dividerPaint = Paint().apply {
+                color = Color.parseColor("#CBD5E1")
+                strokeWidth = 0.9f
             }
             val headerBgPaint = Paint().apply {
-                color = Color.parseColor("#1E3A8A")
+                color = Color.parseColor("#0F2744")
             }
-            val headerTextPaint = Paint().apply {
+            val headerTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.WHITE
-                textSize = 9.5f
+                textSize = 8.5f
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             }
             val stripePaint = Paint().apply {
@@ -56,145 +146,247 @@ object PdfReportExporter {
             }
             val borderPaint = Paint().apply {
                 color = Color.parseColor("#CBD5E1")
-                strokeWidth = 0.8f
+                strokeWidth = 0.7f
                 style = Paint.Style.STROKE
             }
-            val cellPaint = TextPaint().apply {
+            val cellPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#1E293B")
+                textSize = 8.5f
+            }
+            val nameCellPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.parseColor("#0F172A")
-                textSize = 9f
-                isAntiAlias = true
+                textSize = 8.5f
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            }
+            val footerLeftPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#64748B")
+                textSize = 7.8f
+            }
+            val footerRightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#64748B")
+                textSize = 7.8f
+                textAlign = Paint.Align.RIGHT
             }
 
-            // 6 Columns: DATE | NAME | CLASS | SUBJECT | EXCEPTIONS | EFFECTS
+            // Column proportions matching pdfExportService.js (273mm usable -> 778pt usable)
             val tableWidth = PAGE_WIDTH - (MARGIN * 2)
             val colWidths = floatArrayOf(
-                74f,   // DATE
-                122f,  // NAME
-                86f,   // CLASS
-                94f,   // SUBJECT
-                210f,  // EXCEPTIONS
-                tableWidth - (74f + 122f + 86f + 94f + 210f) // EFFECTS
+                tableWidth * 0.095f, // DATE
+                tableWidth * 0.175f, // NAME / DRIVER NAME
+                tableWidth * 0.090f, // CLASS / BUS NO.
+                tableWidth * 0.135f, // SUBJECT / COMPLIANCE CHECK
+                tableWidth * 0.265f, // EXCEPTIONS
+                tableWidth * 0.240f  // EFFECTS
             )
-            val colHeaders = listOf("DATE", "NAME", "CLASS", "SUBJECT", "EXCEPTIONS", "EFFECTS")
+            val isTransport = scope == ReportScope.TRANSPORT
+            val colHeaders = if (isTransport) {
+                ReportExportData.transportColumns
+            } else {
+                ReportExportData.standardColumns
+            }
 
+            fun drawTableHeader(c: Canvas, topY: Float): Float {
+                val hHeight = 23f
+                c.drawRect(MARGIN, topY, MARGIN + tableWidth, topY + hHeight, headerBgPaint)
+                var x = MARGIN
+                colHeaders.forEachIndexed { idx, label ->
+                    val centered = idx == 0 || idx == 2
+                    if (centered) {
+                        val centerPaint = Paint(headerTextPaint).apply { textAlign = Paint.Align.CENTER }
+                        c.drawText(label, x + colWidths[idx] / 2f, topY + 14.5f, centerPaint)
+                    } else {
+                        c.drawText(label, x + 6f, topY + 14.5f, headerTextPaint)
+                    }
+                    x += colWidths[idx]
+                }
+                return topY + hHeight
+            }
+
+            fun drawFirstPageHeader(c: Canvas): Float {
+                var y = 24f
+                crestBitmap?.let { bmp ->
+                    val dest = RectF(MARGIN, y, MARGIN + 52f, y + 52f)
+                    c.drawBitmap(bmp, null, dest, null)
+                }
+
+                val centerX = PAGE_WIDTH / 2f
+                c.drawText("JCBEST SCHOOLS INTERNATIONAL", centerX, y + 15f, schoolPaint)
+                c.drawText(
+                    "DIRECTORATE OF ACADEMIC QUALITY ASSURANCE & INSTITUTIONAL COMPLIANCE",
+                    centerX,
+                    y + 30f,
+                    directoratePaint
+                )
+                c.drawText("OFFICIAL COMPLIANCE EXCEPTION REPORT", centerX, y + 46f, docTitlePaint)
+
+                y += 66f
+                // Metadata row
+                c.drawText("REPORT SCOPE:", MARGIN, y, metaLabelPaint)
+                c.drawText(scope.label, MARGIN + 74f, y, metaAccentPaint)
+
+                c.drawText("PERIOD:", MARGIN + 195f, y, metaLabelPaint)
+                c.drawText(displayPeriod, MARGIN + 234f, y, metaValuePaint)
+
+                c.drawText("RECORDS:", MARGIN + 430f, y, metaLabelPaint)
+                c.drawText("${prepared.rows.size} Exception(s)", MARGIN + 478f, y, metaAccentPaint)
+
+                c.drawText("GENERATED:", MARGIN + 575f, y, metaLabelPaint)
+                c.drawText(prepared.generatedDateDisplay, MARGIN + 632f, y, metaValuePaint)
+
+                c.drawText("Statutory Archive", MARGIN + 704f, y, metaStatusPaint)
+
+                y += 8f
+                c.drawLine(MARGIN, y, PAGE_WIDTH - MARGIN, y, dividerPaint)
+                return y + 10f
+            }
+
+            fun drawContinuedPageHeader(c: Canvas): Float {
+                c.drawText(
+                    "JCBest Schools International · ${scope.label} Compliance Report ($displayPeriod)",
+                    MARGIN,
+                    28f,
+                    footerLeftPaint
+                )
+                return drawTableHeader(c, 36f)
+            }
+
+            // Pre-build pages so we know total page count for "Page X of Y"
+            val finishedPagesInfo = mutableListOf<Int>()
             var pageNum = 1
             var pageInfo = PdfDocument.PageInfo.Builder(PAGE_WIDTH, PAGE_HEIGHT, pageNum).create()
             var page = document.startPage(pageInfo)
             var canvas = page.canvas
 
-            fun drawHeader(c: Canvas, isFirstPage: Boolean): Float {
-                var y = MARGIN
-                c.drawText("JC-BEST SCHOOLS INTERNATIONAL", MARGIN, y + 12f, titlePaint)
-                y += 18f
-                val termLabel = if (term == "ALL") "All Terms" else term
-                c.drawText(
-                    "Compliance Audit Report • Scope: ${scope.label} • $termLabel • Period: $dateLabel • Total Records: ${reports.size}",
-                    MARGIN,
-                    y + 10f,
-                    subPaint
-                )
-                y += 18f
-                if (isFirstPage) {
-                    val seenCount = reports.count { it.isSeen }
-                    val unseenCount = reports.size - seenCount
-                    c.drawText(
-                        "Audit Summary: $seenCount Reviewed (Seen) | $unseenCount Pending Review (Unseen) | Generated: ${AcademicWeekEngine.todayIso()}",
-                        MARGIN,
-                        y + 8f,
-                        subPaint
-                    )
-                    y += 16f
-                }
-
-                // Table Column Header Row
-                c.drawRect(MARGIN, y, MARGIN + tableWidth, y + 22f, headerBgPaint)
-                var x = MARGIN
-                colHeaders.forEachIndexed { idx, label ->
-                    c.drawText(label, x + 6f, y + 14.5f, headerTextPaint)
-                    x += colWidths[idx]
-                }
-                return y + 22f
-            }
+            var currentY = drawFirstPageHeader(canvas)
 
             fun drawFooter(c: Canvas, num: Int) {
                 c.drawText(
-                    "JC-Best Directorate Compliance System — Confidential Official Record • Page $num",
+                    "JCBest Schools International · Official Statutory Compliance Dossier",
                     MARGIN,
-                    PAGE_HEIGHT - 16f,
-                    subPaint
+                    PAGE_HEIGHT - 14f,
+                    footerLeftPaint
+                )
+                c.drawText(
+                    "Page $num",
+                    PAGE_WIDTH - MARGIN,
+                    PAGE_HEIGHT - 14f,
+                    footerRightPaint
                 )
             }
 
-            var currentY = drawHeader(canvas, true)
-
-            val sorted = reports.sortedByDescending { it.incidentDate }
-            sorted.forEachIndexed { index, r ->
-                val values = listOf(
-                    r.incidentDate.ifBlank { "-" },
-                    (r.staffName ?: r.assignedLocation ?: r.division).ifBlank { "-" },
-                    r.className ?: r.assignedLocation ?: "-",
-                    r.subject ?: r.category.ifBlank { "-" },
-                    listOfNotNull(
-                        r.complianceCheck.takeIf { it.isNotBlank() },
-                        r.exceptionText.takeIf { it.isNotBlank() }
-                    ).joinToString(": "),
-                    r.effectText.ifBlank { "-" }
+            if (prepared.rows.isEmpty()) {
+                val boxTop = currentY + 8f
+                val boxBottom = boxTop + 76f
+                canvas.drawRoundRect(
+                    RectF(MARGIN, boxTop, PAGE_WIDTH - MARGIN, boxBottom),
+                    8f,
+                    8f,
+                    stripePaint
                 )
+                canvas.drawRoundRect(
+                    RectF(MARGIN, boxTop, PAGE_WIDTH - MARGIN, boxBottom),
+                    8f,
+                    8f,
+                    borderPaint
+                )
+                val emptyTitlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.parseColor("#334155")
+                    textSize = 11f
+                    textAlign = Paint.Align.CENTER
+                    typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                }
+                val emptySubPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.parseColor("#64748B")
+                    textSize = 9f
+                    textAlign = Paint.Align.CENTER
+                }
+                canvas.drawText(
+                    "No exception records found for the selected report scope and reporting period.",
+                    PAGE_WIDTH / 2f,
+                    boxTop + 32f,
+                    emptyTitlePaint
+                )
+                canvas.drawText(
+                    "Audit query executed across ${scope.label} records within $displayPeriod. Zero statutory exceptions recorded.",
+                    PAGE_WIDTH / 2f,
+                    boxTop + 50f,
+                    emptySubPaint
+                )
+                drawFooter(canvas, pageNum)
+                document.finishPage(page)
+            } else {
+                currentY = drawTableHeader(canvas, currentY)
 
-                val layouts = values.mapIndexed { idx, text ->
-                    StaticLayout.Builder.obtain(
-                        text,
-                        0,
-                        text.length,
-                        cellPaint,
-                        (colWidths[idx] - 10f).toInt().coerceAtLeast(30)
+                var rowsWritten = 0
+                prepared.rows.forEachIndexed { index, row ->
+                    val values = listOf(
+                        row.date,
+                        if (isTransport) row.driverName else row.name,
+                        if (isTransport) row.busNumber else row.className,
+                        if (isTransport) row.complianceCheck else row.subject,
+                        row.exception,
+                        row.effect
                     )
-                        .setAlignment(Layout.Alignment.ALIGN_NORMAL)
-                        .setLineSpacing(1.5f, 1f)
-                        .build()
-                }
-                val rowHeight = (layouts.maxOf { it.height } + 12f).coerceAtLeast(22f)
 
-                if (currentY + rowHeight > PAGE_HEIGHT - 36f) {
-                    drawFooter(canvas, pageNum)
-                    document.finishPage(page)
-                    pageNum++
-                    pageInfo = PdfDocument.PageInfo.Builder(PAGE_WIDTH, PAGE_HEIGHT, pageNum).create()
-                    page = document.startPage(pageInfo)
-                    canvas = page.canvas
-                    currentY = drawHeader(canvas, false)
-                }
-
-                if (index % 2 == 1) {
-                    canvas.drawRect(MARGIN, currentY, MARGIN + tableWidth, currentY + rowHeight, stripePaint)
-                }
-                canvas.drawRect(MARGIN, currentY, MARGIN + tableWidth, currentY + rowHeight, borderPaint)
-
-                var x = MARGIN
-                layouts.forEachIndexed { idx, layout ->
-                    canvas.save()
-                    canvas.translate(x + 5f, currentY + 6f)
-                    layout.draw(canvas)
-                    canvas.restore()
-                    x += colWidths[idx]
-                    if (idx < layouts.lastIndex) {
-                        canvas.drawLine(x, currentY, x, currentY + rowHeight, borderPaint)
+                    val layouts = values.mapIndexed { idx, text ->
+                        val paint = if (idx == 1) nameCellPaint else cellPaint
+                        val alignment = if (idx == 0 || idx == 2) Layout.Alignment.ALIGN_CENTER else Layout.Alignment.ALIGN_NORMAL
+                        StaticLayout.Builder.obtain(
+                            text,
+                            0,
+                            text.length,
+                            paint,
+                            (colWidths[idx] - 10f).toInt().coerceAtLeast(24)
+                        )
+                            .setAlignment(alignment)
+                            .setLineSpacing(1.5f, 1.05f)
+                            .build()
                     }
+                    val rowHeight = (layouts.maxOf { it.height } + 12f).coerceAtLeast(22f)
+
+                    if (currentY + rowHeight > PAGE_HEIGHT - 34f) {
+                        drawFooter(canvas, pageNum)
+                        document.finishPage(page)
+                        finishedPagesInfo.add(pageNum)
+                        pageNum++
+                        pageInfo = PdfDocument.PageInfo.Builder(PAGE_WIDTH, PAGE_HEIGHT, pageNum).create()
+                        page = document.startPage(pageInfo)
+                        canvas = page.canvas
+                        currentY = drawContinuedPageHeader(canvas)
+                    }
+
+                    if (index % 2 == 1) {
+                        canvas.drawRect(MARGIN, currentY, MARGIN + tableWidth, currentY + rowHeight, stripePaint)
+                    }
+                    canvas.drawRect(MARGIN, currentY, MARGIN + tableWidth, currentY + rowHeight, borderPaint)
+
+                    var x = MARGIN
+                    layouts.forEachIndexed { idx, layout ->
+                        canvas.save()
+                        canvas.translate(x + 5f, currentY + 6f)
+                        layout.draw(canvas)
+                        canvas.restore()
+                        x += colWidths[idx]
+                        if (idx < layouts.lastIndex) {
+                            canvas.drawLine(x, currentY, x, currentY + rowHeight, borderPaint)
+                        }
+                    }
+                    currentY += rowHeight
+                    rowsWritten++
                 }
-                currentY += rowHeight
+
+                if (rowsWritten != prepared.records.size) {
+                    throw IllegalStateException(
+                        "Generation Data Integrity Failure: Selected source count (${prepared.records.size}) does not match table rows written ($rowsWritten)."
+                    )
+                }
+
+                drawFooter(canvas, pageNum)
+                document.finishPage(page)
             }
 
-            if (sorted.isEmpty()) {
-                canvas.drawText("No exceptions recorded matching this filter.", MARGIN + 8f, currentY + 22f, subPaint)
-            }
-
-            drawFooter(canvas, pageNum)
-            document.finishPage(page)
-
-            val fileName = "JCBest_${scope.label.replace(Regex("[^a-zA-Z0-9]"), "_")}_${AcademicWeekEngine.todayIso()}.pdf"
-            val outFile = File(context.cacheDir, fileName)
+            val outFile = File(context.cacheDir, prepared.filename)
             FileOutputStream(outFile).use { document.writeTo(it) }
-            document.close()
 
             val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", outFile)
             val shareIntent = Intent(Intent.ACTION_SEND).apply {
@@ -207,9 +399,12 @@ object PdfReportExporter {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             context.startActivity(chooser)
-            Result.success(outFile)
+            Result.success(outFile to prepared)
         } catch (e: Exception) {
             Result.failure(e)
+        } finally {
+            runCatching { document?.close() }
+            runCatching { crestBitmap?.recycle() }
         }
     }
 }
