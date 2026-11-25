@@ -9,6 +9,8 @@ import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -75,6 +77,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
@@ -99,6 +102,7 @@ import com.example.data.model.ComplianceCheck
 import com.example.data.model.ComplianceDivision
 import com.example.data.model.ComplianceReport
 import com.example.data.model.DraftMediaItem
+import com.example.data.model.GroupReportMember
 import com.example.data.model.MediaUploadLimits
 import com.example.data.model.OfflineDraft
 import com.example.data.model.ReportEvidenceAttachment
@@ -107,6 +111,7 @@ import com.example.data.model.ReportFormMode
 import com.example.data.model.StaffMember
 import com.example.data.model.SubjectItem
 import com.example.domain.BackgroundExecutionHelper
+import com.example.domain.GroupReportHelpers
 import com.example.ui.components.GlowingPrimaryButton
 import com.example.ui.components.MicroLabel
 import com.example.ui.components.PreSubmitAuditSheet
@@ -164,8 +169,10 @@ fun ReportFormSheet(
         exceptionText: String,
         effectText: String,
         attachments: List<ReportEvidenceAttachment>,
-        cleanDraftMedia: Boolean
-    ) -> Unit = { _, _, _, _, _, _, _, _, _, _, _, _, _, _ -> },
+        cleanDraftMedia: Boolean,
+        isGroupReport: Boolean,
+        groupMembers: List<GroupReportMember>
+    ) -> Unit = { _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ -> },
     onSubmit: (
         division: ComplianceDivision,
         targetType: String,
@@ -180,7 +187,9 @@ fun ReportFormSheet(
         exceptionText: String,
         effectText: String,
         attachments: List<ReportEvidenceAttachment>,
-        cleanDraftMedia: Boolean
+        cleanDraftMedia: Boolean,
+        isGroupReport: Boolean,
+        groupMembers: List<GroupReportMember>
     ) -> Unit
 ) {
     val context = LocalContext.current
@@ -205,11 +214,29 @@ fun ReportFormSheet(
                 ?: ComplianceDivision.ACADEMIC
         )
     }
+    var isGroupReport by remember {
+        mutableStateOf(
+            (editingReport?.isGroupReport ?: draftToRestore?.isGroupReport ?: false) &&
+                division == ComplianceDivision.ACADEMIC
+        )
+    }
+    var groupMembers by remember {
+        mutableStateOf(
+            when {
+                editingReport?.groupMembers?.isNotEmpty() == true -> editingReport.groupMembers
+                draftToRestore?.groupMembers?.isNotEmpty() == true -> draftToRestore.groupMembers
+                else -> emptyList()
+            }
+        )
+    }
+    var departmentFilter by remember {
+        mutableStateOf(draftToRestore?.departmentFilter ?: "All Departments")
+    }
     var targetType by remember {
         mutableStateOf(
             editingReport?.targetType
                 ?: draftToRestore?.targetType
-                ?: if (division == ComplianceDivision.CDS || division == ComplianceDivision.OPERATIONS) "division" else "staff"
+                ?: if (division == ComplianceDivision.CDS || division == ComplianceDivision.OPERATIONS || isGroupReport) "division" else "staff"
         )
     }
     var classTierFilter by remember {
@@ -229,10 +256,16 @@ fun ReportFormSheet(
     }
     var selectedClass by remember {
         mutableStateOf(
-            editingReport?.classId?.let { id -> classes.firstOrNull { it.id == id } }
-                ?: editingReport?.className?.let { n -> classes.firstOrNull { it.name.equals(n, true) } }
-                ?: draftToRestore?.classId?.let { id -> classes.firstOrNull { it.id == id } }
-                ?: draftToRestore?.className?.let { n -> classes.firstOrNull { it.name.equals(n, true) } }
+            when {
+                editingReport?.classId.equals("NONE", true) || editingReport?.className.equals("None", true) ->
+                    ComplianceTaxonomy.noneClassroom
+                draftToRestore?.classId.equals("NONE", true) || draftToRestore?.className.equals("None", true) ->
+                    ComplianceTaxonomy.noneClassroom
+                else -> editingReport?.classId?.let { id -> classes.firstOrNull { it.id == id } }
+                    ?: editingReport?.className?.let { n -> classes.firstOrNull { it.name.equals(n, true) } }
+                    ?: draftToRestore?.classId?.let { id -> classes.firstOrNull { it.id == id } }
+                    ?: draftToRestore?.className?.let { n -> classes.firstOrNull { it.name.equals(n, true) } }
+            }
         )
     }
     var selectedSubject by remember {
@@ -293,6 +326,8 @@ fun ReportFormSheet(
     var showSubjectMenu by remember { mutableStateOf(false) }
     var showCheckMenu by remember { mutableStateOf(false) }
     var showBusMenu by remember { mutableStateOf(false) }
+    var showGroupClassDialog by remember { mutableStateOf(false) }
+    var showGroupSubjectDialog by remember { mutableStateOf(false) }
     var showCustomCheckDialog by remember { mutableStateOf(false) }
     var showNoEvidenceWarning by remember { mutableStateOf(false) }
     var showOfflineAutoSubmitConsent by remember { mutableStateOf(false) }
@@ -410,18 +445,19 @@ fun ReportFormSheet(
                     capturedAtLabel = it.displayName
                 )
             }
+        val groupActive = division == ComplianceDivision.ACADEMIC && isGroupReport
         return ReportFormDraft(
             divisionKey = division.key,
-            targetType = targetType,
+            targetType = if (groupActive) "division" else targetType,
             classTierFilter = classTierFilter,
             staffSearch = staffSearch,
-            staffId = selectedStaff?.id,
-            staffCode = selectedStaff?.staffCode,
-            staffName = selectedStaff?.name,
-            classId = selectedClass?.id,
-            className = selectedClass?.name,
-            subjectId = selectedSubject?.id,
-            subjectName = selectedSubject?.name,
+            staffId = if (groupActive) null else selectedStaff?.id,
+            staffCode = if (groupActive) "GROUP (${groupMembers.size})" else selectedStaff?.staffCode,
+            staffName = if (groupActive) groupMembers.joinToString(", ") { it.staffName } else selectedStaff?.name,
+            classId = if (groupActive) null else selectedClass?.id,
+            className = if (groupActive) groupMembers.joinToString(", ") { it.className.ifBlank { "None" } } else selectedClass?.name,
+            subjectId = if (groupActive) null else selectedSubject?.id,
+            subjectName = if (groupActive) groupMembers.joinToString(", ") { it.subjectName.ifBlank { "—" } } else selectedSubject?.name,
             operationScope = operationScope,
             selectedBus = selectedBus,
             opPersonOrLocation = opPersonOrLocation,
@@ -441,7 +477,10 @@ fun ReportFormSheet(
                 else -> "${syncedDraftMedia.size} items"
             },
             hasUserEdited = true,
-            updatedAtMillis = System.currentTimeMillis()
+            updatedAtMillis = System.currentTimeMillis(),
+            isGroupReport = groupActive,
+            groupMembers = if (groupActive) groupMembers else emptyList(),
+            departmentFilter = departmentFilter
         )
     }
 
@@ -451,6 +490,7 @@ fun ReportFormSheet(
         userTouched,
         division, targetType, classTierFilter, staffSearch,
         selectedStaff, selectedClass, selectedSubject,
+        isGroupReport, groupMembers, departmentFilter,
         operationScope, selectedBus, opPersonOrLocation, studentNamesArm,
         selectedCheck, incidentDate, exceptionText, effectText,
         attachedEvidence
@@ -671,14 +711,27 @@ fun ReportFormSheet(
 
     fun runAutoFill() {
         if (!autoFillEnabled) return
+        val groupMode = division == ComplianceDivision.ACADEMIC && isGroupReport && groupMembers.isNotEmpty()
         val res = ComplianceAutoFillEngine.generate(
             division = division,
-            targetType = targetType,
+            targetType = if (groupMode) "division" else targetType,
             checkId = selectedCheck?.id.orEmpty(),
             checkName = selectedCheck?.name.orEmpty(),
-            staffName = selectedStaff?.name.orEmpty(),
-            className = selectedClass?.name.orEmpty(),
-            subjectName = selectedSubject?.name.orEmpty(),
+            staffName = if (groupMode) {
+                groupMembers.joinToString(", ") { it.staffName }
+            } else {
+                selectedStaff?.name.orEmpty()
+            },
+            className = if (groupMode) {
+                groupMembers.map { it.className.ifBlank { "None" } }.distinct().joinToString(", ")
+            } else {
+                selectedClass?.name.orEmpty()
+            },
+            subjectName = if (groupMode) {
+                groupMembers.mapNotNull { it.subjectName.takeIf(String::isNotBlank) }.distinct().joinToString(", ")
+            } else {
+                selectedSubject?.name.orEmpty()
+            },
             driverName = opPersonOrLocation,
             selectedBus = selectedBus,
             minderName = opPersonOrLocation,
@@ -695,6 +748,9 @@ fun ReportFormSheet(
 
     val filteredClasses = remember(classes, classTierFilter) {
         if (classTierFilter == "All Tiers") classes else classes.filter { it.section.equals(classTierFilter, true) }
+    }
+    val classDropdownOptions = remember(filteredClasses, classes) {
+        listOf(ComplianceTaxonomy.noneClassroom) + filteredClasses.ifEmpty { classes }
     }
     val activeStaff = remember(staffList, division, staffSearch) {
         val q = staffSearch.trim().lowercase()
@@ -719,6 +775,22 @@ fun ReportFormSheet(
                 s.role.lowercase().contains(q)
         }
     }
+    val groupFilteredStaff = remember(activeStaff, departmentFilter) {
+        if (departmentFilter.equals("All Departments", ignoreCase = true)) {
+            activeStaff
+        } else {
+            activeStaff.filter { s ->
+                GroupReportHelpers.resolveStaffDepartment(s).equals(departmentFilter, ignoreCase = true)
+            }
+        }
+    }
+
+    val hasGroupingModalOverlay = showGroupClassDialog || showGroupSubjectDialog
+    val formOverlayBlurRadius by animateDpAsState(
+        targetValue = if (hasGroupingModalOverlay) 16.dp else 0.dp,
+        animationSpec = tween(durationMillis = 220),
+        label = "report_form_grouping_blur"
+    )
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -729,6 +801,7 @@ fun ReportFormSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .then(if (formOverlayBlurRadius > 0.dp) Modifier.blur(formOverlayBlurRadius) else Modifier)
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 20.dp)
                 .imePadding()
@@ -772,6 +845,9 @@ fun ReportFormSheet(
                             onClick = {
                                 userTouched = false
                                 division = ComplianceDivision.ACADEMIC
+                                isGroupReport = false
+                                groupMembers = emptyList()
+                                departmentFilter = "All Departments"
                                 targetType = "staff"
                                 classTierFilter = "All Tiers"
                                 staffSearch = ""
@@ -836,7 +912,10 @@ fun ReportFormSheet(
                         selected = division == div,
                         onClick = {
                             division = div
-                            targetType = if (div == ComplianceDivision.CDS || div == ComplianceDivision.OPERATIONS) "division" else "staff"
+                            if (div != ComplianceDivision.ACADEMIC) {
+                                isGroupReport = false
+                            }
+                            targetType = if (div == ComplianceDivision.CDS || div == ComplianceDivision.OPERATIONS || (div == ComplianceDivision.ACADEMIC && isGroupReport)) "division" else "staff"
                             localValidationError = null
                             onClearFeedback()
                             userTouched = true
@@ -848,6 +927,36 @@ fun ReportFormSheet(
             }
 
             if (division == ComplianceDivision.ACADEMIC) {
+                AcademicReportModeSwitcher(
+                    isGroupReport = isGroupReport,
+                    onSelectMode = { groupMode ->
+                        isGroupReport = groupMode
+                        targetType = if (groupMode) "division" else "staff"
+                        if (groupMode && groupMembers.isEmpty() && selectedStaff != null) {
+                            val first = selectedStaff!!
+                            groupMembers = listOf(
+                                GroupReportMember(
+                                    staffId = first.id,
+                                    staffName = first.name,
+                                    staffCode = first.staffCode,
+                                    staffGroup = GroupReportHelpers.resolveStaffDepartment(first),
+                                    classId = selectedClass?.id ?: "NONE",
+                                    className = selectedClass?.name ?: "",
+                                    subjectId = selectedSubject?.id,
+                                    subjectName = selectedSubject?.name.orEmpty()
+                                )
+                            )
+                        } else if (!groupMode && selectedStaff == null && groupMembers.isNotEmpty()) {
+                            val firstM = groupMembers.first()
+                            selectedStaff = staffList.firstOrNull {
+                                it.id == firstM.staffId || it.name.equals(firstM.staffName, true)
+                            }
+                        }
+                        localValidationError = null
+                        userTouched = true
+                    }
+                )
+
                 Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     ComplianceTaxonomy.academicClassTiers.forEach { tier ->
                         FilterChip(
@@ -880,121 +989,185 @@ fun ReportFormSheet(
                     shape = RoundedCornerShape(16.dp),
                     modifier = Modifier.fillMaxWidth().testTag("form_staff_search")
                 )
-                if (staffSearch.isNotBlank() && (selectedStaff == null || !selectedStaff!!.name.equals(staffSearch.trim(), true))) {
-                    Surface(
-                        color = ext.glassBottom,
-                        shape = RoundedCornerShape(14.dp),
-                        border = BorderStroke(1.dp, ext.glassRimEnd),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(modifier = Modifier.padding(vertical = 4.dp)) {
-                            if (activeStaff.isEmpty()) {
-                                Text(
-                                    text = "No matching staff found for \"${staffSearch.trim()}\"",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
-                                )
+
+                if (isGroupReport) {
+                    AcademicGroupStaffSelector(
+                        filteredStaff = groupFilteredStaff,
+                        groupMembers = groupMembers,
+                        departmentFilter = departmentFilter,
+                        onDepartmentFilterChange = {
+                            departmentFilter = it
+                            userTouched = true
+                        },
+                        onToggleStaff = { staff ->
+                            val exists = groupMembers.any {
+                                it.staffId.equals(staff.id, true) ||
+                                    (staff.staffCode.isNotBlank() && it.staffCode.equals(staff.staffCode, true))
+                            }
+                            groupMembers = if (exists) {
+                                groupMembers.filterNot {
+                                    it.staffId.equals(staff.id, true) ||
+                                        (staff.staffCode.isNotBlank() && it.staffCode.equals(staff.staffCode, true))
+                                }
                             } else {
-                                activeStaff.take(6).forEach { candidate ->
-                                    Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .clickable {
-                                                selectedStaff = candidate
-                                                staffSearch = candidate.name
-                                                localValidationError = null
-                                                userTouched = true
-                                            }
-                                            .padding(horizontal = 14.dp, vertical = 10.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Text(
-                                            text = candidate.name,
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            fontWeight = FontWeight.SemiBold,
-                                            color = MaterialTheme.colorScheme.onSurface,
-                                            modifier = Modifier.weight(1f),
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-                                        if (candidate.staffCode.isNotBlank()) {
+                                val uniformClass = groupMembers.map { it.className }
+                                    .filter { it.isNotBlank() }
+                                    .distinct()
+                                    .takeIf { it.size == 1 && groupMembers.size == groupMembers.count { m -> m.className.isNotBlank() } }
+                                    ?.firstOrNull()
+                                val uniformClassId = if (uniformClass != null) groupMembers.first().classId else "NONE"
+                                val uniformSubj = groupMembers.map { it.subjectName }
+                                    .filter { it.isNotBlank() }
+                                    .distinct()
+                                    .takeIf { it.size == 1 && groupMembers.size == groupMembers.count { m -> m.subjectName.isNotBlank() } }
+                                    ?.firstOrNull()
+                                val uniformSubjId = if (uniformSubj != null) groupMembers.first().subjectId else null
+
+                                groupMembers + GroupReportMember(
+                                    staffId = staff.id,
+                                    staffName = staff.name,
+                                    staffCode = staff.staffCode,
+                                    staffGroup = GroupReportHelpers.resolveStaffDepartment(staff),
+                                    classId = uniformClassId ?: "NONE",
+                                    className = uniformClass.orEmpty(),
+                                    subjectId = uniformSubjId,
+                                    subjectName = uniformSubj.orEmpty()
+                                )
+                            }
+                            localValidationError = null
+                            userTouched = true
+                        },
+                        onRemoveMember = { member ->
+                            groupMembers = groupMembers.filterNot {
+                                it.staffId == member.staffId && it.staffName == member.staffName
+                            }
+                            userTouched = true
+                        },
+                        onOpenClassAssignment = { showGroupClassDialog = true },
+                        onOpenSubjectAssignment = { showGroupSubjectDialog = true }
+                    )
+                } else {
+                    if (staffSearch.isNotBlank() && (selectedStaff == null || !selectedStaff!!.name.equals(staffSearch.trim(), true))) {
+                        Surface(
+                            color = ext.glassBottom,
+                            shape = RoundedCornerShape(14.dp),
+                            border = BorderStroke(1.dp, ext.glassRimEnd),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(modifier = Modifier.padding(vertical = 4.dp)) {
+                                if (activeStaff.isEmpty()) {
+                                    Text(
+                                        text = "No matching staff found for \"${staffSearch.trim()}\"",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                                    )
+                                } else {
+                                    activeStaff.take(6).forEach { candidate ->
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clickable {
+                                                    selectedStaff = candidate
+                                                    staffSearch = candidate.name
+                                                    localValidationError = null
+                                                    userTouched = true
+                                                }
+                                                .padding(horizontal = 14.dp, vertical = 10.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
                                             Text(
-                                                text = candidate.staffCode,
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.primary
+                                                text = candidate.name,
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = MaterialTheme.colorScheme.onSurface,
+                                                modifier = Modifier.weight(1f),
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
                                             )
+                                            if (candidate.staffCode.isNotBlank()) {
+                                                Text(
+                                                    text = candidate.staffCode,
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = MaterialTheme.colorScheme.primary
+                                                )
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                }
-                Box {
-                    OutlinedButton(
-                        onClick = { showStaffMenu = true },
-                        modifier = Modifier.fillMaxWidth().testTag("form_select_staff_button")
-                    ) {
-                        Text(
-                            selectedStaff?.let { "${it.name} (${it.staffCode})" }
-                                ?: "Select Staff Member (${activeStaff.size})"
-                        )
-                    }
-                    DropdownMenu(expanded = showStaffMenu, onDismissRequest = { showStaffMenu = false }) {
-                        if (activeStaff.isEmpty()) {
-                            DropdownMenuItem(
-                                text = { Text("No matching active staff found") },
-                                onClick = { showStaffMenu = false }
+                    Box {
+                        OutlinedButton(
+                            onClick = { showStaffMenu = true },
+                            modifier = Modifier.fillMaxWidth().testTag("form_select_staff_button")
+                        ) {
+                            Text(
+                                selectedStaff?.let { "${it.name} (${it.staffCode})" }
+                                    ?: "Select Staff Member (${activeStaff.size})"
                             )
-                        } else {
-                            activeStaff.forEach { s ->
+                        }
+                        DropdownMenu(expanded = showStaffMenu, onDismissRequest = { showStaffMenu = false }) {
+                            if (activeStaff.isEmpty()) {
                                 DropdownMenuItem(
-                                    text = { Text("${s.name} • ${s.staffCode}") },
-                                    onClick = {
-                                        selectedStaff = s
-                                        showStaffMenu = false
-                                        localValidationError = null
-                                        userTouched = true
-                                    }
+                                    text = { Text("No matching active staff found") },
+                                    onClick = { showStaffMenu = false }
                                 )
+                            } else {
+                                activeStaff.forEach { s ->
+                                    DropdownMenuItem(
+                                        text = { Text("${s.name} • ${s.staffCode}") },
+                                        onClick = {
+                                            selectedStaff = s
+                                            showStaffMenu = false
+                                            localValidationError = null
+                                            userTouched = true
+                                        }
+                                    )
+                                }
                             }
                         }
                     }
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    Box(modifier = Modifier.weight(1f)) {
-                        OutlinedButton(onClick = { showClassMenu = true }, modifier = Modifier.fillMaxWidth()) {
-                            Text(selectedClass?.name ?: "Select Class")
-                        }
-                        DropdownMenu(expanded = showClassMenu, onDismissRequest = { showClassMenu = false }) {
-                            filteredClasses.forEach { c ->
-                                DropdownMenuItem(
-                                    text = { Text(c.name) },
-                                    onClick = {
-                                        selectedClass = c
-                                        showClassMenu = false
-                                        userTouched = true
-                                    }
-                                )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        Box(modifier = Modifier.weight(1f)) {
+                            OutlinedButton(onClick = { showClassMenu = true }, modifier = Modifier.fillMaxWidth()) {
+                                Text(selectedClass?.name ?: "Select Class")
+                            }
+                            DropdownMenu(expanded = showClassMenu, onDismissRequest = { showClassMenu = false }) {
+                                classDropdownOptions.forEach { c ->
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                text = if (c.id == "NONE") "None (Outside Classroom)" else c.name,
+                                                fontWeight = if (c.id == "NONE") FontWeight.Bold else FontWeight.Normal
+                                            )
+                                        },
+                                        onClick = {
+                                            selectedClass = c
+                                            showClassMenu = false
+                                            userTouched = true
+                                        }
+                                    )
+                                }
                             }
                         }
-                    }
-                    Box(modifier = Modifier.weight(1f)) {
-                        OutlinedButton(onClick = { showSubjectMenu = true }, modifier = Modifier.fillMaxWidth()) {
-                            Text(selectedSubject?.name ?: "Select Subject")
-                        }
-                        DropdownMenu(expanded = showSubjectMenu, onDismissRequest = { showSubjectMenu = false }) {
-                            subjects.forEach { subj ->
-                                DropdownMenuItem(
-                                    text = { Text(subj.name) },
-                                    onClick = {
-                                        selectedSubject = subj
-                                        showSubjectMenu = false
-                                        userTouched = true
-                                    }
-                                )
+                        Box(modifier = Modifier.weight(1f)) {
+                            OutlinedButton(onClick = { showSubjectMenu = true }, modifier = Modifier.fillMaxWidth()) {
+                                Text(selectedSubject?.name ?: "Select Subject")
+                            }
+                            DropdownMenu(expanded = showSubjectMenu, onDismissRequest = { showSubjectMenu = false }) {
+                                subjects.forEach { subj ->
+                                    DropdownMenuItem(
+                                        text = { Text(subj.name) },
+                                        onClick = {
+                                            selectedSubject = subj
+                                            showSubjectMenu = false
+                                            userTouched = true
+                                        }
+                                    )
+                                }
                             }
                         }
                     }
@@ -1316,9 +1489,17 @@ fun ReportFormSheet(
                         val isVideo = item.mediaType.equals("video", ignoreCase = true)
                         val isImage = item.mediaType.equals("image", ignoreCase = true)
                         var signedThumbUrl by remember(item.id, item.pathOrUri) { mutableStateOf<String?>(null) }
+                        val thumbCacheKey = remember(item.pathOrUri) {
+                            com.example.domain.MediaCacheManager.evidenceCacheKey(item.pathOrUri)
+                        }
                         if (item.isExistingCloud && (isImage || isVideo)) {
-                            LaunchedEffect(item.id, item.pathOrUri) {
-                                onResolveSignedUrl(item.pathOrUri).onSuccess { signedThumbUrl = it }
+                            val ctx = LocalContext.current
+                            LaunchedEffect(item.id, item.pathOrUri, thumbCacheKey) {
+                                if (isImage && com.example.domain.MediaCacheManager.hasCachedDiskEntry(ctx, thumbCacheKey)) {
+                                    signedThumbUrl = "https://offline-cache.invalid/$thumbCacheKey"
+                                } else {
+                                    onResolveSignedUrl(item.pathOrUri).onSuccess { signedThumbUrl = it }
+                                }
                             }
                         }
                         val previewModel: Any? = when {
@@ -1352,12 +1533,30 @@ fun ReportFormSheet(
                                         modifier = Modifier.fillMaxSize(),
                                         badgeSize = 22.dp
                                     )
-                                    isImage && previewModel != null -> AsyncImage(
-                                        model = previewModel,
-                                        contentDescription = "Evidence Image Thumbnail",
-                                        contentScale = ContentScale.Crop,
-                                        modifier = Modifier.fillMaxSize()
-                                    )
+                                    isImage && previewModel != null -> {
+                                        val ctx = LocalContext.current
+                                        val imgReq = remember(previewModel, thumbCacheKey, item.isExistingCloud) {
+                                            coil.request.ImageRequest.Builder(ctx)
+                                                .data(previewModel)
+                                                .apply {
+                                                    if (item.isExistingCloud) {
+                                                        memoryCacheKey(thumbCacheKey)
+                                                        diskCacheKey(thumbCacheKey)
+                                                        if (signedThumbUrl?.startsWith("https://offline-cache.invalid/") == true) {
+                                                            networkCachePolicy(coil.request.CachePolicy.DISABLED)
+                                                            diskCachePolicy(coil.request.CachePolicy.READ_ONLY)
+                                                        }
+                                                    }
+                                                }
+                                                .build()
+                                        }
+                                        AsyncImage(
+                                            model = imgReq,
+                                            contentDescription = "Evidence Image Thumbnail",
+                                            contentScale = ContentScale.Crop,
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+                                    }
                                     item.mediaType.equals("audio", true) -> Icon(
                                         imageVector = Icons.Default.Mic,
                                         contentDescription = "Audio Evidence",
@@ -1459,12 +1658,20 @@ fun ReportFormSheet(
             fun performSubmit() {
                 localValidationError = null
                 onClearFeedback()
+                val groupActive = division == ComplianceDivision.ACADEMIC && isGroupReport
+                val finalizedMembers = if (groupActive) {
+                    groupMembers.map { m ->
+                        if (m.className.isBlank()) m.copy(classId = "NONE", className = "None") else m
+                    }
+                } else {
+                    emptyList()
+                }
                 onSubmit(
                     division,
-                    targetType,
-                    selectedStaff,
-                    selectedClass,
-                    selectedSubject,
+                    if (groupActive) "division" else targetType,
+                    if (groupActive) null else selectedStaff,
+                    if (groupActive) null else selectedClass,
+                    if (groupActive) null else selectedSubject,
                     operationScope,
                     if (division == ComplianceDivision.OPERATIONS) {
                         if (operationScope == "Transport") "$selectedBus ($opPersonOrLocation)" else opPersonOrLocation
@@ -1475,12 +1682,16 @@ fun ReportFormSheet(
                     exceptionText,
                     effectText,
                     attachedEvidence,
-                    cleanDraftMedia
+                    cleanDraftMedia,
+                    groupActive,
+                    finalizedMembers
                 )
             }
 
             fun validateSubmissionInputs(): String? = when {
-                division == ComplianceDivision.ACADEMIC && selectedStaff == null ->
+                division == ComplianceDivision.ACADEMIC && isGroupReport && groupMembers.size < 2 ->
+                    "Select at least 2 staff members for a Group Report (Combined), or switch to Single Staff."
+                division == ComplianceDivision.ACADEMIC && !isGroupReport && selectedStaff == null ->
                     "Please select a staff member from the Staff Roster."
                 division == ComplianceDivision.DISCIPLINE && targetType == "staff" && selectedStaff == null ->
                     "Please select a monitoring staff member or switch to Student Decorum."
@@ -1754,12 +1965,20 @@ fun ReportFormSheet(
                             GlowingPrimaryButton(
                                 onClick = {
                                     showOfflineAutoSubmitConsent = false
+                                    val groupActive = division == ComplianceDivision.ACADEMIC && isGroupReport
+                                    val finalizedMembers = if (groupActive) {
+                                        groupMembers.map { m ->
+                                            if (m.className.isBlank()) m.copy(classId = "NONE", className = "None") else m
+                                        }
+                                    } else {
+                                        emptyList()
+                                    }
                                     onQueueOfflineAutoSubmit(
                                         division,
-                                        targetType,
-                                        selectedStaff,
-                                        selectedClass,
-                                        selectedSubject,
+                                        if (groupActive) "division" else targetType,
+                                        if (groupActive) null else selectedStaff,
+                                        if (groupActive) null else selectedClass,
+                                        if (groupActive) null else selectedSubject,
                                         operationScope,
                                         if (division == ComplianceDivision.OPERATIONS) {
                                             if (operationScope == "Transport") "$selectedBus ($opPersonOrLocation)" else opPersonOrLocation
@@ -1770,7 +1989,9 @@ fun ReportFormSheet(
                                         exceptionText,
                                         effectText,
                                         attachedEvidence,
-                                        cleanDraftMedia
+                                        cleanDraftMedia,
+                                        groupActive,
+                                        finalizedMembers
                                     )
                                 },
                                 modifier = Modifier
@@ -1841,6 +2062,46 @@ fun ReportFormSheet(
                 ) { Text("Save") }
             },
             dismissButton = { TextButton(onClick = { showCustomCheckDialog = false }) { Text("Cancel") } }
+        )
+    }
+
+    if (showGroupClassDialog) {
+        GroupClassAssignmentDialog(
+            members = groupMembers,
+            classOptions = classDropdownOptions,
+            onApplyAll = { chosen ->
+                groupMembers = groupMembers.map {
+                    it.copy(classId = chosen.id, className = chosen.name)
+                }
+                userTouched = true
+            },
+            onUpdateMemberClass = { staffId, chosen ->
+                groupMembers = groupMembers.map {
+                    if (it.staffId == staffId) it.copy(classId = chosen.id, className = chosen.name) else it
+                }
+                userTouched = true
+            },
+            onDismiss = { showGroupClassDialog = false }
+        )
+    }
+
+    if (showGroupSubjectDialog) {
+        GroupSubjectAssignmentDialog(
+            members = groupMembers,
+            subjectOptions = subjects,
+            onApplyAll = { chosen ->
+                groupMembers = groupMembers.map {
+                    it.copy(subjectId = chosen.id, subjectName = chosen.name)
+                }
+                userTouched = true
+            },
+            onUpdateMemberSubject = { staffId, chosen ->
+                groupMembers = groupMembers.map {
+                    if (it.staffId == staffId) it.copy(subjectId = chosen.id, subjectName = chosen.name) else it
+                }
+                userTouched = true
+            },
+            onDismiss = { showGroupSubjectDialog = false }
         )
     }
 }

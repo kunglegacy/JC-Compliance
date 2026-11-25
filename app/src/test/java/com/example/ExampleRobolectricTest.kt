@@ -5,6 +5,14 @@ import org.junit.Assert.assertNotNull
 import org.junit.Test
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Dashboard
+import androidx.compose.ui.graphics.vector.ImageVector
+
+private data class NavItem(
+  val title: String,
+  val route: String,
+  val icon: ImageVector,
+  val subtitle: String
+)
 
 class ComplianceNavigationUnitTest {
 

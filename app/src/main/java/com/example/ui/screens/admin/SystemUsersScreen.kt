@@ -96,7 +96,7 @@ fun SystemUsersScreen(
     currentUserRole: UserRole,
     onUpdateRole: (DirectorateUser, UserRole) -> Unit,
     onToggleStatus: (DirectorateUser) -> Unit,
-    onUpdateEmail: (DirectorateUser, String) -> Unit,
+    onUpdateName: (DirectorateUser, String) -> Unit,
     onForceResetPassword: (DirectorateUser) -> Unit,
     onProvisionUser: (email: String, password: String, name: String, staffNo: String, role: UserRole, () -> Unit) -> Unit,
     onResolveSignedUrl: (suspend (String) -> Result<String>)? = null,
@@ -110,7 +110,7 @@ fun SystemUsersScreen(
 
     var search by remember { mutableStateOf("") }
     var roleFilter by remember { mutableStateOf("ALL") }
-    var editingEmailUser by remember { mutableStateOf<DirectorateUser?>(null) }
+    var editingNameUser by remember { mutableStateOf<DirectorateUser?>(null) }
     var showProvisionDialog by remember { mutableStateOf(false) }
 
     val showSummaryStrip by remember {
@@ -365,7 +365,7 @@ fun SystemUsersScreen(
                             onResolveSignedUrl = onResolveSignedUrl,
                             onGetMediaHeaders = onGetMediaHeaders,
                             onUpdateRole = { role -> onUpdateRole(user, role) },
-                            onEditEmail = { editingEmailUser = user },
+                            onEditName = { editingNameUser = user },
                             onResetPassword = { onForceResetPassword(user) },
                             onToggleStatus = { onToggleStatus(user) }
                         )
@@ -375,51 +375,53 @@ fun SystemUsersScreen(
         }
     }
 
-    // Update Email Dialog
-    editingEmailUser?.let { target ->
-        var newEmail by remember(target.userId) { mutableStateOf(target.email) }
-        val emailValid = newEmail.trim().contains("@") && newEmail.trim().contains(".")
+    // Update Officer Name Dialog
+    editingNameUser?.let { target ->
+        var newName by remember(target.userId) { mutableStateOf(target.displayName) }
+        val cleanName = newName.trim()
         AlertDialog(
-            onDismissRequest = { editingEmailUser = null },
+            onDismissRequest = { editingNameUser = null },
             containerColor = if (p.isDark) Color(0xFF151923) else Color(0xFFF6F8FC),
             titleContentColor = p.textPrimary,
             textContentColor = p.textSecondary,
             title = {
-                Text("Update Officer Email", fontWeight = FontWeight.Bold)
+                Text("Update Officer Name", fontWeight = FontWeight.Bold)
             },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "Updating login email for ${target.displayName}.",
+                        text = "Updating display name for ${target.email}.",
                         fontSize = 13.sp,
                         color = p.textSecondary
                     )
                     OutlinedTextField(
-                        value = newEmail,
-                        onValueChange = { newEmail = it },
-                        label = { Text("Institutional Email") },
+                        value = newName,
+                        onValueChange = { newName = it },
+                        label = { Text("Officer Full Name") },
                         singleLine = true,
                         colors = glassFieldColors(),
                         shape = RoundedCornerShape(14.dp),
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("edit_user_name_input")
                     )
                 }
             },
             confirmButton = {
                 Button(
-                    enabled = emailValid && newEmail.trim() != target.email.trim(),
+                    enabled = cleanName.isNotBlank() && cleanName != target.displayName.trim(),
                     colors = ButtonDefaults.buttonColors(containerColor = p.tangerine, contentColor = Color.White),
                     shape = RoundedCornerShape(12.dp),
                     onClick = {
-                        onUpdateEmail(target, newEmail.trim())
-                        editingEmailUser = null
+                        onUpdateName(target, cleanName)
+                        editingNameUser = null
                     }
                 ) {
                     Text("Update", fontWeight = FontWeight.SemiBold)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { editingEmailUser = null }) {
+                TextButton(onClick = { editingNameUser = null }) {
                     Text("Cancel", color = p.textSecondary)
                 }
             }
@@ -654,7 +656,7 @@ private fun DirectorateUserGlassCard(
     onResolveSignedUrl: (suspend (String) -> Result<String>)?,
     onGetMediaHeaders: ((String) -> Map<String, String>)?,
     onUpdateRole: (UserRole) -> Unit,
-    onEditEmail: () -> Unit,
+    onEditName: () -> Unit,
     onResetPassword: () -> Unit,
     onToggleStatus: () -> Unit
 ) {
@@ -819,19 +821,20 @@ private fun DirectorateUserGlassCard(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    // Edit Email
+                    // Edit Name
                     Box(
                         modifier = Modifier
                             .size(36.dp)
                             .clip(CircleShape)
                             .background(p.trackFill)
                             .border(1.dp, p.borderBottom, CircleShape)
-                            .clickable(onClick = onEditEmail),
+                            .clickable(onClick = onEditName)
+                            .testTag("edit_user_name_${user.userId}"),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
                             imageVector = Icons.Rounded.Edit,
-                            contentDescription = "Edit Email",
+                            contentDescription = "Edit Name",
                             tint = p.textPrimary,
                             modifier = Modifier.size(16.dp)
                         )

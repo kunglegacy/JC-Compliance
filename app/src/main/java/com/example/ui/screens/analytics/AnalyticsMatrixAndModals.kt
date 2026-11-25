@@ -27,24 +27,14 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Description
-import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.PendingActions
-import androidx.compose.material.icons.filled.PictureAsPdf
-import androidx.compose.material.icons.filled.Slideshow
-import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.VolunteerActivism
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -73,13 +63,11 @@ import com.example.data.model.AuthoritativeGrandTotals
 import com.example.data.model.CategorySectionMatrix
 import com.example.data.model.DrillDownAnalytics
 import com.example.data.model.DrillDownContext
-import com.example.data.model.PptxSlideConfig
 import com.example.data.model.ReportScope
 import com.example.ui.components.GlassCard
 import com.example.ui.components.GlowingPrimaryButton
 import com.example.ui.components.MicroLabel
 import com.example.ui.theme.ComplianceTheme
-import java.util.Locale
 
 @Composable
 fun CdsDivisionAnalysisPanel(
@@ -538,301 +526,43 @@ private fun ApplyModalWindowBlur(
 @Composable
 fun AnalysisExportSection(
     isAdmin: Boolean,
-    isCorrupt: Boolean,
     selectedTerm: String,
-    sessionLabel: String,
-    periodLabel: String,
     startDate: String,
     endDate: String,
-    slideConfig: PptxSlideConfig,
-    isExportingPptx: Boolean,
-    pptxExportSuccess: String?,
-    pptxExportError: String?,
-    onOpenSlideConfig: () -> Unit,
-    onGeneratePptx: () -> Unit,
     onExportDossier: (ReportScope, String, String, String, String) -> Unit
 ) {
-    val ext = ComplianceTheme.extended
-    val p = ComplianceTheme.palette
-    val primary = MaterialTheme.colorScheme.primary
-    var exportFormat by remember { mutableStateOf("PDF") }
+    GlassCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 26.dp, contentPadding = 18.dp) {
+        MicroLabel(if (isAdmin) "Audit Deliverable Studio" else "Personal Export Studio")
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = if (isAdmin) "Export Official Dossier (DOCX)" else "Export My Exceptions Dossier (DOCX)",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.ExtraBold,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+        Text(
+            text = if (isAdmin) {
+                "Generates an editable Word (.docx) dossier covering the active term and date window."
+            } else {
+                "Generates an editable Word (.docx) dossier covering your submitted exceptions for this window."
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(14.dp))
 
-    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        if (isAdmin) {
-            GlassCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 26.dp, contentPadding = 18.dp) {
-                AnalyticsSectionHeader(
-                    icon = Icons.Default.Slideshow,
-                    tint = ext.indigo,
-                    eyebrow = "Executive Presentation Suite",
-                    title = "Official PowerPoint Deck (.pptx)",
-                    subtitle = "$sessionLabel • $selectedTerm • $periodLabel"
-                )
-                Spacer(Modifier.height(12.dp))
-
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(p.trackFill)
-                        .border(1.dp, ext.glassRimEnd, RoundedCornerShape(14.dp))
-                        .padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    Text("ACTIVE SLIDE HEADINGS", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.ExtraBold, color = ext.indigo)
-                    Text("S2: ${slideConfig.slide2Heading}", style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text("S3: ${slideConfig.slide3Heading}", style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text("S4: ${slideConfig.slide4Heading}", style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text("S5: ${slideConfig.slide5Heading}", style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
-
-                if (!pptxExportError.isNullOrBlank()) {
-                    Spacer(Modifier.height(10.dp))
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(ext.rose.copy(alpha = 0.14f))
-                            .border(1.dp, ext.rose.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
-                            .padding(10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Icon(Icons.Default.ErrorOutline, null, tint = ext.rose, modifier = Modifier.size(18.dp))
-                        Text(pptxExportError, style = MaterialTheme.typography.bodySmall, color = ext.rose)
-                    }
-                } else if (!pptxExportSuccess.isNullOrBlank()) {
-                    Spacer(Modifier.height(10.dp))
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(ext.emerald.copy(alpha = 0.14f))
-                            .border(1.dp, ext.emerald.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
-                            .padding(10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Icon(Icons.Default.CheckCircle, null, tint = ext.emerald, modifier = Modifier.size(18.dp))
-                        Text(pptxExportSuccess, style = MaterialTheme.typography.bodySmall, color = ext.emerald)
-                    }
-                }
-
-                Spacer(Modifier.height(12.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    OutlinedButton(
-                        onClick = onOpenSlideConfig,
-                        enabled = !isCorrupt && !isExportingPptx,
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(48.dp)
-                            .testTag("analytics_configure_slides_button")
-                    ) {
-                        Icon(Icons.Default.Tune, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text("Configure Slides", maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    }
-
-                    Button(
-                        onClick = onGeneratePptx,
-                        enabled = !isCorrupt && !isExportingPptx,
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(48.dp)
-                            .testTag("analytics_generate_pptx_button")
-                    ) {
-                        if (isExportingPptx) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(18.dp),
-                                strokeWidth = 2.dp,
-                                color = MaterialTheme.colorScheme.onPrimary
-                            )
-                            Spacer(Modifier.width(6.dp))
-                            Text("Building...")
-                        } else {
-                            Icon(Icons.Default.Slideshow, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("Generate .pptx")
-                        }
-                    }
-                }
-            }
-        }
-
-        GlassCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 26.dp, contentPadding = 18.dp) {
-            MicroLabel(if (isAdmin) "Audit Deliverable Studio" else "Personal Export Studio")
-            Spacer(Modifier.height(4.dp))
-            Text(
-                text = if (isAdmin) "Export Official Dossier (PDF / DOCX)" else "Export My Exceptions Dossier",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.ExtraBold,
-                color = MaterialTheme.colorScheme.onSurface
+        GlowingPrimaryButton(
+            onClick = { onExportDossier(ReportScope.ALL, "DOCX", selectedTerm, startDate, endDate) },
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("analytics_export_report_button")
+        ) {
+            Icon(
+                imageVector = Icons.Default.Description,
+                contentDescription = null
             )
-            Text(
-                text = if (isAdmin) {
-                    "Generates an official 6-column landscape PDF or editable Word (.docx) dossier covering the active term and date window."
-                } else {
-                    "Generates a landscape PDF or editable Word (.docx) dossier covering your submitted exceptions for this window."
-                },
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Spacer(Modifier.height(12.dp))
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(ext.glassBottom)
-                    .border(1.dp, ext.glassRimEnd, RoundedCornerShape(14.dp))
-                    .padding(4.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                listOf(
-                    Triple("PDF", Icons.Default.PictureAsPdf, ext.rose),
-                    Triple("DOCX", Icons.Default.Description, primary)
-                ).forEach { (fmt, icon, accent) ->
-                    val selected = exportFormat == fmt
-                    Row(
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(44.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(if (selected) accent.copy(alpha = 0.18f) else Color.Transparent)
-                            .border(
-                                width = if (selected) 1.dp else 0.dp,
-                                color = if (selected) accent.copy(alpha = 0.5f) else Color.Transparent,
-                                shape = RoundedCornerShape(10.dp)
-                            )
-                            .clickable { exportFormat = fmt }
-                            .testTag("analytics_format_${fmt.lowercase(Locale.US)}"),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.Center
-                    ) {
-                        Icon(
-                            imageVector = icon,
-                            contentDescription = fmt,
-                            tint = if (selected) accent else MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            text = fmt,
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.Bold,
-                            color = if (selected) accent else MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(14.dp))
-
-            GlowingPrimaryButton(
-                onClick = { onExportDossier(ReportScope.ALL, exportFormat, selectedTerm, startDate, endDate) },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("analytics_export_report_button")
-            ) {
-                Icon(
-                    imageVector = if (exportFormat == "DOCX") Icons.Default.Description else Icons.Default.PictureAsPdf,
-                    contentDescription = null
-                )
-                Spacer(Modifier.width(8.dp))
-                Text("Generate & Share $exportFormat Report", fontWeight = FontWeight.ExtraBold)
-            }
+            Spacer(Modifier.width(8.dp))
+            Text("Generate & Share DOCX Report", fontWeight = FontWeight.ExtraBold)
         }
     }
-}
-
-@Composable
-fun SlideConfigDialog(
-    initialConfig: PptxSlideConfig,
-    sessionLabel: String,
-    selectedTerm: String,
-    periodLabel: String,
-    onDismiss: () -> Unit,
-    onSaveAndGenerate: (PptxSlideConfig) -> Unit
-) {
-    var s2 by remember { mutableStateOf(initialConfig.slide2Heading) }
-    var s3 by remember { mutableStateOf(initialConfig.slide3Heading) }
-    var s4 by remember { mutableStateOf(initialConfig.slide4Heading) }
-    var s5 by remember { mutableStateOf(initialConfig.slide5Heading) }
-
-    val updated = PptxSlideConfig(s2.trim(), s3.trim(), s4.trim(), s5.trim())
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = {
-            Column {
-                MicroLabel("PPTX Template Variables")
-                Text(
-                    text = "Configure Presentation Slide Headings",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.ExtraBold
-                )
-                Text(
-                    text = "$sessionLabel • $selectedTerm • $periodLabel",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        },
-        text = {
-            Column(
-                modifier = Modifier.verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                OutlinedTextField(
-                    value = s2,
-                    onValueChange = { s2 = it },
-                    label = { Text("Slide 2 Heading (Comparative Analysis)") },
-                    singleLine = false,
-                    maxLines = 2,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = s3,
-                    onValueChange = { s3 = it },
-                    label = { Text("Slide 3 Heading (Department Breakdown)") },
-                    singleLine = false,
-                    maxLines = 2,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = s4,
-                    onValueChange = { s4 = it },
-                    label = { Text("Slide 4 Heading (Class Analysis)") },
-                    singleLine = false,
-                    maxLines = 2,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = s5,
-                    onValueChange = { s5 = it },
-                    label = { Text("Slide 5 Heading (Category × Section Matrix)") },
-                    singleLine = false,
-                    maxLines = 2,
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = { onSaveAndGenerate(updated) },
-                enabled = updated.isValid,
-                modifier = Modifier.testTag("slide_config_generate_button")
-            ) {
-                Text("Save & Generate .pptx")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Cancel")
-            }
-        }
-    )
 }

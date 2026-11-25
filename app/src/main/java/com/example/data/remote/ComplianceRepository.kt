@@ -15,6 +15,7 @@ import com.example.data.model.ComplianceCheck
 import com.example.data.model.ComplianceDivision
 import com.example.data.model.ComplianceReport
 import com.example.data.model.DirectorateUser
+import com.example.data.model.GroupReportMember
 import com.example.data.model.MobileAppConfig
 import com.example.data.model.ReportResolutionStatus
 import com.example.data.model.StaffMember
@@ -1158,6 +1159,36 @@ class ComplianceRepository(
         }
     }
 
+    suspend fun updateDirectorateUserName(
+        config: SupabaseConfig,
+        token: String,
+        targetUserId: String,
+        newDisplayName: String
+    ): Result<Unit> {
+        val cleanName = newDisplayName.trim()
+        if (cleanName.isBlank()) {
+            return Result.failure(Exception("Officer name cannot be empty."))
+        }
+        val rolePayload = JSONObject().apply {
+            put("display_name", cleanName)
+            put("updated_at", java.time.Instant.now().toString())
+        }
+        val patchRes = requestWithMissingColumnRetry(
+            config,
+            "PATCH",
+            "/rest/v1/user_roles?user_id=eq.${enc(targetUserId)}",
+            rolePayload,
+            token,
+            mapOf("Prefer" to "return=representation")
+        )
+        if (patchRes.isSuccess && api.parseJsonArraySafe(patchRes.body).length() > 0) {
+            return Result.success(Unit)
+        }
+        return Result.failure(
+            Exception(patchRes.errorMessage ?: "Permission denied or officer record not found in user_roles.")
+        )
+    }
+
     suspend fun forceResetDirectoratePassword(
         config: SupabaseConfig,
         token: String,
@@ -1304,6 +1335,41 @@ class ComplianceRepository(
     // ---------------------------------------------------------------------
     // COMPLIANCE REPORTS
     // ---------------------------------------------------------------------
+    data class ReportSyncSignal(
+        val count: Int,
+        val fingerprint: String
+    )
+
+    suspend fun fetchReportSyncSignal(config: SupabaseConfig, session: UserSession): Result<ReportSyncSignal> {
+        val scopePrefix = if (session.role.isAdminOrAbove) {
+            "/rest/v1/compliance_reports"
+        } else {
+            "/rest/v1/compliance_reports?reported_by=eq.${enc(session.userId)}"
+        }
+        val sep = if (scopePrefix.contains("?")) "&" else "?"
+        val query = "${scopePrefix}${sep}select=id,status,is_seen,edited_at,resolved_at,seen_at,created_at&order=created_at.desc"
+        val res = api.requestJson(config, "GET", query, accessToken = session.accessToken)
+        if (!res.isSuccess) {
+            return Result.failure(Exception(res.errorMessage ?: "Unable to check report updates."))
+        }
+        val arr = api.parseJsonArraySafe(res.body)
+        val sb = StringBuilder(arr.length() * 48)
+        sb.append(arr.length()).append('|')
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            sb.append(o.optCleanString("id")).append(':')
+                .append(o.optCleanString("status")).append(':')
+                .append(o.optBoolean("is_seen", false)).append(':')
+                .append(o.optCleanString("edited_at")).append(':')
+                .append(o.optCleanString("resolved_at")).append(':')
+                .append(o.optCleanString("seen_at")).append(';')
+        }
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(sb.toString().toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+        return Result.success(ReportSyncSignal(count = arr.length(), fingerprint = "${arr.length()}:$digest"))
+    }
+
     suspend fun fetchReports(config: SupabaseConfig, session: UserSession): Result<List<ComplianceReport>> {
         val query = if (session.role.isAdminOrAbove) {
             "/rest/v1/compliance_reports?select=*&order=created_at.desc"
@@ -1363,6 +1429,19 @@ class ComplianceRepository(
         val parsedEvidenceNotes = parseJsonStringList(o.optJSONArray("evidence_notes")).ifEmpty {
             resNotes?.lines()?.map { it.trim() }?.filter { it.startsWith("[Evidence") }.orEmpty()
         }
+        val parsedExceptionTags = parseJsonStringList(o.optJSONArray("exception_tags")).ifEmpty {
+            val rawTags = o.optCleanString("exception_tags")
+            if (rawTags.startsWith("[")) {
+                parseJsonStringList(runCatching { JSONArray(rawTags) }.getOrNull())
+            } else {
+                emptyList()
+            }
+        }
+        val parsedGroupMembers = parseGroupMembers(o, parsedExceptionTags)
+        val staffCodeVal = o.optCleanString("staff_code").takeIf { it.isNotBlank() }
+        val isGroupReportVal = o.optBoolean("is_group_report", false) ||
+            parsedGroupMembers.isNotEmpty() ||
+            staffCodeVal?.startsWith("GROUP (", ignoreCase = true) == true
 
         return ComplianceReport(
             id = o.optCleanString("id"),
@@ -1375,7 +1454,7 @@ class ComplianceRepository(
             term = o.optCleanString("term").ifBlank { "First Term" },
             staffId = o.optCleanString("staff_id").takeIf { it.isNotBlank() },
             staffName = o.optCleanString("staff_name").takeIf { it.isNotBlank() },
-            staffCode = o.optCleanString("staff_code").takeIf { it.isNotBlank() },
+            staffCode = staffCodeVal,
             staffCategory = o.optCleanString("staff_category").takeIf { it.isNotBlank() },
             staffGroup = o.optCleanString("staff_group").takeIf { it.isNotBlank() },
             role = o.optCleanString("role").takeIf { it.isNotBlank() },
@@ -1385,7 +1464,7 @@ class ComplianceRepository(
             classId = o.optCleanString("class_id").takeIf { it.isNotBlank() },
             className = o.optCleanString("class_name").takeIf { it.isNotBlank() },
             subjectId = o.optCleanString("subject_id").takeIf { it.isNotBlank() },
-            subject = o.optCleanString("subject").takeIf { it.isNotBlank() },
+            subject = o.optCleanString("subject").ifBlank { o.optCleanString("subject_name") }.takeIf { it.isNotBlank() },
             exceptionText = o.optCleanString("exception").ifBlank { o.optCleanString("exception_text") },
             effectText = o.optCleanString("effect").ifBlank { o.optCleanString("effect_text") },
             category = o.optCleanString("category").ifBlank { divStr },
@@ -1411,8 +1490,49 @@ class ComplianceRepository(
             createdAt = o.optCleanString("created_at"),
             schoolSection = o.optCleanString("school_section").takeIf { it.isNotBlank() },
             disciplineGroup = o.optCleanString("discipline_group").takeIf { it.isNotBlank() },
-            session = o.optCleanString("session").takeIf { it.isNotBlank() }
+            session = o.optCleanString("session").takeIf { it.isNotBlank() },
+            isGroupReport = isGroupReportVal,
+            groupMembers = parsedGroupMembers,
+            exceptionTags = parsedExceptionTags
         )
+    }
+
+    private fun parseGroupMembers(
+        o: JSONObject,
+        exceptionTags: List<String>
+    ): List<GroupReportMember> {
+        val directArr = o.optJSONArray("group_members") ?: run {
+            val raw = o.optCleanString("group_members")
+            if (raw.startsWith("[")) runCatching { JSONArray(raw) }.getOrNull() else null
+        }
+        val fallbackArr = if (directArr == null || directArr.length() == 0) {
+            val tag = exceptionTags.firstOrNull { it.startsWith("__GROUP_REPORT_MEMBERS__:") }
+            val jsonPart = tag?.removePrefix("__GROUP_REPORT_MEMBERS__:")?.trim()
+            if (!jsonPart.isNullOrBlank()) runCatching { JSONArray(jsonPart) }.getOrNull() else null
+        } else {
+            directArr
+        }
+        if (fallbackArr == null) return emptyList()
+        return buildList {
+            for (i in 0 until fallbackArr.length()) {
+                val m = fallbackArr.optJSONObject(i) ?: continue
+                val staffId = m.optCleanString("staff_id")
+                val staffName = m.optCleanString("staff_name")
+                if (staffId.isBlank() && staffName.isBlank()) continue
+                add(
+                    GroupReportMember(
+                        staffId = staffId,
+                        staffName = staffName,
+                        staffCode = m.optCleanString("staff_code"),
+                        staffGroup = m.optCleanString("staff_group"),
+                        classId = m.optCleanString("class_id").ifBlank { "NONE" },
+                        className = m.optCleanString("class_name").ifBlank { "None" },
+                        subjectId = m.optCleanString("subject_id").takeIf { it.isNotBlank() },
+                        subjectName = m.optCleanString("subject_name")
+                    )
+                )
+            }
+        }
     }
 
     private fun parseJsonStringList(arr: JSONArray?): List<String> {
@@ -1436,10 +1556,11 @@ class ComplianceRepository(
         val current = JSONObject(payload.toString())
         val optionalCols = listOf(
             "role", "staff_group", "department", "assigned_location", "staff_category",
-            "check_id", "class_id", "subject_id", "reporter_id", "reporting_officer",
+            "check_id", "class_id", "subject_id", "subject_name", "reporter_id", "reporting_officer",
             "evidence_name", "evidence_urls", "evidence_types", "evidence_notes",
             "pending_at", "pending_by", "is_edited", "edited_at",
-            "date", "exception_text", "effect_text", "violation_level"
+            "date", "exception_text", "effect_text", "violation_level",
+            "is_group_report", "group_members", "exception_tags"
         )
         var res = api.requestJson(
             config,

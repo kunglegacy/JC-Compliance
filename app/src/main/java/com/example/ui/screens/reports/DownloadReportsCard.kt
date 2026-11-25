@@ -205,7 +205,7 @@ fun DownloadReportsCard(
             term = selectedTerm,
             startDate = activeDateBounds.start,
             endDate = activeDateBounds.end
-        )
+        ).filter { ReportExportData.isExportEligible(it) }
     }
 
     val visibleScopeItems = remember(filteredReports, staffMap) {
@@ -1040,5 +1040,5 @@ private fun iconForScope(scope: ReportScope): ImageVector = when (scope) {
     ReportScope.MINDERS -> Icons.Rounded.Visibility
     ReportScope.HOSTEL_KITCHEN -> Icons.Rounded.Restaurant
     ReportScope.CDS -> Icons.Rounded.Dns
-    ReportScope.ALL, ReportScope.ACADEMIC -> Icons.Rounded.Layers
+    ReportScope.ALL, ReportScope.ACADEMIC, ReportScope.OPERATIONS -> Icons.Rounded.Layers
 }

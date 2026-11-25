@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
@@ -27,14 +28,18 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import android.app.DatePickerDialog
 import androidx.compose.foundation.clickable
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Assessment
 import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -48,25 +53,31 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import java.util.Calendar
 import java.util.Locale
 import com.example.data.model.ComplianceReport
 import com.example.data.model.OfficerMetric
 import com.example.data.model.OfficerSortOption
+import com.example.data.model.ReportResolutionStatus
 import com.example.domain.AnalysisEngine
 import com.example.ui.components.AtmosphericGlassBackground
+import com.example.ui.components.EditedBadgePill
 import com.example.ui.components.EmptyStatePanel
 import com.example.ui.components.GlassCard
 import com.example.ui.components.MicroLabel
+import com.example.ui.components.ResolutionBadge
 import com.example.ui.components.SearchInputBar
+import com.example.ui.components.SeenBadge
 import com.example.ui.components.SubScreenTopRow
-import com.example.ui.components.glassFieldColors
 import com.example.ui.theme.ComplianceTheme
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OfficerAnalyticsScreen(
     reports: List<ComplianceReport>,
+    onSelectReport: (ComplianceReport) -> Unit,
     onBack: () -> Unit
 ) {
     BackHandler { onBack() }
@@ -76,6 +87,7 @@ fun OfficerAnalyticsScreen(
     var toDate by remember { mutableStateOf("") }
     var search by remember { mutableStateOf("") }
     var sortOption by remember { mutableStateOf(OfficerSortOption.HIGHEST_TOTAL) }
+    var selectedOfficerKey by remember { mutableStateOf<String?>(null) }
 
     val officers = remember(reports, fromDate, toDate, search, sortOption) {
         AnalysisEngine.calculateOfficerMetrics(
@@ -85,6 +97,9 @@ fun OfficerAnalyticsScreen(
             searchQuery = search,
             sortOption = sortOption
         )
+    }
+    val selectedOfficer = remember(officers, selectedOfficerKey) {
+        selectedOfficerKey?.let { key -> officers.firstOrNull { it.officerKey == key } }
     }
 
     AtmosphericGlassBackground {
@@ -195,7 +210,211 @@ fun OfficerAnalyticsScreen(
                     }
                 } else {
                     items(officers, key = { it.officerKey }) { officer ->
-                        OfficerStatCard(officer)
+                        OfficerStatCard(
+                            officer = officer,
+                            onClick = { selectedOfficerKey = officer.officerKey }
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    selectedOfficer?.let { officer ->
+        OfficerExceptionsDrillDownSheet(
+            officer = officer,
+            fromDate = fromDate,
+            toDate = toDate,
+            onDismiss = { selectedOfficerKey = null },
+            onSelectReport = { report ->
+                selectedOfficerKey = null
+                onSelectReport(report)
+            }
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun OfficerExceptionsDrillDownSheet(
+    officer: OfficerMetric,
+    fromDate: String,
+    toDate: String,
+    onDismiss: () -> Unit,
+    onSelectReport: (ComplianceReport) -> Unit
+) {
+    val ext = ComplianceTheme.extended
+    var statusFilter by remember(officer.officerKey) { mutableStateOf("ALL") }
+
+    val dateScopeLabel = remember(fromDate, toDate) {
+        when {
+            fromDate.isNotBlank() && toDate.isNotBlank() -> "$fromDate to $toDate"
+            fromDate.isNotBlank() -> "From $fromDate"
+            toDate.isNotBlank() -> "Up to $toDate"
+            else -> "All Dates"
+        }
+    }
+
+    val filteredReports = remember(officer.reports, statusFilter) {
+        when (statusFilter) {
+            "SEEN" -> officer.reports.filter { it.isSeen }
+            "UNSEEN" -> officer.reports.filter { !it.isSeen }
+            "REJECTED" -> officer.reports.filter { it.status == ReportResolutionStatus.REJECTED }
+            else -> officer.reports
+        }
+    }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        containerColor = if (ext.isDark) Color(0xFF131720) else Color(0xFFF4F7FB),
+        contentColor = MaterialTheme.colorScheme.onSurface
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    MicroLabel("Directorate Submissions • $dateScopeLabel")
+                    Text(
+                        text = officer.officerName,
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (officer.officerEmail.isNotBlank()) {
+                        Text(
+                            text = officer.officerEmail,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+                Column(horizontalAlignment = Alignment.End) {
+                    MicroLabel("Filtered")
+                    Text(
+                        text = "${filteredReports.size}",
+                        style = MaterialTheme.typography.headlineSmall.merge(TextStyle(fontFeatureSettings = "tnum")),
+                        fontWeight = FontWeight.ExtraBold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                listOf(
+                    "ALL" to "All (${officer.totalReports})",
+                    "SEEN" to "Seen (${officer.seenCount})",
+                    "UNSEEN" to "Unseen (${officer.unseenCount})",
+                    "REJECTED" to "Rejected (${officer.rejectedCount})"
+                ).forEach { (key, label) ->
+                    val selected = statusFilter == key
+                    Surface(
+                        onClick = { statusFilter = key },
+                        shape = CircleShape,
+                        color = if (selected) MaterialTheme.colorScheme.primary else ext.glassBottom,
+                        contentColor = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
+                        border = BorderStroke(1.dp, if (selected) MaterialTheme.colorScheme.primary else ext.glassRimEnd),
+                        modifier = Modifier.testTag("officer_drilldown_filter_${key.lowercase()}")
+                    ) {
+                        Text(
+                            text = label,
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.padding(horizontal = 13.dp, vertical = 7.dp)
+                        )
+                    }
+                }
+            }
+
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(420.dp),
+                contentPadding = PaddingValues(top = 4.dp, bottom = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                if (filteredReports.isEmpty()) {
+                    item {
+                        EmptyStatePanel(
+                            icon = Icons.Default.Assessment,
+                            title = "No Exceptions in Filter",
+                            subtitle = "No submissions match this status within $dateScopeLabel."
+                        )
+                    }
+                } else {
+                    items(filteredReports, key = { it.id }) { report ->
+                        GlassCard(
+                            onClick = { onSelectReport(report) },
+                            cornerRadius = 20.dp,
+                            contentPadding = 14.dp,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("officer_exception_row_${report.id}")
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                MicroLabel("${report.incidentDate} • ${report.division}")
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    if (report.isEdited) EditedBadgePill()
+                                    SeenBadge(isSeen = report.isSeen, isPending = report.isPending)
+                                    ResolutionBadge(report.status)
+                                }
+                            }
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                text = report.complianceCheck.ifBlank { report.category.ifBlank { "Compliance Exception" } },
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            val targetLabel = listOfNotNull(
+                                report.staffName?.takeIf { it.isNotBlank() },
+                                report.className?.takeIf { it.isNotBlank() },
+                                report.subject?.takeIf { it.isNotBlank() }
+                            ).joinToString(" • ")
+                            if (targetLabel.isNotBlank()) {
+                                Text(
+                                    text = targetLabel,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            if (report.exceptionText.isNotBlank()) {
+                                Spacer(Modifier.height(4.dp))
+                                Text(
+                                    text = report.exceptionText,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -204,14 +423,24 @@ fun OfficerAnalyticsScreen(
 }
 
 @Composable
-private fun OfficerStatCard(officer: OfficerMetric) {
+private fun OfficerStatCard(
+    officer: OfficerMetric,
+    onClick: () -> Unit
+) {
     val ext = ComplianceTheme.extended
     val total = officer.totalReports.coerceAtLeast(1).toFloat()
     val seenWeight = officer.seenCount.toFloat() / total
     val unseenWeight = officer.unseenCount.toFloat() / total
     val rejectedWeight = officer.rejectedCount.toFloat() / total
 
-    GlassCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 24.dp, contentPadding = 16.dp) {
+    GlassCard(
+        onClick = onClick,
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("officer_stat_card_${officer.officerKey}"),
+        cornerRadius = 24.dp,
+        contentPadding = 16.dp
+    ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -232,13 +461,24 @@ private fun OfficerStatCard(officer: OfficerMetric) {
                     )
                 }
             }
-            Column(horizontalAlignment = Alignment.End) {
-                MicroLabel("Total")
-                Text(
-                    text = "${officer.totalReports}",
-                    style = MaterialTheme.typography.headlineSmall.merge(TextStyle(fontFeatureSettings = "tnum")),
-                    fontWeight = FontWeight.ExtraBold,
-                    color = MaterialTheme.colorScheme.primary
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Column(horizontalAlignment = Alignment.End) {
+                    MicroLabel("Total")
+                    Text(
+                        text = "${officer.totalReports}",
+                        style = MaterialTheme.typography.headlineSmall.merge(TextStyle(fontFeatureSettings = "tnum")),
+                        fontWeight = FontWeight.ExtraBold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+                Icon(
+                    imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                    contentDescription = "View ${officer.officerName} exceptions",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(20.dp)
                 )
             }
         }

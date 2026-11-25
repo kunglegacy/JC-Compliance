@@ -76,6 +76,7 @@ import com.example.ui.components.StatusGlassChip
 import com.example.ui.components.complianceGlassCard
 import com.example.ui.theme.ComplianceTheme
 import com.example.ui.theme.JCBestTheme
+import com.example.ui.theme.LocalBottomFooterClearance
 import com.example.ui.theme.LocalCompliancePalette
 
 @Composable
@@ -134,7 +135,7 @@ fun OverviewScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .statusBarsPadding(),
-            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 112.dp),
+            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = LocalBottomFooterClearance.current),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             // Compact greeting header row
@@ -383,7 +384,13 @@ fun RecentReportCard(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            MicroLabel("${resolvedDivision.label} • ${report.incidentDate}")
+            MicroLabel(
+                if (report.isGroupReport && report.groupMembers.isNotEmpty()) {
+                    "${resolvedDivision.label} • GROUP (${report.groupMembers.size}) • ${report.incidentDate}"
+                } else {
+                    "${resolvedDivision.label} • ${report.incidentDate}"
+                }
+            )
             Row(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically

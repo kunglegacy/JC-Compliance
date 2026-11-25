@@ -146,7 +146,41 @@ fun ReportDetailSheet(
                 MicroLabel("Compliance Check Cited")
                 Spacer(Modifier.height(4.dp))
                 Text(report.complianceCheck, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                if (!report.className.isNullOrBlank() || !report.subject.isNullOrBlank()) {
+                if (report.isGroupReport && report.groupMembers.isNotEmpty()) {
+                    Spacer(Modifier.height(10.dp))
+                    MicroLabel("Combined Group Members (${report.groupMembers.size})")
+                    Spacer(Modifier.height(6.dp))
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        report.groupMembers.forEach { member ->
+                            Surface(
+                                color = ext.glassBottom,
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, ext.glassRimEnd),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = if (member.staffGroup.isNotBlank()) "${member.staffName} (${member.staffGroup})" else member.staffName,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                        Text(
+                                            text = "Class: ${member.className.ifBlank { "None" }} • Subject: ${member.subjectName.ifBlank { "—" }}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if (!report.className.isNullOrBlank() || !report.subject.isNullOrBlank()) {
                     Spacer(Modifier.height(6.dp))
                     Text(
                         text = listOfNotNull(report.className, report.subject).joinToString(" • "),
@@ -259,7 +293,7 @@ fun ReportDetailSheet(
 
             // Action Controls
             val canEdit = userRole.isSuperAdmin || (showEditButton && isOwnReport && report.canUserEdit)
-            if (showEditButton || userRole.isAdminOrAbove) {
+            if (showEditButton || userRole.isSuperAdmin) {
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     if (showEditButton) {
                         OutlinedButton(
@@ -286,39 +320,39 @@ fun ReportDetailSheet(
                         }
                     }
 
-                if (userRole.isAdminOrAbove) {
-                    val markAsReviewed = !report.isSeen || report.isPending
-                    Button(
-                        onClick = { onToggleSeen(report) },
-                        shape = CircleShape,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (markAsReviewed) ext.emerald else ext.amber,
-                            contentColor = if (ext.isDark) Color(0xFF0A0C10) else Color.White
-                        ),
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(48.dp)
-                            .testTag("toggle_seen_button")
-                    ) {
-                        Icon(if (markAsReviewed) Icons.Default.Visibility else Icons.Default.VisibilityOff, contentDescription = null)
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            text = when {
-                                report.isPending -> "Accept & Mark Seen"
-                                report.isSeen -> "Mark Unseen"
-                                else -> "Mark Seen"
-                            },
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1
-                        )
+                    if (userRole.isSuperAdmin) {
+                        val markAsReviewed = !report.isSeen || report.isPending
+                        Button(
+                            onClick = { onToggleSeen(report) },
+                            shape = CircleShape,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (markAsReviewed) ext.emerald else ext.amber,
+                                contentColor = if (ext.isDark) Color(0xFF0A0C10) else Color.White
+                            ),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .testTag("toggle_seen_button")
+                        ) {
+                            Icon(if (markAsReviewed) Icons.Default.Visibility else Icons.Default.VisibilityOff, contentDescription = null)
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = when {
+                                    report.isPending -> "Accept & Mark Seen"
+                                    report.isSeen -> "Mark Unseen"
+                                    else -> "Mark Seen"
+                                },
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1
+                            )
+                        }
                     }
                 }
             }
-            }
 
-            if (userRole.isAdminOrAbove) {
+            if (userRole.isSuperAdmin) {
                 HorizontalDivider(color = ext.glassRimEnd)
-                MicroLabel("Admin Moderation & Status")
+                MicroLabel("Super Admin Moderation & Status")
 
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(
@@ -442,7 +476,7 @@ fun ReportDetailSheet(
             evidenceName = report.evidenceName ?: report.complianceCheck,
             inspectorName = report.reporterName.ifBlank { "Compliance Officer" },
             items = viewerItems,
-            showModerationControls = userRole.isAdminOrAbove,
+            showModerationControls = userRole.isSuperAdmin,
             onResolveSignedUrl = onResolveSignedUrl,
             onResolveHeaders = onResolveMediaHeaders,
             onDownloadEvidence = onDownloadEvidence?.let { handler ->
@@ -461,7 +495,7 @@ fun ReportDetailSheet(
                         }
                     }
                 }
-                if (userRole.isAdminOrAbove) {
+                if (userRole.isSuperAdmin) {
                     onSaveEvidenceFeedback(report, idx, verdict, note)
                 }
             },

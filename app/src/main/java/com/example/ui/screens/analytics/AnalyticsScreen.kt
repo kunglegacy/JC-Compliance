@@ -33,7 +33,6 @@ import com.example.data.local.AcademicWeekEngine
 import com.example.data.model.ComplianceDivision
 import com.example.data.model.ComplianceReport
 import com.example.data.model.DrillDownContext
-import com.example.data.model.PptxSlideConfig
 import com.example.data.model.ReportScope
 import com.example.data.model.SeverityLevel
 import com.example.data.model.StaffMember
@@ -44,6 +43,7 @@ import com.example.domain.AnalysisEngine
 import com.example.domain.AuthoritativeAnalysisBuilder
 import com.example.ui.components.AtmosphericGlassBackground
 import com.example.ui.theme.ComplianceTheme
+import com.example.ui.theme.LocalBottomFooterClearance
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -57,20 +57,9 @@ fun AnalyticsScreen(
     systemSettings: SystemSettings = SystemSettings(),
     selectedTerm: String,
     isRefreshing: Boolean = false,
-    isExportingPptx: Boolean = false,
-    pptxExportSuccess: String? = null,
-    pptxExportError: String? = null,
     onSelectTerm: (String) -> Unit,
     onSyncDatabase: () -> Unit = {},
     onExportReport: (ReportScope, String, String, String, String) -> Unit,
-    onExportPptx: (
-        term: String,
-        sessionLabel: String,
-        reportingPeriod: String,
-        slideConfig: PptxSlideConfig,
-        filteredExceptions: List<ComplianceReport>
-    ) -> Unit = { _, _, _, _, _ -> },
-    onClearPptxStatus: () -> Unit = {},
     userRole: UserRole = UserRole.ADMIN,
     currentUserId: String = ""
 ) {
@@ -87,8 +76,6 @@ fun AnalyticsScreen(
     var customEnd by remember { mutableStateOf("") }
     var activeJumpKey by remember { mutableStateOf("summary") }
     var drillDownContext by remember { mutableStateOf<DrillDownContext?>(null) }
-    var showSlideConfigDialog by remember { mutableStateOf(false) }
-    var slideConfig by remember(selectedTerm) { mutableStateOf(PptxSlideConfig.forTerm(selectedTerm)) }
 
     val (startDate, endDate, periodLabel) = remember(datePreset, customStart, customEnd, selectedTerm) {
         when (datePreset) {
@@ -119,10 +106,6 @@ fun AnalyticsScreen(
             }
             else -> Triple("", "", if (selectedTerm == "ALL") "All Recorded Terms" else "Full $selectedTerm")
         }
-    }
-
-    LaunchedEffect(selectedTerm, datePreset) {
-        onClearPptxStatus()
     }
 
     val analysis = remember(scopedReports, staffList, snapshots, selectedTerm, sessionLabel, periodLabel, startDate, endDate) {
@@ -338,7 +321,7 @@ fun AnalyticsScreen(
     }
 
     val p = ComplianceTheme.palette
-    val hasOverlay = drillDownContext != null || showSlideConfigDialog
+    val hasOverlay = drillDownContext != null
     val overlayBlurRadius by animateDpAsState(
         targetValue = if (hasOverlay) 20.dp else 0.dp,
         animationSpec = tween(durationMillis = 220),
@@ -357,7 +340,7 @@ fun AnalyticsScreen(
                     .widthIn(max = 860.dp)
                     .then(if (overlayBlurRadius > 0.dp) Modifier.blur(overlayBlurRadius) else Modifier)
                     .statusBarsPadding(),
-                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 124.dp),
+                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = LocalBottomFooterClearance.current),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
                 item(key = "hero_header") {
@@ -479,26 +462,9 @@ fun AnalyticsScreen(
                 item(key = "export_studio") {
                     AnalysisExportSection(
                         isAdmin = isAdmin,
-                        isCorrupt = analysis.isCorruptOrUnverified,
                         selectedTerm = selectedTerm,
-                        sessionLabel = sessionLabel,
-                        periodLabel = periodLabel,
                         startDate = startDate,
                         endDate = endDate,
-                        slideConfig = slideConfig,
-                        isExportingPptx = isExportingPptx,
-                        pptxExportSuccess = pptxExportSuccess,
-                        pptxExportError = pptxExportError,
-                        onOpenSlideConfig = { showSlideConfigDialog = true },
-                        onGeneratePptx = {
-                            onExportPptx(
-                                selectedTerm,
-                                sessionLabel,
-                                periodLabel,
-                                slideConfig,
-                                filteredTermReports
-                            )
-                        },
                         onExportDossier = onExportReport
                     )
                 }
@@ -529,27 +495,6 @@ fun AnalyticsScreen(
             context = ctx,
             analytics = drillAnalytics,
             onDismiss = { drillDownContext = null }
-        )
-    }
-
-    if (showSlideConfigDialog) {
-        SlideConfigDialog(
-            initialConfig = slideConfig,
-            sessionLabel = sessionLabel,
-            selectedTerm = selectedTerm,
-            periodLabel = periodLabel,
-            onDismiss = { showSlideConfigDialog = false },
-            onSaveAndGenerate = { updated ->
-                slideConfig = updated
-                showSlideConfigDialog = false
-                onExportPptx(
-                    selectedTerm,
-                    sessionLabel,
-                    periodLabel,
-                    updated,
-                    filteredTermReports
-                )
-            }
         )
     }
 }

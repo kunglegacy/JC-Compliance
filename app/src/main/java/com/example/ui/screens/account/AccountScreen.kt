@@ -52,6 +52,7 @@ import com.example.ui.components.ProfileAvatar
 import com.example.ui.components.StatusPill
 import com.example.ui.components.VideoStyleChecklistRow
 import com.example.ui.theme.ComplianceTheme
+import com.example.ui.theme.LocalBottomFooterClearance
 
 @Composable
 fun AccountScreen(
@@ -76,7 +77,7 @@ fun AccountScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .statusBarsPadding(),
-            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 112.dp),
+            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = LocalBottomFooterClearance.current),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             item {

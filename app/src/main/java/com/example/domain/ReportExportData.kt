@@ -1,11 +1,18 @@
 package com.example.domain
 
 import com.example.data.model.ComplianceReport
+import com.example.data.model.ReportResolutionStatus
 import com.example.data.model.ReportScope
 import com.example.data.model.StaffMember
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+
+data class GroupExportSubRow(
+    val name: String,
+    val className: String,
+    val subject: String
+)
 
 data class NormalizedReportRow(
     val date: String,
@@ -17,7 +24,9 @@ data class NormalizedReportRow(
     val effect: String,
     val driverName: String,
     val busNumber: String,
-    val complianceCheck: String
+    val complianceCheck: String,
+    val isGroup: Boolean = false,
+    val subRows: List<GroupExportSubRow> = emptyList()
 )
 
 data class PreparedExportDataset(
@@ -165,6 +174,56 @@ object ReportExportData {
         val cleanException = record.exceptionText.trim().ifBlank { "—" }
         val cleanEffect = record.effectText.trim().ifBlank { "—" }
 
+        // 7. COMBINED GROUP REPORT SUB-ROWS (Academic multi-staff submissions)
+        if (!isCds && !isTransport && !isOps && record.isGroupReport && record.groupMembers.isNotEmpty()) {
+            val subRows = record.groupMembers.map { m ->
+                val memberStaff = staffMap[m.staffId.lowercase()]
+                    ?: m.staffCode.takeIf { it.isNotBlank() }?.let { staffMap["code:${it.lowercase()}"] }
+                val rawMemberName = m.staffName.trim()
+                    .ifBlank { memberStaff?.name.orEmpty().trim() }
+                    .ifBlank { "—" }
+                val deptLabel = m.staffGroup.trim()
+                    .ifBlank { memberStaff?.let { GroupReportHelpers.resolveStaffDepartment(it) }.orEmpty() }
+                    .ifBlank { "Academic" }
+                val formattedName = if (
+                    rawMemberName != "—" &&
+                    !rawMemberName.contains(deptLabel, ignoreCase = true)
+                ) {
+                    "$rawMemberName ($deptLabel)"
+                } else {
+                    rawMemberName
+                }
+                val formattedClass = m.className.trim().ifBlank { "None" }
+                val formattedSubject = m.subjectName.trim()
+                    .takeUnless {
+                        it.equals("N/A", ignoreCase = true) ||
+                            it.equals("NA", ignoreCase = true) ||
+                            it.equals("General", ignoreCase = true)
+                    }
+                    .orEmpty()
+                    .ifBlank { "—" }
+                GroupExportSubRow(
+                    name = formattedName,
+                    className = formattedClass,
+                    subject = formattedSubject
+                )
+            }
+            return NormalizedReportRow(
+                date = cleanDate,
+                name = subRows.joinToString(", ") { it.name },
+                unit = recordScope,
+                className = subRows.joinToString(", ") { it.className },
+                subject = subRows.joinToString(", ") { it.subject },
+                exception = cleanException,
+                effect = cleanEffect,
+                driverName = extractedDriver.ifBlank { cleanName },
+                busNumber = extractedBus.ifBlank { cleanClass },
+                complianceCheck = rawComplianceCheck.ifBlank { cleanSubject },
+                isGroup = true,
+                subRows = subRows
+            )
+        }
+
         return NormalizedReportRow(
             date = cleanDate,
             name = cleanName,
@@ -208,6 +267,23 @@ object ReportExportData {
         return null
     }
 
+    /**
+     * Audit & Download Eligibility Guard:
+     * Excludes any unverified/problematic record (UNSEEN, not yet marked seen, FLAGGED,
+     * ACTION_REQUIRED, or REJECTED) from official downloadable dossiers.
+     */
+    fun isExportEligible(report: ComplianceReport): Boolean {
+        if (!report.isSeen) return false
+        val review = report.reviewStatus.trim().uppercase(Locale.US)
+        if (review == "UNSEEN" || review == "FLAGGED") return false
+        if (report.status == ReportResolutionStatus.ACTION_REQUIRED ||
+            report.status == ReportResolutionStatus.REJECTED
+        ) {
+            return false
+        }
+        return true
+    }
+
     fun getDownloadRecords(
         scope: ReportScope,
         records: List<ComplianceReport>,
@@ -222,7 +298,7 @@ object ReportExportData {
             startDate = startDate,
             endDate = endDate
         ).filter {
-            AnalysisEngine.recordMatchesScope(it, scope, staffMap)
+            isExportEligible(it) && AnalysisEngine.recordMatchesScope(it, scope, staffMap)
         }.sortedByDescending {
             it.incidentDate.take(10).ifBlank { it.createdAt.take(10) }
         }

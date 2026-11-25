@@ -2,7 +2,11 @@ package com.example.ui.screens.admin
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -21,11 +25,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.RestoreFromTrash
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -35,6 +41,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -43,6 +50,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -61,6 +69,23 @@ import com.example.ui.components.SubScreenTopRow
 import com.example.ui.components.glassFieldColors
 import com.example.ui.theme.ComplianceTheme
 import java.util.UUID
+
+private val AcademicStaffRoles = listOf(
+    "Teacher",
+    "Principal",
+    "Vice Principal",
+    "HOD"
+)
+
+private fun normalizeAcademicRole(raw: String?): String {
+    val clean = raw.orEmpty().trim().lowercase()
+    return when {
+        clean.contains("vice") -> "Vice Principal"
+        clean.contains("principal") -> "Principal"
+        clean == "hod" || clean.contains("head") -> "HOD"
+        else -> "Teacher"
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -86,12 +111,19 @@ fun StaffRegisterScreen(
     var conflictHolder by remember { mutableStateOf<StaffMember?>(null) }
     var pendingSavePair by remember { mutableStateOf<Pair<StaffMember, Boolean>?>(null) }
 
-    val filtered = remember(staffList, showArchived, search) {
-        val q = search.trim().lowercase()
+    val academicStaff = remember(staffList) {
         staffList.filter { s ->
+            !s.department.contains("oper", ignoreCase = true) &&
+                !s.category.equals("Non-Academic", ignoreCase = true)
+        }
+    }
+
+    val filtered = remember(academicStaff, showArchived, search) {
+        val q = search.trim().lowercase()
+        academicStaff.filter { s ->
             val statusOk = if (showArchived) !s.isActive else s.isActive
             val qOk = q.isBlank() || s.name.lowercase().contains(q) || s.staffCode.lowercase().contains(q) ||
-                s.department.lowercase().contains(q) || s.assignedLocation.lowercase().contains(q)
+                s.role.lowercase().contains(q)
             statusOk && qOk
         }
     }
@@ -105,7 +137,7 @@ fun StaffRegisterScreen(
         ) {
             SubScreenTopRow(
                 title = "Staff Register",
-                subtitle = "${staffList.count { it.isActive }} active personnel",
+                subtitle = "${academicStaff.count { it.isActive }} active academic personnel",
                 onBack = onBack,
                 trailing = {
                     Surface(
@@ -133,7 +165,7 @@ fun StaffRegisterScreen(
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                SearchInputBar(value = search, onValueChange = { search = it }, placeholder = "Search name, code, or wing...")
+                SearchInputBar(value = search, onValueChange = { search = it }, placeholder = "Search name, code, or role...")
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf(false to "Active Staff", true to "Archived").forEach { (arch, label) ->
                         val selected = showArchived == arch
@@ -190,7 +222,7 @@ fun StaffRegisterScreen(
                                 Column(modifier = Modifier.weight(1f)) {
                                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                         MonoCodeText(person.staffCode.ifBlank { "NO-CODE" })
-                                        MicroLabel(person.department)
+                                        MicroLabel("Academic")
                                     }
                                     Text(
                                         text = person.name,
@@ -199,7 +231,7 @@ fun StaffRegisterScreen(
                                         color = MaterialTheme.colorScheme.onSurface
                                     )
                                     Text(
-                                        "${person.role} • ${person.assignedLocation.ifBlank { "General Campus" }}",
+                                        text = person.role.ifBlank { "Teacher" },
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -236,27 +268,93 @@ fun StaffRegisterScreen(
     if (showAddEditDialog) {
         var name by remember(editingStaff) { mutableStateOf(editingStaff?.name.orEmpty()) }
         var code by remember(editingStaff) { mutableStateOf(editingStaff?.staffCode.orEmpty()) }
-        var dept by remember(editingStaff) { mutableStateOf(editingStaff?.department ?: "Academic") }
-        var role by remember(editingStaff) { mutableStateOf(editingStaff?.role ?: "Teacher") }
-        var loc by remember(editingStaff) { mutableStateOf(editingStaff?.assignedLocation.orEmpty()) }
+        var role by remember(editingStaff) { mutableStateOf(normalizeAcademicRole(editingStaff?.role)) }
+        var showRoleMenu by remember(editingStaff) { mutableStateOf(false) }
 
         AlertDialog(
             onDismissRequest = { showAddEditDialog = false },
             containerColor = if (ext.isDark) Color(0xFF151923) else Color(0xFFF6F8FC),
             titleContentColor = MaterialTheme.colorScheme.onSurface,
             textContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-            title = { Text(if (editingStaff != null) "Edit Staff Record" else "Register Staff Member", fontWeight = FontWeight.Bold) },
+            title = { Text(if (editingStaff != null) "Edit Academic Staff" else "Register Academic Staff", fontWeight = FontWeight.Bold) },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Full Name") }, singleLine = true, colors = glassFieldColors(), shape = RoundedCornerShape(14.dp))
-                    OutlinedTextField(value = code, onValueChange = { code = it }, label = { Text("Staff Code") }, singleLine = true, colors = glassFieldColors(), shape = RoundedCornerShape(14.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        listOf("Academic", "Operation").forEach { d ->
-                            FilterChip(selected = dept.equals(d, true), onClick = { dept = d }, label = { Text(d) })
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedTextField(
+                        value = name,
+                        onValueChange = { name = it },
+                        label = { Text("Full Name") },
+                        singleLine = true,
+                        colors = glassFieldColors(),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("staff_name_input")
+                    )
+                    OutlinedTextField(
+                        value = code,
+                        onValueChange = { code = it },
+                        label = { Text("Staff Code") },
+                        singleLine = true,
+                        colors = glassFieldColors(),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("staff_code_input")
+                    )
+                    Box(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .minimumInteractiveComponentSize()
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(ext.glassBottom)
+                                .border(1.dp, ext.glassRimEnd, RoundedCornerShape(14.dp))
+                                .clickable { showRoleMenu = true }
+                                .padding(horizontal = 14.dp, vertical = 12.dp)
+                                .testTag("staff_role_dropdown"),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column {
+                                Text(
+                                    text = "STAFF ROLE",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Text(
+                                    text = role,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                            Icon(
+                                imageVector = Icons.Default.KeyboardArrowDown,
+                                contentDescription = "Select staff role",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
+
+                        DropdownMenu(
+                            expanded = showRoleMenu,
+                            onDismissRequest = { showRoleMenu = false }
+                        ) {
+                            AcademicStaffRoles.forEach { option ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            text = option,
+                                            fontWeight = if (option == role) FontWeight.Bold else FontWeight.Normal
+                                        )
+                                    },
+                                    onClick = {
+                                        role = option
+                                        showRoleMenu = false
+                                    }
+                                )
+                            }
                         }
                     }
-                    OutlinedTextField(value = role, onValueChange = { role = it }, label = { Text("Role / Group") }, singleLine = true, colors = glassFieldColors(), shape = RoundedCornerShape(14.dp))
-                    OutlinedTextField(value = loc, onValueChange = { loc = it }, label = { Text("Assigned Location / Class Wing") }, singleLine = true, colors = glassFieldColors(), shape = RoundedCornerShape(14.dp))
                 }
             },
             confirmButton = {
@@ -269,11 +367,11 @@ fun StaffRegisterScreen(
                             staffNumber = code.trim(),
                             staffCode = code.trim(),
                             name = name.trim(),
-                            category = if (dept == "Operation") "Non-Academic" else "Academic",
-                            staffGroup = role.ifBlank { dept },
-                            role = role.ifBlank { "Teacher" },
-                            department = dept,
-                            assignedLocation = loc.trim(),
+                            category = "Academic",
+                            staffGroup = editingStaff?.staffGroup?.takeIf { it.isNotBlank() } ?: "Languages",
+                            role = role,
+                            department = "Academic",
+                            assignedLocation = "",
                             isActive = editingStaff?.isActive ?: true
                         )
                         val conflict = staffList.firstOrNull {

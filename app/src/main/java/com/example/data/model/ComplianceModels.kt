@@ -179,6 +179,17 @@ enum class SeverityLevel(val label: String, val rank: Int) {
     }
 }
 
+data class GroupReportMember(
+    val staffId: String,
+    val staffName: String,
+    val staffCode: String,
+    val staffGroup: String,
+    val classId: String? = "NONE",
+    val className: String = "None",
+    val subjectId: String? = null,
+    val subjectName: String = ""
+)
+
 data class ComplianceReport(
     val id: String,
     val reportNumber: String,
@@ -226,7 +237,10 @@ data class ComplianceReport(
     val createdAt: String = "",
     val schoolSection: String? = null,
     val disciplineGroup: String? = null,
-    val session: String? = null
+    val session: String? = null,
+    val isGroupReport: Boolean = false,
+    val groupMembers: List<GroupReportMember> = emptyList(),
+    val exceptionTags: List<String> = emptyList()
 ) {
     val isPending: Boolean
         get() = status == ReportResolutionStatus.PENDING
@@ -338,7 +352,10 @@ data class ReportFormDraft(
     val evidenceType: String = "none",
     val evidenceName: String? = null,
     val hasUserEdited: Boolean = false,
-    val updatedAtMillis: Long = 0L
+    val updatedAtMillis: Long = 0L,
+    val isGroupReport: Boolean = false,
+    val groupMembers: List<GroupReportMember> = emptyList(),
+    val departmentFilter: String = "All Departments"
 ) {
     val hasContent: Boolean
         get() = hasUserEdited && hasAnyDraftContent
@@ -358,7 +375,9 @@ data class ReportFormDraft(
             (evidenceType != "none" && !evidenceName.isNullOrBlank()) ||
             divisionKey != ComplianceDivision.ACADEMIC.key ||
             targetType != "staff" ||
-            operationScope != "Maintenance"
+            operationScope != "Maintenance" ||
+            isGroupReport ||
+            groupMembers.isNotEmpty()
 }
 
 data class SystemSettings(
@@ -378,6 +397,7 @@ data class AcademicWeekStatus(
 enum class ReportScope(val key: String, val label: String) {
     ALL("All", "All Divisions"),
     ACADEMIC("Academic", "All Academic"),
+    OPERATIONS("Operation", "All Operation"),
     JUNIOR_SECONDARY("Junior Secondary", "Junior Secondary"),
     SENIOR_SECONDARY("Senior Secondary", "Senior Secondary"),
     JUNIOR_PRIMARY("Junior Primary", "Junior Primary"),
@@ -414,7 +434,8 @@ data class OfficerMetric(
     val totalReports: Int,
     val seenCount: Int,
     val unseenCount: Int,
-    val rejectedCount: Int
+    val rejectedCount: Int,
+    val reports: List<ComplianceReport> = emptyList()
 )
 
 enum class OfficerSortOption(val label: String) {

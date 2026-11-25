@@ -84,8 +84,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import coil.compose.AsyncImage
+import coil.request.CachePolicy
 import coil.request.ImageRequest
 import com.example.data.model.ThemePreference
+import com.example.domain.MediaCacheManager
 import com.example.ui.components.GlassCircleIcon
 import com.example.ui.components.LivingAtmosphericBackground
 import com.example.ui.components.StatusGlassChip
@@ -96,7 +98,9 @@ import com.example.ui.components.complianceGlassCard
 import com.example.ui.components.glassFieldColors
 import com.example.ui.theme.JCBestTheme
 import com.example.ui.theme.LocalCompliancePalette
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
 
@@ -159,6 +163,20 @@ fun EvidencePreviewerScreen(
             isLoading = false
             errorMessage = null
             return@LaunchedEffect
+        }
+
+        val activeType = normalizeEvidenceMediaType(activeItem?.mediaType.orEmpty(), path)
+        if (activeType == "image") {
+            val evKey = MediaCacheManager.evidenceCacheKey(path)
+            val cachedOnDisk = withContext(Dispatchers.IO) {
+                MediaCacheManager.hasCachedDiskEntry(context, evKey)
+            }
+            if (cachedOnDisk) {
+                resolvedUrls = resolvedUrls + (path to "https://offline-cache.invalid/$evKey")
+                isLoading = false
+                errorMessage = null
+                return@LaunchedEffect
+            }
         }
 
         isLoading = true
@@ -503,11 +521,22 @@ fun EvidencePreviewerScaffold(
                                 val imageModel = remember(activeUrl) {
                                     toCoilModel(activeUrl)
                                 }
-                                val imageRequest = remember(imageModel, activeHeaders, context) {
+                                val canonicalEvKey = remember(activeItem?.storedPath, activeUrl) {
+                                    MediaCacheManager.evidenceCacheKey(activeItem?.storedPath ?: activeUrl)
+                                }
+                                val isOfflineSynthetic = activeUrl.startsWith("https://offline-cache.invalid/")
+                                val imageRequest = remember(imageModel, activeHeaders, canonicalEvKey, isOfflineSynthetic, context) {
                                     ImageRequest.Builder(context)
                                         .data(imageModel)
+                                        .memoryCacheKey(canonicalEvKey)
+                                        .diskCacheKey(canonicalEvKey)
                                         .apply {
-                                            activeHeaders.forEach { (k, v) -> addHeader(k, v) }
+                                            if (isOfflineSynthetic) {
+                                                networkCachePolicy(CachePolicy.DISABLED)
+                                                diskCachePolicy(CachePolicy.READ_ONLY)
+                                            } else {
+                                                activeHeaders.forEach { (k, v) -> addHeader(k, v) }
+                                            }
                                         }
                                         .crossfade(true)
                                         .build()
@@ -891,10 +920,23 @@ fun EvidencePreviewerScaffold(
                             ) {
                                 if (itemType == "image" && !thumbSource.isNullOrBlank()) {
                                     val thumbHeaders = onResolveHeaders(thumbSource)
-                                    val thumbReq = remember(thumbSource, thumbHeaders, context) {
+                                    val thumbKey = remember(item.storedPath, thumbSource) {
+                                        MediaCacheManager.evidenceCacheKey(item.storedPath)
+                                    }
+                                    val isThumbOfflineSynthetic = thumbSource.startsWith("https://offline-cache.invalid/")
+                                    val thumbReq = remember(thumbSource, thumbHeaders, thumbKey, isThumbOfflineSynthetic, context) {
                                         ImageRequest.Builder(context)
                                             .data(toCoilModel(thumbSource))
-                                            .apply { thumbHeaders.forEach { (k, v) -> addHeader(k, v) } }
+                                            .memoryCacheKey(thumbKey)
+                                            .diskCacheKey(thumbKey)
+                                            .apply {
+                                                if (isThumbOfflineSynthetic) {
+                                                    networkCachePolicy(CachePolicy.DISABLED)
+                                                    diskCachePolicy(CachePolicy.READ_ONLY)
+                                                } else {
+                                                    thumbHeaders.forEach { (k, v) -> addHeader(k, v) }
+                                                }
+                                            }
                                             .build()
                                     }
                                     AsyncImage(

@@ -43,10 +43,12 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -82,9 +84,11 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -100,7 +104,9 @@ import androidx.compose.ui.graphics.asComposeRenderEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -119,6 +125,7 @@ import com.example.data.model.ReportFormMode
 import com.example.data.model.ReportResolutionStatus
 import com.example.data.model.ReportScope
 import com.example.domain.ComplianceNotificationHelper
+import com.example.domain.MediaCacheManager
 import com.example.ui.components.LivingAtmosphericBackground
 import com.example.ui.components.NativeLoadingBar
 import com.example.ui.components.complianceGlassCard
@@ -138,6 +145,7 @@ import com.example.ui.screens.reports.ReportsScreen
 import com.example.ui.screens.security.AppLockScreen
 import com.example.ui.screens.security.DeviceSetupScreen
 import com.example.ui.theme.JCBestTheme
+import com.example.ui.theme.LocalBottomFooterClearance
 import com.example.ui.theme.LocalCompliancePalette
 import com.example.ui.viewmodel.AuthScreenMode
 import com.example.ui.viewmodel.ComplianceViewModel
@@ -149,6 +157,7 @@ class MainActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        MediaCacheManager.ensureInitialized(this)
         enableEdgeToEdge()
         handleNotificationIntent(intent)
 
@@ -430,7 +439,29 @@ private fun JCBestComplianceRoot(
     // Adaptive Edge-to-Edge Shell: Frosted Glass Bottom Dock on phone, Glass NavigationRail on tablet
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val useRail = maxWidth >= 640.dp
+        val isCompactHeight = maxHeight < 680.dp
+        val density = LocalDensity.current
+        var measuredDockHeightPx by remember { mutableIntStateOf(0) }
+        val navBarBottomDp = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+        val fallbackDockDp = navBarBottomDp + if (isCompactHeight) 82.dp else 94.dp
+        val effectiveDockDp = if (!useRail && showDock) {
+            if (measuredDockHeightPx > 0) with(density) { measuredDockHeightPx.toDp() }
+            else fallbackDockDp
+        } else {
+            navBarBottomDp
+        }
+        val bottomFooterClearance = if (!useRail && showDock) {
+            effectiveDockDp + 16.dp
+        } else {
+            navBarBottomDp + 24.dp
+        }
+        val snackbarBottomPadding = if (!useRail && showDock) {
+            (effectiveDockDp - navBarBottomDp + 8.dp).coerceAtLeast(80.dp)
+        } else {
+            16.dp
+        }
 
+        CompositionLocalProvider(LocalBottomFooterClearance provides bottomFooterClearance) {
         Box(modifier = Modifier.fillMaxSize()) {
             Row(modifier = Modifier.fillMaxSize()) {
                 if (useRail && showDock) {
@@ -525,7 +556,7 @@ private fun JCBestComplianceRoot(
                             onSelectReport = viewModel::openReportDetail,
                             onUpdateUserRole = viewModel::updateUserRole,
                             onToggleUserStatus = viewModel::toggleUserStatus,
-                            onUpdateUserEmail = viewModel::updateUserEmail,
+                            onUpdateUserName = viewModel::updateUserName,
                             onForceResetUserPassword = viewModel::forceResetUserPassword,
                             onProvisionUser = viewModel::provisionUser,
                             onSaveSystemSettings = viewModel::saveSystemSettings,
@@ -647,16 +678,11 @@ private fun JCBestComplianceRoot(
                             systemSettings = uiState.systemSettings,
                             selectedTerm = uiState.selectedTerm,
                             isRefreshing = uiState.isRefreshing,
-                            isExportingPptx = uiState.isExportingPptx,
-                            pptxExportSuccess = uiState.pptxExportSuccessMessage,
-                            pptxExportError = uiState.pptxExportError,
                             onSelectTerm = viewModel::setSelectedTerm,
                             onSyncDatabase = { viewModel.refreshAllData(silent = false) },
                             onExportReport = { scope, format, term, start, end ->
                                 viewModel.exportAnalyticsReport(scope, format, term, start, end)
                             },
-                            onExportPptx = viewModel::exportCompliancePptx,
-                            onClearPptxStatus = viewModel::clearPptxExportStatus,
                             userRole = session.role,
                             currentUserId = session.userId
                         )
@@ -726,7 +752,7 @@ private fun JCBestComplianceRoot(
                                     modifier = Modifier.size(16.dp)
                                 )
                                 Text(
-                                    text = "Offline Mode — Draft locally or queue to auto-submit online.",
+                                    text = "Offline Mode — Viewing cached data. Draft or queue reports anytime.",
                                     color = p.textPrimary,
                                     fontSize = 12.sp,
                                     fontWeight = FontWeight.SemiBold,
@@ -742,11 +768,14 @@ private fun JCBestComplianceRoot(
                         FloatingGlassBottomDock(
                             items = visibleFooterItems,
                             activeTab = uiState.activeTab,
+                            compactHeight = isCompactHeight,
                             onSelectTab = { route ->
                                 initialReportsScope = ReportScope.ALL
                                 viewModel.setActiveTab(route)
                             },
-                            modifier = Modifier.align(Alignment.BottomCenter)
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .onSizeChanged { measuredDockHeightPx = it.height }
                         )
                     }
 
@@ -757,8 +786,10 @@ private fun JCBestComplianceRoot(
                             .align(Alignment.BottomCenter)
                             .navigationBarsPadding()
                             .padding(
-                                horizontal = 16.dp,
-                                vertical = if (!useRail && showDock) 94.dp else 16.dp
+                                start = 16.dp,
+                                end = 16.dp,
+                                top = 16.dp,
+                                bottom = snackbarBottomPadding
                             )
                     ) { data ->
                         GlassSnackbar(
@@ -833,7 +864,7 @@ private fun JCBestComplianceRoot(
                             feedbackMessage = uiState.feedbackMessage,
                             isErrorFeedback = uiState.isErrorFeedback,
                             onClearFeedback = viewModel::clearFeedback,
-                            onQueueOfflineAutoSubmit = { division, targetType, staff, classroom, subject, opScope, specificSubjectText, assignedLocation, check, incDate, exText, effText, attachments, _ ->
+                            onQueueOfflineAutoSubmit = { division, targetType, staff, classroom, subject, opScope, specificSubjectText, assignedLocation, check, incDate, exText, effText, attachments, _, isGroupReport, groupMembers ->
                                 viewModel.queueReportForAutoSubmit(
                                     division = division,
                                     targetType = targetType,
@@ -848,10 +879,12 @@ private fun JCBestComplianceRoot(
                                     exceptionText = exText,
                                     effectText = effText,
                                     attachments = attachments,
-                                    sourceDraft = uiState.convertingDraft
+                                    sourceDraft = uiState.convertingDraft,
+                                    isGroupReport = isGroupReport,
+                                    groupMembers = groupMembers
                                 )
                             },
-                            onSubmit = { division, targetType, staff, classroom, subject, opScope, specificSubjectText, assignedLocation, check, incDate, exText, effText, attachments, cleanDraft ->
+                            onSubmit = { division, targetType, staff, classroom, subject, opScope, specificSubjectText, assignedLocation, check, incDate, exText, effText, attachments, cleanDraft, isGroupReport, groupMembers ->
                                 viewModel.submitReport(
                                     existingReport = uiState.editingReport,
                                     division = division,
@@ -869,6 +902,8 @@ private fun JCBestComplianceRoot(
                                     attachments = attachments,
                                     sourceDraft = uiState.convertingDraft,
                                     cleanDraftMediaOnComplete = cleanDraft,
+                                    isGroupReport = isGroupReport,
+                                    groupMembers = groupMembers,
                                     onComplete = {}
                                 )
                             }
@@ -886,6 +921,7 @@ private fun JCBestComplianceRoot(
                     }
                 }
             }
+        }
         }
     }
 }
@@ -1226,6 +1262,7 @@ private fun GlassSnackbar(
 private fun FloatingGlassBottomDock(
     items: List<FooterNavItem>,
     activeTab: String,
+    compactHeight: Boolean = false,
     onSelectTab: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -1233,6 +1270,10 @@ private fun FloatingGlassBottomDock(
     val dockFillTop = if (p.isDark) Color(0xFF161B26).copy(alpha = 0.90f) else Color(0xFFFFFFFF).copy(alpha = 0.92f)
     val dockFillBottom = if (p.isDark) Color(0xFF0E121B).copy(alpha = 0.95f) else Color(0xFFEEF3FA).copy(alpha = 0.95f)
     val topLuminousRim = if (p.isDark) Color.White.copy(alpha = 0.24f) else Color.White.copy(alpha = 0.95f)
+    val outerVerticalPadding = if (compactHeight) 6.dp else 10.dp
+    val rowVerticalPadding = if (compactHeight) 5.dp else 8.dp
+    val itemVerticalPadding = if (compactHeight) 3.dp else 4.dp
+    val pillHeight = if (compactHeight) 25.dp else 28.dp
 
     // Frosted smoked-glass dock with atmospheric scrim + blurred backdrop layer + 1.dp luminous top border
     Box(
@@ -1248,7 +1289,7 @@ private fun FloatingGlassBottomDock(
                 )
             )
             .navigationBarsPadding()
-            .padding(horizontal = 14.dp, vertical = 10.dp),
+            .padding(horizontal = 14.dp, vertical = outerVerticalPadding),
         contentAlignment = Alignment.Center
     ) {
         Box(
@@ -1317,7 +1358,7 @@ private fun FloatingGlassBottomDock(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 6.dp, vertical = 8.dp),
+                    .padding(horizontal = 6.dp, vertical = rowVerticalPadding),
                 horizontalArrangement = Arrangement.SpaceEvenly,
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -1344,15 +1385,15 @@ private fun FloatingGlassBottomDock(
                             indication = ripple(bounded = true),
                             onClick = { onSelectTab(item.route) }
                         )
-                        .padding(vertical = 4.dp)
+                        .padding(vertical = itemVerticalPadding)
                         .testTag("footer_nav_${item.route}"),
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(3.dp)
+                    verticalArrangement = Arrangement.spacedBy(if (compactHeight) 2.dp else 3.dp)
                 ) {
                     Box(
                         modifier = Modifier
                             .width(pillWidth)
-                            .height(28.dp)
+                            .height(pillHeight)
                             .clip(CircleShape)
                             .background(
                                 if (selected) p.tangerine.copy(alpha = if (p.isDark) 0.22f else 0.14f)

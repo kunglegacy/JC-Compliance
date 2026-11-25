@@ -96,11 +96,17 @@ object AnalysisEngine {
         staffMap: Map<String, StaffMember>
     ): Boolean {
         if (scope == ReportScope.ALL) return true
+        val staff = findStaff(report, staffMap)
         val resolved = getRecordScope(report, staffMap)
         if (resolved == scope.key) return true
         if (scope == ReportScope.HOSTEL_KITCHEN && (resolved == "Hostel/Kitchen" || resolved == "Hostel / Kitchen")) return true
         if (scope == ReportScope.ACADEMIC) {
-            return resolved in listOf("Nursery", "Junior Primary", "Senior Primary", "Junior Secondary", "Senior Secondary", "Academic")
+            return resolveDivision(report, staff) == ComplianceDivision.ACADEMIC ||
+                resolved in listOf("Nursery", "Junior Primary", "Senior Primary", "Junior Secondary", "Senior Secondary", "Academic", "Mentorship")
+        }
+        if (scope == ReportScope.OPERATIONS) {
+            return resolveDivision(report, staff) == ComplianceDivision.OPERATIONS ||
+                resolved in listOf("Maintenance", "Security", "Transport", "Minders", "Hostel/Kitchen", "Hostel / Kitchen")
         }
         return false
     }
@@ -201,7 +207,8 @@ object AnalysisEngine {
                 totalReports = items.size,
                 seenCount = seen,
                 unseenCount = items.count { !it.isSeen },
-                rejectedCount = rejected
+                rejectedCount = rejected,
+                reports = items.sortedByDescending { it.incidentDate }
             )
         }.filter { m ->
             if (q.isBlank()) true

@@ -50,25 +50,31 @@ class ComplianceNotificationJobService : JobService() {
                         }
 
                         JOB_ID_EVENING_REMINDER -> {
-                            val drafts = draftRepo.listAllDraftsOnce(session.userId, materializeMedia = false)
-                            val formDraft = draftRepo.loadComposerFormDraft(session.userId)?.takeIf { it.hasContent }
-                            val hasAnyDraft = drafts.isNotEmpty() || formDraft != null
-                            val todayIso = AcademicWeekEngine.todayIso()
-                            val (lastDate, firstDate) = prefs.getReportTrackingSnapshot(session.userId, todayIso)
-                            ComplianceNotificationHelper.notifyEveningStandardReminderIfDue(
+                            runLocalOfflineNotificationSweep(
                                 context = applicationContext,
+                                prefs = prefs,
+                                draftRepo = draftRepo,
                                 userId = session.userId,
                                 role = session.role,
-                                hasAnyDraft = hasAnyDraft,
-                                lastSubmittedDateIso = lastDate,
-                                firstTrackingDateIso = firstDate,
-                                forceHourCheck = true
+                                includeDraftReminder = false
                             )
                             scheduleEveningReminder(applicationContext, forceNextDay = true)
                         }
 
+                        JOB_ID_OFFLINE_NOTIFICATION_SWEEP -> {
+                            runLocalOfflineNotificationSweep(
+                                context = applicationContext,
+                                prefs = prefs,
+                                draftRepo = draftRepo,
+                                userId = session.userId,
+                                role = session.role,
+                                includeDraftReminder = true
+                            )
+                            scheduleEveningReminder(applicationContext, forceNextDay = false)
+                        }
+
                         else -> {
-                            // Periodic sync: flush queued offline submissions, pull server alerts, check drafts & 6 PM reminder
+                            // Online periodic sync: flush queued offline submissions + lightweight unread notifications check only
                             if (state.supabaseConfig.isConfigured) {
                                 val queueRes = OfflineAutoSubmitEngine.processQueue(applicationContext)
                                 if (queueRes.hasRemainingFailures) {
@@ -111,29 +117,16 @@ class ComplianceNotificationJobService : JobService() {
                                         )
                                     }
                                 }
-
-                                val drafts = draftRepo.listAllDraftsOnce(activeSession.userId, materializeMedia = false)
-                                val formDraft = draftRepo.loadComposerFormDraft(activeSession.userId)?.takeIf { it.hasContent }
-                                ComplianceNotificationHelper.notifyDraftReminderIfDue(
-                                    context = applicationContext,
-                                    userId = activeSession.userId,
-                                    drafts = drafts,
-                                    unfinishedFormDraft = formDraft
-                                )
-
-                                val hasAnyDraft = drafts.isNotEmpty() || formDraft != null
-                                val todayIso = AcademicWeekEngine.todayIso()
-                                val (lastDate, firstDate) = prefs.getReportTrackingSnapshot(activeSession.userId, todayIso)
-                                ComplianceNotificationHelper.notifyEveningStandardReminderIfDue(
-                                    context = applicationContext,
-                                    userId = activeSession.userId,
-                                    role = activeSession.role,
-                                    hasAnyDraft = hasAnyDraft,
-                                    lastSubmittedDateIso = lastDate,
-                                    firstTrackingDateIso = firstDate,
-                                    forceHourCheck = true
-                                )
                             }
+                            // Also run local notification sweep whenever online periodic job fires
+                            runLocalOfflineNotificationSweep(
+                                context = applicationContext,
+                                prefs = prefs,
+                                draftRepo = draftRepo,
+                                userId = session.userId,
+                                role = session.role,
+                                includeDraftReminder = true
+                            )
                         }
                     }
                 }
@@ -141,6 +134,42 @@ class ComplianceNotificationJobService : JobService() {
             jobFinished(params, rescheduleNeeded)
         }
         return true
+    }
+
+    private suspend fun runLocalOfflineNotificationSweep(
+        context: Context,
+        prefs: SecurePreferences,
+        draftRepo: DraftRepository,
+        userId: String,
+        role: com.example.data.model.UserRole,
+        includeDraftReminder: Boolean
+    ) {
+        val drafts = draftRepo.listAllDraftsOnce(userId, materializeMedia = false)
+        val formDraft = draftRepo.loadComposerFormDraft(userId)?.takeIf { it.hasContent }
+        if (includeDraftReminder) {
+            ComplianceNotificationHelper.notifyDraftReminderIfDue(
+                context = context,
+                userId = userId,
+                drafts = drafts,
+                unfinishedFormDraft = formDraft
+            )
+        }
+        val todayIso = AcademicWeekEngine.todayIso()
+        val cachedDates = OfflineCacheRepository(context).getLatestUserReportDatesOffline(userId)
+        if (cachedDates.isNotEmpty()) {
+            prefs.syncReportActivityDates(userId, cachedDates, todayIso)
+        }
+        val hasAnyDraft = drafts.isNotEmpty() || formDraft != null
+        val (lastDate, firstDate) = prefs.getReportTrackingSnapshot(userId, todayIso)
+        ComplianceNotificationHelper.notifyEveningStandardReminderIfDue(
+            context = context,
+            userId = userId,
+            role = role,
+            hasAnyDraft = hasAnyDraft,
+            lastSubmittedDateIso = lastDate,
+            firstTrackingDateIso = firstDate,
+            forceHourCheck = true
+        )
     }
 
     override fun onStopJob(params: JobParameters?): Boolean {
@@ -157,16 +186,29 @@ class ComplianceNotificationJobService : JobService() {
         private const val JOB_ID_DRAFT_REMINDER = 4102
         private const val JOB_ID_AUTO_SUBMIT = 4103
         private const val JOB_ID_EVENING_REMINDER = 4104
+        private const val JOB_ID_OFFLINE_NOTIFICATION_SWEEP = 4105
 
         fun schedulePeriodicSync(context: Context) {
             val js = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
             val component = ComponentName(context, ComplianceNotificationJobService::class.java)
-            val info = JobInfo.Builder(JOB_ID_PERIODIC_SYNC, component)
+            val onlineInfo = JobInfo.Builder(JOB_ID_PERIODIC_SYNC, component)
                 .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
                 .setPeriodic(15L * 60L * 1000L)
                 .setPersisted(true)
                 .build()
-            runCatching { js.schedule(info) }
+            runCatching { js.schedule(onlineInfo) }
+            scheduleOfflineNotificationSweep(context)
+        }
+
+        fun scheduleOfflineNotificationSweep(context: Context) {
+            val js = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
+            val component = ComponentName(context, ComplianceNotificationJobService::class.java)
+            val offlineInfo = JobInfo.Builder(JOB_ID_OFFLINE_NOTIFICATION_SWEEP, component)
+                .setRequiredNetworkType(JobInfo.NETWORK_TYPE_NONE)
+                .setPeriodic(15L * 60L * 1000L)
+                .setPersisted(true)
+                .build()
+            runCatching { js.schedule(offlineInfo) }
         }
 
         fun scheduleAutoSubmitJob(context: Context) {
@@ -202,6 +244,7 @@ class ComplianceNotificationJobService : JobService() {
             val js = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
             val component = ComponentName(context, ComplianceNotificationJobService::class.java)
             val info = JobInfo.Builder(JOB_ID_EVENING_REMINDER, component)
+                .setRequiredNetworkType(JobInfo.NETWORK_TYPE_NONE)
                 .setMinimumLatency(delayMs)
                 .setOverrideDeadline(delayMs + 30L * 60L * 1000L)
                 .setPersisted(true)
@@ -213,8 +256,10 @@ class ComplianceNotificationJobService : JobService() {
             val js = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
             val component = ComponentName(context, ComplianceNotificationJobService::class.java)
             val info = JobInfo.Builder(JOB_ID_DRAFT_REMINDER, component)
+                .setRequiredNetworkType(JobInfo.NETWORK_TYPE_NONE)
                 .setMinimumLatency(delayMs)
                 .setOverrideDeadline(delayMs + 15L * 60L * 1000L)
+                .setPersisted(true)
                 .build()
             runCatching { js.schedule(info) }
         }
@@ -231,6 +276,7 @@ class ComplianceNotificationJobService : JobService() {
                 js.cancel(JOB_ID_DRAFT_REMINDER)
                 js.cancel(JOB_ID_AUTO_SUBMIT)
                 js.cancel(JOB_ID_EVENING_REMINDER)
+                js.cancel(JOB_ID_OFFLINE_NOTIFICATION_SWEEP)
             }
         }
     }

@@ -16,6 +16,7 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import com.example.data.model.ComplianceDivision
 import com.example.data.model.DraftMediaItem
+import com.example.data.model.GroupReportMember
 import com.example.data.model.OfflineDraft
 import com.example.data.model.ReportEvidenceAttachment
 import com.example.data.model.ReportFormDraft
@@ -116,9 +117,41 @@ interface DraftDao {
     suspend fun deleteByIdForUser(id: String, userId: String)
 }
 
-@Database(entities = [DraftEntity::class], version = 4, exportSchema = false)
+@Entity(tableName = "workspace_cache")
+data class WorkspaceCacheEntity(
+    @PrimaryKey val userId: String,
+    val reportsJson: String = "",
+    val staffJson: String = "",
+    val classesJson: String = "",
+    val subjectsJson: String = "",
+    val checksJson: String = "",
+    val usersJson: String = "",
+    val settingsJson: String = "",
+    val snapshotsJson: String = "",
+    val storageConfigJson: String = "",
+    val mobileConfigJson: String = "",
+    val lastFullSyncAtMs: Long = 0L,
+    val lastReportsSyncAtMs: Long = 0L,
+    val lastCatalogSyncAtMs: Long = 0L,
+    val lastReportFingerprint: String = ""
+)
+
+@Dao
+interface WorkspaceCacheDao {
+    @Query("SELECT * FROM workspace_cache WHERE userId = :userId LIMIT 1")
+    suspend fun getForUser(userId: String): WorkspaceCacheEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(entity: WorkspaceCacheEntity)
+
+    @Query("DELETE FROM workspace_cache WHERE userId = :userId")
+    suspend fun deleteForUser(userId: String)
+}
+
+@Database(entities = [DraftEntity::class, WorkspaceCacheEntity::class], version = 5, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun draftDao(): DraftDao
+    abstract fun workspaceCacheDao(): WorkspaceCacheDao
 
     companion object {
         @Volatile
@@ -132,6 +165,32 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS workspace_cache (
+                        userId TEXT NOT NULL PRIMARY KEY,
+                        reportsJson TEXT NOT NULL DEFAULT '',
+                        staffJson TEXT NOT NULL DEFAULT '',
+                        classesJson TEXT NOT NULL DEFAULT '',
+                        subjectsJson TEXT NOT NULL DEFAULT '',
+                        checksJson TEXT NOT NULL DEFAULT '',
+                        usersJson TEXT NOT NULL DEFAULT '',
+                        settingsJson TEXT NOT NULL DEFAULT '',
+                        snapshotsJson TEXT NOT NULL DEFAULT '',
+                        storageConfigJson TEXT NOT NULL DEFAULT '',
+                        mobileConfigJson TEXT NOT NULL DEFAULT '',
+                        lastFullSyncAtMs INTEGER NOT NULL DEFAULT 0,
+                        lastReportsSyncAtMs INTEGER NOT NULL DEFAULT 0,
+                        lastCatalogSyncAtMs INTEGER NOT NULL DEFAULT 0,
+                        lastReportFingerprint TEXT NOT NULL DEFAULT ''
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase {
             return instance ?: synchronized(this) {
                 instance ?: Room.databaseBuilder(
@@ -139,7 +198,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "jcbest_compliance_local.db"
                 )
-                    .addMigrations(MIGRATION_3_4)
+                    .addMigrations(MIGRATION_3_4, MIGRATION_4_5)
                     .fallbackToDestructiveMigration(true)
                     .build()
                     .also { instance = it }
@@ -657,7 +716,57 @@ class DraftRepository(private val context: Context) {
             put("evidenceName", draft.evidenceName ?: JSONObject.NULL)
             put("hasUserEdited", draft.hasUserEdited)
             put("updatedAtMillis", draft.updatedAtMillis)
+            put("isGroupReport", draft.isGroupReport)
+            put("departmentFilter", draft.departmentFilter)
+            put("groupMembersJson", encodeGroupMembersJson(draft.groupMembers))
         }.toString()
+    }
+
+    private fun encodeGroupMembersJson(members: List<GroupReportMember>): String {
+        val arr = JSONArray()
+        members.forEach { m ->
+            arr.put(JSONObject().apply {
+                put("staff_id", m.staffId)
+                put("staff_name", m.staffName)
+                put("staff_code", m.staffCode)
+                put("staff_group", m.staffGroup)
+                put("class_id", m.classId ?: "NONE")
+                put("class_name", m.className)
+                put("subject_id", m.subjectId ?: JSONObject.NULL)
+                put("subject_name", m.subjectName)
+            })
+        }
+        return arr.toString()
+    }
+
+    private fun decodeGroupMembersJson(raw: String?): List<GroupReportMember> {
+        if (raw.isNullOrBlank()) return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val staffId = o.optString("staff_id", "").trim()
+                    val staffName = o.optString("staff_name", "").trim()
+                    if (staffId.isBlank() && staffName.isBlank()) continue
+                    val classIdRaw = if (o.isNull("class_id")) "NONE" else o.optString("class_id", "NONE").ifBlank { "NONE" }
+                    val classNameRaw = if (o.isNull("class_name")) "None" else o.optString("class_name", "None")
+                    val subjIdRaw = if (o.isNull("subject_id")) null else o.optString("subject_id").takeIf { it.isNotBlank() && it != "null" }
+                    add(
+                        GroupReportMember(
+                            staffId = staffId,
+                            staffName = staffName,
+                            staffCode = o.optString("staff_code", ""),
+                            staffGroup = o.optString("staff_group", ""),
+                            classId = classIdRaw,
+                            className = classNameRaw,
+                            subjectId = subjIdRaw,
+                            subjectName = o.optString("subject_name", "")
+                        )
+                    )
+                }
+            }
+        }.getOrDefault(emptyList())
     }
 
     private fun decodeFormDraftJson(userId: String, raw: String, materializeMedia: Boolean): ReportFormDraft? =
@@ -708,7 +817,10 @@ class DraftRepository(private val context: Context) {
                 evidenceType = validEvType,
                 evidenceName = if (validEvType == "none") null else optNullStr("evidenceName"),
                 hasUserEdited = o.optBoolean("hasUserEdited", false),
-                updatedAtMillis = o.optLong("updatedAtMillis", 0L)
+                updatedAtMillis = o.optLong("updatedAtMillis", 0L),
+                isGroupReport = o.optBoolean("isGroupReport", false),
+                groupMembers = decodeGroupMembersJson(optNullStr("groupMembersJson")),
+                departmentFilter = o.optString("departmentFilter", "All Departments")
             )
         }.getOrNull()
 

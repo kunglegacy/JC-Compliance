@@ -29,7 +29,11 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import coil.request.CachePolicy
 import coil.request.ImageRequest
+import com.example.domain.MediaCacheManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
 
@@ -64,6 +68,9 @@ fun ProfileAvatar(
     val trimmedUrl = remember(avatarUrl) {
         avatarUrl.trim().takeUnless { it.equals("null", ignoreCase = true) }.orEmpty()
     }
+    val cacheKey = remember(trimmedUrl) {
+        if (trimmedUrl.isBlank()) "" else MediaCacheManager.avatarCacheKey(trimmedUrl)
+    }
 
     val isLocalFile = trimmedUrl.startsWith("/") && !trimmedUrl.startsWith("/api/storage/", ignoreCase = true)
     val isContentOrFileUri = trimmedUrl.startsWith("content://", ignoreCase = true) ||
@@ -91,12 +98,23 @@ fun ProfileAvatar(
             }
         )
     }
+    var isOfflineCachedOnly by remember(trimmedUrl) { mutableStateOf(false) }
     var loadFailed by remember(trimmedUrl, resolvedUrl) { mutableStateOf(false) }
 
-    LaunchedEffect(trimmedUrl, needsSigning) {
+    LaunchedEffect(trimmedUrl, needsSigning, cacheKey) {
         loadFailed = false
+        isOfflineCachedOnly = false
         if (trimmedUrl.isBlank()) {
             resolvedUrl = null
+            return@LaunchedEffect
+        }
+        val cachedOnDisk = withContext(Dispatchers.IO) {
+            MediaCacheManager.hasCachedDiskEntry(context, cacheKey)
+        }
+        if (cachedOnDisk) {
+            // Serve directly from Coil disk cache with zero network egress or signed-URL calls
+            isOfflineCachedOnly = true
+            resolvedUrl = "https://offline-cache.invalid/$cacheKey"
             return@LaunchedEffect
         }
         if (!needsSigning) {
@@ -146,7 +164,7 @@ fun ProfileAvatar(
     ) {
         if (!showFallback) {
             val modelUrl = resolvedUrl!!
-            val imageRequest = remember(modelUrl, trimmedUrl) {
+            val imageRequest = remember(modelUrl, cacheKey, isOfflineCachedOnly) {
                 val dataModel: Any = if (modelUrl.startsWith("/") && !modelUrl.startsWith("/api/storage/", ignoreCase = true)) {
                     File(modelUrl)
                 } else {
@@ -154,13 +172,18 @@ fun ProfileAvatar(
                 }
                 ImageRequest.Builder(context)
                     .data(dataModel)
-                    .memoryCacheKey("avatar_$trimmedUrl")
-                    .diskCacheKey("avatar_$trimmedUrl")
-                    .crossfade(true)
+                    .memoryCacheKey(cacheKey)
+                    .diskCacheKey(cacheKey)
                     .apply {
-                        val headers = getAuthHeaders?.invoke(modelUrl).orEmpty()
-                        headers.forEach { (k, v) -> addHeader(k, v) }
+                        if (isOfflineCachedOnly) {
+                            networkCachePolicy(CachePolicy.DISABLED)
+                            diskCachePolicy(CachePolicy.READ_ONLY)
+                        } else {
+                            val headers = getAuthHeaders?.invoke(modelUrl).orEmpty()
+                            headers.forEach { (k, v) -> addHeader(k, v) }
+                        }
                     }
+                    .crossfade(true)
                     .build()
             }
             AsyncImage(

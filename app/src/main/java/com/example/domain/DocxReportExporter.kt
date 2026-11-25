@@ -198,7 +198,7 @@ object DocxReportExporter {
         append("""</w:p></w:ftr>""")
     }
 
-    private fun buildDocumentXml(prepared: PreparedExportDataset, hasCrest: Boolean): String {
+    internal fun buildDocumentXml(prepared: PreparedExportDataset, hasCrest: Boolean): String {
         val isTransport = prepared.scope == ReportScope.TRANSPORT
         val headers = if (isTransport) ReportExportData.transportColumns else ReportExportData.standardColumns
 
@@ -282,37 +282,88 @@ object DocxReportExporter {
                 // Data Rows
                 prepared.rows.forEachIndexed { rowIdx, row ->
                     val fill = if (rowIdx % 2 == 1) "F8FAFC" else "FFFFFF"
-                    val cells = listOf(
-                        row.date,
-                        if (isTransport) row.driverName else row.name,
-                        if (isTransport) row.busNumber else row.className,
-                        if (isTransport) row.complianceCheck else row.subject,
-                        row.exception,
-                        row.effect
-                    )
+                    if (!isTransport && row.isGroup && row.subRows.isNotEmpty()) {
+                        row.subRows.forEachIndexed { subIdx, sub ->
+                            val isFirst = subIdx == 0
+                            val cells = listOf(
+                                row.date,
+                                sub.name,
+                                sub.className,
+                                sub.subject,
+                                row.exception,
+                                row.effect
+                            )
 
-                    append("<w:tr><w:trPr><w:cantSplit/></w:trPr>")
-                    cells.forEachIndexed { colIdx, text ->
-                        val align = if (colIdx == 0 || colIdx == 2) "center" else "left"
-                        val bold = colIdx == 1
-                        val color = when (colIdx) {
-                            1 -> "0F172A"
-                            4 -> "1E293B"
-                            2, 3, 5 -> "475569"
-                            else -> "334155"
+                            append("<w:tr><w:trPr><w:cantSplit/></w:trPr>")
+                            cells.forEachIndexed { colIdx, text ->
+                                val isMergedCol = colIdx == 0 || colIdx == 4 || colIdx == 5
+                                val align = if (colIdx == 0 || colIdx == 2) "center" else "left"
+                                val bold = colIdx == 1
+                                val color = when (colIdx) {
+                                    1 -> "0F172A"
+                                    4 -> "1E293B"
+                                    2, 3, 5 -> "475569"
+                                    else -> "334155"
+                                }
+                                val vAlign = if (colIdx == 0) "center" else "top"
+                                append("<w:tc><w:tcPr>")
+                                append("<w:tcW w:w=\"${colWidthsDxa[colIdx]}\" w:type=\"dxa\"/>")
+                                if (isMergedCol) {
+                                    if (isFirst) {
+                                        append("<w:vMerge w:val=\"restart\"/>")
+                                    } else {
+                                        append("<w:vMerge/>")
+                                    }
+                                }
+                                append("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"$fill\"/>")
+                                append("<w:tcMar><w:top w:w=\"110\" w:type=\"dxa\"/><w:left w:w=\"130\" w:type=\"dxa\"/><w:bottom w:w=\"110\" w:type=\"dxa\"/><w:right w:w=\"130\" w:type=\"dxa\"/></w:tcMar>")
+                                append("<w:vAlign w:val=\"$vAlign\"/>")
+                                append("</w:tcPr>")
+                                if (isMergedCol && !isFirst) {
+                                    append("<w:p/>")
+                                } else {
+                                    append("<w:p><w:pPr><w:jc w:val=\"$align\"/></w:pPr>")
+                                    append(buildTextRunsXml(text, sizeHalfPt = 19, colorHex = color, bold = bold))
+                                    append("</w:p>")
+                                }
+                                append("</w:tc>")
+                            }
+                            append("</w:tr>")
                         }
-                        append("<w:tc><w:tcPr>")
-                        append("<w:tcW w:w=\"${colWidthsDxa[colIdx]}\" w:type=\"dxa\"/>")
-                        append("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"$fill\"/>")
-                        append("<w:tcMar><w:top w:w=\"110\" w:type=\"dxa\"/><w:left w:w=\"130\" w:type=\"dxa\"/><w:bottom w:w=\"110\" w:type=\"dxa\"/><w:right w:w=\"130\" w:type=\"dxa\"/></w:tcMar>")
-                        append("<w:vAlign w:val=\"top\"/>")
-                        append("</w:tcPr>")
-                        append("<w:p><w:pPr><w:jc w:val=\"$align\"/></w:pPr>")
-                        append(buildTextRunsXml(text, sizeHalfPt = 19, colorHex = color, bold = bold))
-                        append("</w:p></w:tc>")
+                        rowsWritten++
+                    } else {
+                        val cells = listOf(
+                            row.date,
+                            if (isTransport) row.driverName else row.name,
+                            if (isTransport) row.busNumber else row.className,
+                            if (isTransport) row.complianceCheck else row.subject,
+                            row.exception,
+                            row.effect
+                        )
+
+                        append("<w:tr><w:trPr><w:cantSplit/></w:trPr>")
+                        cells.forEachIndexed { colIdx, text ->
+                            val align = if (colIdx == 0 || colIdx == 2) "center" else "left"
+                            val bold = colIdx == 1
+                            val color = when (colIdx) {
+                                1 -> "0F172A"
+                                4 -> "1E293B"
+                                2, 3, 5 -> "475569"
+                                else -> "334155"
+                            }
+                            append("<w:tc><w:tcPr>")
+                            append("<w:tcW w:w=\"${colWidthsDxa[colIdx]}\" w:type=\"dxa\"/>")
+                            append("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"$fill\"/>")
+                            append("<w:tcMar><w:top w:w=\"110\" w:type=\"dxa\"/><w:left w:w=\"130\" w:type=\"dxa\"/><w:bottom w:w=\"110\" w:type=\"dxa\"/><w:right w:w=\"130\" w:type=\"dxa\"/></w:tcMar>")
+                            append("<w:vAlign w:val=\"top\"/>")
+                            append("</w:tcPr>")
+                            append("<w:p><w:pPr><w:jc w:val=\"$align\"/></w:pPr>")
+                            append(buildTextRunsXml(text, sizeHalfPt = 19, colorHex = color, bold = bold))
+                            append("</w:p></w:tc>")
+                        }
+                        append("</w:tr>")
+                        rowsWritten++
                     }
-                    append("</w:tr>")
-                    rowsWritten++
                 }
 
                 if (sourceCount != rowsWritten) {

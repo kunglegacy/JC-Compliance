@@ -13,6 +13,7 @@ import com.example.data.local.AppPreferencesState
 import com.example.data.local.ComplianceNotificationJobService
 import com.example.data.local.ComplianceTaxonomy
 import com.example.data.local.DraftRepository
+import com.example.data.local.OfflineCacheRepository
 import com.example.data.local.SecurePreferences
 import com.example.data.model.AccentPalette
 import com.example.data.model.AppNotificationRecord
@@ -22,6 +23,7 @@ import com.example.data.model.ComplianceDivision
 import com.example.data.model.ComplianceReport
 import com.example.data.model.DirectorateUser
 import com.example.data.model.DraftMediaItem
+import com.example.data.model.GroupReportMember
 import com.example.data.model.LockPolicy
 import com.example.data.model.MediaUploadLimits
 import com.example.data.model.MobileAppConfig
@@ -45,6 +47,8 @@ import com.example.data.remote.ComplianceRepository
 import com.example.domain.AnalysisEngine
 import com.example.domain.ComplianceNotificationHelper
 import com.example.domain.DocxReportExporter
+import com.example.domain.GroupReportHelpers
+import com.example.domain.MediaCacheManager
 import com.example.domain.MediaCompressor
 import com.example.domain.OfflineAutoSubmitEngine
 import com.example.domain.PdfReportExporter
@@ -113,13 +117,16 @@ data class ComplianceUiState(
     val termSnapshots: List<TermAnalysisSnapshot> = emptyList(),
     val isExportingPptx: Boolean = false,
     val pptxExportSuccessMessage: String? = null,
-    val pptxExportError: String? = null
+    val pptxExportError: String? = null,
+    val lastSyncedAtMillis: Long = 0L,
+    val hasLoadedCache: Boolean = false
 )
 
 class ComplianceViewModel(application: Application) : AndroidViewModel(application) {
 
     private val prefs = SecurePreferences(application)
     private val draftRepo = DraftRepository(application)
+    private val offlineCacheRepo = OfflineCacheRepository(application)
     private val remoteRepo = ComplianceRepository(application)
 
     private var unlockedInCurrentProcess = false
@@ -128,7 +135,12 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
     private var lastVerifiedPassword: Pair<String, String>? = null
     private var knownReportSnapshots: Map<String, ReportResolutionStatus>? = null
     private var initialSyncDone = false
+    private var hasPerformedSessionLiveSync = false
+    private var lastReportFingerprint = ""
+    private var lastCatalogSyncAtMs = 0L
     private var pollingJob: Job? = null
+
+    private val catalogTtlMs = 6L * 60L * 60L * 1000L // 6 hours for slow-changing catalogs
 
     private val uuidRegex = Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
@@ -167,24 +179,31 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
 
     init {
         ComplianceNotificationHelper.ensureChannels(application)
+        MediaCacheManager.ensureInitialized(application)
         viewModelScope.launch {
             val initial = prefs.state.first()
             val locked = shouldShowAppLock(initial)
+            val session = initial.session
             if (locked) {
                 draftRepo.wipeActiveSessionMediaCache()
-            } else if (initial.session != null) {
-                draftRepo.warmActiveSessionMediaCache(initial.session.userId)
-                refreshSavedFormDraftState(initial.session.userId, triggerPrompt = true)
+            } else if (session != null) {
+                hydrateFromLocalCache(session)
+                draftRepo.warmActiveSessionMediaCache(session.userId)
+                refreshSavedFormDraftState(session.userId, triggerPrompt = true)
             }
             _uiState.update { it.copy(isBootstrapping = false) }
-            if (initial.session != null && initial.supabaseConfig.isConfigured) {
+            if (session != null) {
+                // Local draft & weekday 6 PM notifications always run offline or online
                 ComplianceNotificationJobService.schedulePeriodicSync(application)
                 ComplianceNotificationJobService.scheduleEveningReminder(application)
-                startForegroundNotificationLoop()
-                if (_uiState.value.isOnline) {
-                    flushQueuedSubmissionsIfOnline()
+                if (!locked) {
+                    evaluateLocalOfflineNotifications(session)
                 }
-                refreshAllData(silent = true)
+                startForegroundNotificationLoop()
+                if (!locked && initial.supabaseConfig.isConfigured && _uiState.value.isOnline) {
+                    flushQueuedSubmissionsIfOnline()
+                    syncLiveSessionOnceIfNeeded()
+                }
             }
         }
     }
@@ -193,10 +212,15 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         if (pollingJob?.isActive == true) return
         pollingJob = viewModelScope.launch {
             while (isActive) {
-                delay(45_000L)
+                delay(180_000L) // Lightweight 3-minute foreground check (zero bulk downloads)
                 val state = preferencesState.value
-                if (state.session != null && state.supabaseConfig.isConfigured && !shouldShowAppLock(state)) {
-                    refreshAllData(silent = true)
+                val session = state.session
+                if (session != null && !shouldShowAppLock(state)) {
+                    // Always evaluate local offline draft & weekday 6 PM reminders regardless of connectivity
+                    evaluateLocalOfflineNotifications(session)
+                    if (_uiState.value.isOnline && state.supabaseConfig.isConfigured) {
+                        checkForUpdatesAndSyncDelta(silent = true)
+                    }
                 }
             }
         }
@@ -240,8 +264,14 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             val state = preferencesState.value
             if (state.session != null && !shouldShowAppLock(state)) {
                 flushQueuedSubmissionsIfOnline()
-                if (wasOffline) {
-                    refreshAllData(silent = true)
+                if (wasOffline && state.supabaseConfig.isConfigured) {
+                    if (!hasPerformedSessionLiveSync) {
+                        syncLiveSessionOnceIfNeeded()
+                    } else {
+                        viewModelScope.launch {
+                            checkForUpdatesAndSyncDelta(silent = true)
+                        }
+                    }
                 }
             }
         }
@@ -256,18 +286,21 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             if (queuedBefore.isEmpty()) return@launch
             val res = OfflineAutoSubmitEngine.processQueue(getApplication())
             if (res.hasAnySubmitted) {
-                _uiState.update { current ->
+                val updatedList = run {
+                    val currentReports = _uiState.value.reports
                     val newIds = res.submittedReports.map { it.id }.toSet()
-                    current.copy(
-                        reports = res.submittedReports + current.reports.filterNot { it.id in newIds }
-                    )
+                    res.submittedReports + currentReports.filterNot { it.id in newIds }
                 }
+                knownReportSnapshots = (knownReportSnapshots.orEmpty()) + res.submittedReports.associate { it.id to it.status }
+                _uiState.update { current ->
+                    current.copy(reports = updatedList)
+                }
+                persistReportsWriteThrough(session, updatedList, state.supabaseConfig)
                 val count = res.submittedReports.size
                 notifyMessage(
                     if (count == 1) "Queued offline report submitted automatically."
                     else "$count queued offline reports submitted automatically."
                 )
-                refreshAllData(silent = true)
             } else if (res.hasRemainingFailures) {
                 ComplianceNotificationJobService.scheduleAutoSubmitJob(getApplication())
             }
@@ -305,6 +338,10 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun setAdminSubScreen(screen: String) {
+        if (screen == "system_config" && preferencesState.value.session?.role?.isSuperAdmin != true) {
+            notifyMessage("Only Super Admins can access Academic Configuration.", isError = true)
+            return
+        }
         _uiState.update { it.copy(adminSubScreen = screen) }
     }
 
@@ -437,6 +474,8 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                     prefs.saveBiometricCredential(session.email, password)
                 }
                 prefs.saveSession(session)
+                hasPerformedSessionLiveSync = false
+                hydrateFromLocalCache(session)
                 draftRepo.warmActiveSessionMediaCache(session.userId)
                 refreshSavedFormDraftState(session.userId, triggerPrompt = true)
                 _uiState.update {
@@ -448,11 +487,12 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                         accountSubScreen = null
                     )
                 }
-                refreshAllData(silent = true)
                 ComplianceNotificationJobService.schedulePeriodicSync(getApplication())
                 ComplianceNotificationJobService.scheduleEveningReminder(getApplication())
+                evaluateLocalOfflineNotifications(session)
                 startForegroundNotificationLoop()
                 flushQueuedSubmissionsIfOnline()
+                syncLiveSessionOnceIfNeeded()
             }.onFailure { err ->
                 _uiState.update {
                     it.copy(
@@ -576,6 +616,9 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         lastVerifiedPassword = null
         knownReportSnapshots = null
         initialSyncDone = false
+        hasPerformedSessionLiveSync = false
+        lastReportFingerprint = ""
+        lastCatalogSyncAtMs = 0L
         pollingJob?.cancel()
         pollingJob = null
         ComplianceNotificationJobService.cancelAll(getApplication())
@@ -584,6 +627,9 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         viewModelScope.launch {
             val state = preferencesState.value
             val session = state.session
+            if (session != null) {
+                offlineCacheRepo.clearForUser(session.userId)
+            }
             if (session != null && state.supabaseConfig.isConfigured) {
                 remoteRepo.signOut(state.supabaseConfig, session.accessToken)
             }
@@ -677,6 +723,7 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             if (!lockedNow && returningFromBackground) {
                 viewModelScope.launch {
                     refreshSavedFormDraftState(state.session.userId, triggerPrompt = true)
+                    evaluateLocalOfflineNotifications(state.session)
                 }
             }
         }
@@ -740,17 +787,25 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         unlockedInCurrentProcess = true
         wasBackgrounded = false
         prefs.setAppLockedSync(false)
-        val userId = preferencesState.value.session?.userId.orEmpty()
+        val session = preferencesState.value.session
+        val userId = session?.userId.orEmpty()
         viewModelScope.launch {
             prefs.touchLastActive()
-            if (userId.isNotBlank()) {
+            if (session != null && userId.isNotBlank()) {
+                if (!_uiState.value.hasLoadedCache) {
+                    hydrateFromLocalCache(session)
+                }
                 draftRepo.warmActiveSessionMediaCache(userId)
                 refreshSavedFormDraftState(userId, triggerPrompt = true)
+                evaluateLocalOfflineNotifications(session)
             }
             ComplianceNotificationJobService.schedulePeriodicSync(getApplication())
             ComplianceNotificationJobService.scheduleEveningReminder(getApplication())
             startForegroundNotificationLoop()
-            flushQueuedSubmissionsIfOnline()
+            if (_uiState.value.isOnline && preferencesState.value.supabaseConfig.isConfigured) {
+                flushQueuedSubmissionsIfOnline()
+                syncLiveSessionOnceIfNeeded()
+            }
             _uiState.update { it.copy(lockCheckNonce = System.currentTimeMillis()) }
         }
     }
@@ -831,17 +886,21 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                 val updatedSession = activeSession.copy(avatarUrl = canonicalObjectKey)
                 prefs.saveProfileCustomization(null, canonicalObjectKey)
                 prefs.saveSession(updatedSession)
+                val updatedUsers = _uiState.value.directorateUsers.map { u ->
+                    if (u.userId.equals(activeSession.userId, ignoreCase = true)) {
+                        u.copy(avatarUrl = canonicalObjectKey)
+                    } else u
+                }
                 _uiState.update { current ->
                     current.copy(
                         isLoading = false,
                         compressionLabel = null,
                         compressionProgress = null,
-                        directorateUsers = current.directorateUsers.map { u ->
-                            if (u.userId.equals(activeSession.userId, ignoreCase = true)) {
-                                u.copy(avatarUrl = canonicalObjectKey)
-                            } else u
-                        }
+                        directorateUsers = updatedUsers
                     )
+                }
+                if (updatedUsers.isNotEmpty()) {
+                    offlineCacheRepo.saveUsersOnly(activeSession.userId, updatedUsers)
                 }
                 notifyMessage("Profile photo updated.")
             }.onFailure { err ->
@@ -871,15 +930,19 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                 }
                 prefs.saveProfileCustomization(null, "")
                 prefs.saveSession(activeSession.copy(avatarUrl = ""))
+                val updatedUsers = _uiState.value.directorateUsers.map { u ->
+                    if (u.userId.equals(activeSession.userId, ignoreCase = true)) {
+                        u.copy(avatarUrl = "")
+                    } else u
+                }
                 _uiState.update { current ->
                     current.copy(
                         isLoading = false,
-                        directorateUsers = current.directorateUsers.map { u ->
-                            if (u.userId.equals(activeSession.userId, ignoreCase = true)) {
-                                u.copy(avatarUrl = "")
-                            } else u
-                        }
+                        directorateUsers = updatedUsers
                     )
+                }
+                if (updatedUsers.isNotEmpty()) {
+                    offlineCacheRepo.saveUsersOnly(activeSession.userId, updatedUsers)
                 }
             } else {
                 prefs.saveProfileCustomization(null, "")
@@ -910,14 +973,16 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                     return@launch
                 }
                 prefs.saveSession(activeSession.copy(displayName = cleanName))
+                val updatedUsers = _uiState.value.directorateUsers.map { u ->
+                    if (u.userId.equals(activeSession.userId, ignoreCase = true)) {
+                        u.copy(displayName = cleanName)
+                    } else u
+                }
                 _uiState.update { current ->
-                    current.copy(
-                        directorateUsers = current.directorateUsers.map { u ->
-                            if (u.userId.equals(activeSession.userId, ignoreCase = true)) {
-                                u.copy(displayName = cleanName)
-                            } else u
-                        }
-                    )
+                    current.copy(directorateUsers = updatedUsers)
+                }
+                if (updatedUsers.isNotEmpty()) {
+                    offlineCacheRepo.saveUsersOnly(activeSession.userId, updatedUsers)
                 }
             }
             _uiState.update { it.copy(isLoading = false) }
@@ -926,132 +991,403 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     // ---------------------------------------------------------------------
-    // DATA SYNCHRONIZATION
+    // OFFLINE-FIRST WORKSPACE CACHE & MINIMAL-EGRESS SYNCHRONIZATION
     // ---------------------------------------------------------------------
+    private suspend fun hydrateFromLocalCache(session: UserSession) {
+        val cached = offlineCacheRepo.loadWorkspaceCache(session.userId) ?: return
+        val scopedCachedReports = if (session.role.isAdminOrAbove) {
+            cached.reports
+        } else {
+            cached.reports.filter { it.reportedBy.equals(session.userId, ignoreCase = true) }
+        }
+        val myCachedDates = scopedCachedReports
+            .filter { it.reportedBy.equals(session.userId, ignoreCase = true) }
+            .flatMap { r -> listOf(r.createdAt.take(10), r.incidentDate.take(10)) }
+        prefs.syncReportActivityDates(session.userId, myCachedDates, AcademicWeekEngine.todayIso())
+
+        val seedKeys = buildList {
+            scopedCachedReports.forEach { r ->
+                add("new_sub_${r.id}")
+                if (r.status == ReportResolutionStatus.ACTION_REQUIRED) add("action_req_${r.id}_${r.status.key}")
+                if (r.status == ReportResolutionStatus.ACCEPTED) add("accepted_${r.id}_${r.status.key}")
+            }
+        }
+        ComplianceNotificationHelper.seedSeenKeys(getApplication(), seedKeys)
+        knownReportSnapshots = scopedCachedReports.associate { it.id to it.status }
+        initialSyncDone = true
+        lastReportFingerprint = cached.lastReportFingerprint
+        lastCatalogSyncAtMs = cached.lastCatalogSyncAtMs
+
+        _uiState.update { current ->
+            val resolvedSettings = cached.systemSettings ?: current.systemSettings
+            val pendingId = current.pendingNavigationReportId
+            val targetDetail = if (!pendingId.isNullOrBlank()) {
+                scopedCachedReports.firstOrNull { it.id == pendingId } ?: current.selectedReportForDetail
+            } else {
+                current.selectedReportForDetail
+            }
+            current.copy(
+                systemSettings = resolvedSettings,
+                selectedTerm = if (current.reports.isEmpty()) resolvedSettings.activeTerm else current.selectedTerm,
+                reports = scopedCachedReports,
+                staffList = cached.staffList.ifEmpty { current.staffList },
+                classes = cached.classes.ifEmpty { current.classes },
+                subjects = cached.subjects.ifEmpty { current.subjects },
+                serverCustomChecks = cached.serverCustomChecks.ifEmpty { current.serverCustomChecks },
+                directorateUsers = cached.directorateUsers.ifEmpty { current.directorateUsers },
+                termSnapshots = cached.termSnapshots.ifEmpty { current.termSnapshots },
+                storageProviderConfig = cached.storageProviderConfig ?: current.storageProviderConfig,
+                mobileAppConfig = cached.mobileAppConfig ?: current.mobileAppConfig,
+                selectedReportForDetail = targetDetail,
+                pendingNavigationReportId = if (targetDetail?.id == pendingId) null else pendingId,
+                lastSyncedAtMillis = cached.lastReportsSyncAtMs.coerceAtLeast(cached.lastFullSyncAtMs),
+                hasLoadedCache = true
+            )
+        }
+    }
+
+    private suspend fun evaluateLocalOfflineNotifications(session: UserSession) {
+        val currentDrafts = draftRepo.listAllDraftsOnce(session.userId, materializeMedia = false)
+        val composerDraft = draftRepo.loadComposerFormDraft(session.userId)?.takeIf { it.hasContent }
+        ComplianceNotificationHelper.notifyDraftReminderIfDue(
+            context = getApplication(),
+            userId = session.userId,
+            drafts = currentDrafts,
+            unfinishedFormDraft = composerDraft
+        )
+        val todayIso = AcademicWeekEngine.todayIso()
+        val cachedDates = offlineCacheRepo.getLatestUserReportDatesOffline(session.userId)
+        if (cachedDates.isNotEmpty()) {
+            prefs.syncReportActivityDates(session.userId, cachedDates, todayIso)
+        }
+        val (lastDate, firstDate) = prefs.getReportTrackingSnapshot(session.userId, todayIso)
+        ComplianceNotificationHelper.notifyEveningStandardReminderIfDue(
+            context = getApplication(),
+            userId = session.userId,
+            role = session.role,
+            hasAnyDraft = currentDrafts.isNotEmpty() || composerDraft != null,
+            lastSubmittedDateIso = lastDate,
+            firstTrackingDateIso = firstDate,
+            forceHourCheck = true
+        )
+    }
+
+    private fun syncLiveSessionOnceIfNeeded() {
+        if (hasPerformedSessionLiveSync) return
+        val state = preferencesState.value
+        val session = state.session ?: return
+        val config = state.supabaseConfig
+        if (!config.isConfigured || !_uiState.value.isOnline) return
+
+        viewModelScope.launch {
+            if (hasPerformedSessionLiveSync) return@launch
+            hasPerformedSessionLiveSync = true
+            syncWorkspaceInternal(forceFull = false, silent = true)
+        }
+    }
+
+    private suspend fun checkForUpdatesAndSyncDelta(silent: Boolean = true) {
+        val state = preferencesState.value
+        val session = state.session ?: return
+        val config = state.supabaseConfig
+        if (!config.isConfigured || !_uiState.value.isOnline) return
+
+        val activeSession = ensureFreshSession(config, session)
+        val unreadNotifications = remoteRepo.fetchUnreadNotifications(config, activeSession)
+        val hasReportNotification = unreadNotifications.any {
+            val t = it.type.uppercase()
+            t == "NEW_SUBMISSION" || t == "ACTION_REQUIRED" || t == "ACCEPTED"
+        }
+        dispatchServerNotifications(config, activeSession, unreadNotifications)
+
+        val signal = remoteRepo.fetchReportSyncSignal(config, activeSession).getOrNull()
+        val shouldFetchReports = _uiState.value.reports.isEmpty() ||
+            hasReportNotification ||
+            (signal != null && signal.fingerprint != lastReportFingerprint)
+
+        if (!shouldFetchReports) {
+            return
+        }
+
+        val reportsRes = remoteRepo.fetchReports(config, activeSession)
+        val fetchedReports = reportsRes.getOrNull() ?: return
+        val myServerDates = fetchedReports
+            .filter { it.reportedBy.equals(activeSession.userId, ignoreCase = true) }
+            .flatMap { r -> listOf(r.createdAt.take(10), r.incidentDate.take(10)) }
+        prefs.syncReportActivityDates(activeSession.userId, myServerDates, AcademicWeekEngine.todayIso())
+
+        val scopedReports = if (activeSession.role.isAdminOrAbove) {
+            fetchedReports
+        } else {
+            fetchedReports.filter { it.reportedBy.equals(activeSession.userId, ignoreCase = true) }
+        }
+        processReportDiffNotifications(activeSession, scopedReports)
+
+        val nowMs = System.currentTimeMillis()
+        val updatedFingerprint = signal?.fingerprint ?: lastReportFingerprint
+        lastReportFingerprint = updatedFingerprint
+        offlineCacheRepo.saveReportsOnly(
+            userId = activeSession.userId,
+            reports = scopedReports,
+            syncedAtMs = nowMs,
+            fingerprint = updatedFingerprint
+        )
+
+        _uiState.update { current ->
+            val pendingId = current.pendingNavigationReportId
+            val targetDetail = if (!pendingId.isNullOrBlank()) {
+                scopedReports.firstOrNull { it.id == pendingId } ?: current.selectedReportForDetail
+            } else {
+                current.selectedReportForDetail
+            }
+            current.copy(
+                reports = scopedReports,
+                selectedReportForDetail = targetDetail,
+                pendingNavigationReportId = if (targetDetail?.id == pendingId) null else pendingId,
+                lastSyncedAtMillis = nowMs,
+                hasLoadedCache = true
+            )
+        }
+        if (!silent) {
+            notifyMessage("Compliance updates synced.")
+        }
+    }
+
+    private suspend fun persistReportsWriteThrough(
+        session: UserSession,
+        updatedReports: List<ComplianceReport>,
+        config: SupabaseConfig
+    ) {
+        val nowMs = System.currentTimeMillis()
+        val updatedSignal = if (_uiState.value.isOnline && config.isConfigured) {
+            remoteRepo.fetchReportSyncSignal(config, session).getOrNull()?.fingerprint
+        } else null
+        if (!updatedSignal.isNullOrBlank()) {
+            lastReportFingerprint = updatedSignal
+        }
+        offlineCacheRepo.saveReportsOnly(
+            userId = session.userId,
+            reports = updatedReports,
+            syncedAtMs = nowMs,
+            fingerprint = updatedSignal
+        )
+        _uiState.update { it.copy(lastSyncedAtMillis = nowMs, hasLoadedCache = true) }
+    }
+
     fun refreshAllData(silent: Boolean = false) {
         val state = preferencesState.value
         val session = state.session ?: return
         val config = state.supabaseConfig
         if (!config.isConfigured) return
+        if (!_uiState.value.isOnline) {
+            if (!silent) {
+                notifyMessage("Offline mode — viewing cached records. Connect to sync new updates.")
+            }
+            return
+        }
 
         viewModelScope.launch {
-            _uiState.update { it.copy(isRefreshing = true, isLoading = !silent) }
-            val activeSession = ensureFreshSession(config, session)
+            syncWorkspaceInternal(forceFull = !silent, silent = silent)
+        }
+    }
 
-            val settingsDeferred = async { remoteRepo.fetchSettings(config, activeSession.accessToken) }
-            val reportsDeferred = async { remoteRepo.fetchReports(config, activeSession) }
-            val staffDeferred = async { remoteRepo.fetchStaff(config, activeSession.accessToken) }
-            val classesDeferred = async { remoteRepo.fetchClasses(config, activeSession.accessToken) }
-            val subjectsDeferred = async { remoteRepo.fetchSubjects(config, activeSession.accessToken) }
-            val checksDeferred = async { remoteRepo.fetchComplianceChecks(config, activeSession.accessToken) }
-            val profileDeferred = async { remoteRepo.fetchCurrentUserProfile(config, activeSession) }
-            val usersDeferred = async {
-                if (activeSession.role.isAdminOrAbove) {
-                    remoteRepo.fetchDirectorateUsers(config, activeSession.accessToken, activeSession)
-                } else {
-                    emptyList()
-                }
-            }
-            val notificationsDeferred = async {
-                remoteRepo.fetchUnreadNotifications(config, activeSession)
-            }
-            val storageProviderDeferred = async {
-                runCatching { remoteRepo.fetchStorageProviderConfig(config, activeSession.accessToken) }.getOrNull()
-            }
-            val mobileAppConfigDeferred = async {
-                runCatching { remoteRepo.fetchMobileAppConfig(config, activeSession.accessToken) }.getOrNull()
-            }
-            val snapshotsDeferred = async {
-                runCatching { remoteRepo.fetchTermSnapshots(config, activeSession.accessToken) }.getOrDefault(emptyList())
-            }
+    private suspend fun syncWorkspaceInternal(forceFull: Boolean, silent: Boolean) {
+        val state = preferencesState.value
+        val session = state.session ?: return
+        val config = state.supabaseConfig
+        if (!config.isConfigured || !_uiState.value.isOnline) return
 
-            val settings = settingsDeferred.await()
-            val reportsRes = reportsDeferred.await()
-            val staff = staffDeferred.await()
-            val classes = classesDeferred.await()
-            val subjects = subjectsDeferred.await()
-            val checks = checksDeferred.await()
-            val fetchedProfile = profileDeferred.await()
-            val users = usersDeferred.await()
-            val unreadNotifications = notificationsDeferred.await()
-            val storageProviderCfg = storageProviderDeferred.await()
-            val mobileAppCfg = mobileAppConfigDeferred.await()
-            val fetchedSnapshots = snapshotsDeferred.await()
+        _uiState.update { it.copy(isRefreshing = true, isLoading = !silent) }
+        val activeSession = ensureFreshSession(config, session)
+        val nowMs = System.currentTimeMillis()
+        val currentSnapshot = _uiState.value
 
-            fetchedProfile.onSuccess { (serverName, serverAvatar) ->
-                val resolvedName = serverName.ifBlank { activeSession.displayName }
-                val avatarChanged = serverAvatar != state.avatarUri || serverAvatar != activeSession.avatarUrl
-                val nameChanged = serverName.isNotBlank() && serverName != state.customDisplayName
-                if (avatarChanged || nameChanged) {
-                    prefs.saveProfileCustomization(
-                        displayName = if (serverName.isNotBlank()) serverName else null,
-                        avatarUri = serverAvatar
-                    )
-                    prefs.saveSession(
-                        activeSession.copy(
-                            displayName = resolvedName,
-                            avatarUrl = serverAvatar
-                        )
-                    )
-                }
-            }
+        val needCatalogSync = forceFull ||
+            currentSnapshot.staffList.isEmpty() ||
+            (nowMs - lastCatalogSyncAtMs) >= catalogTtlMs ||
+            !currentSnapshot.hasLoadedCache
 
-            dispatchServerNotifications(config, activeSession, unreadNotifications)
+        val notificationsDeferred = viewModelScope.async {
+            remoteRepo.fetchUnreadNotifications(config, activeSession)
+        }
+        val signalDeferred = viewModelScope.async {
+            remoteRepo.fetchReportSyncSignal(config, activeSession).getOrNull()
+        }
 
-            val fetchedReports = reportsRes.getOrElse { _uiState.value.reports }
-            val myServerDates = fetchedReports
-                .filter { it.reportedBy.equals(activeSession.userId, ignoreCase = true) }
-                .flatMap { r -> listOf(r.createdAt.take(10), r.incidentDate.take(10)) }
-            prefs.syncReportActivityDates(activeSession.userId, myServerDates, AcademicWeekEngine.todayIso())
+        val unreadNotifications = notificationsDeferred.await()
+        val hasReportNotification = unreadNotifications.any {
+            val t = it.type.uppercase()
+            t == "NEW_SUBMISSION" || t == "ACTION_REQUIRED" || t == "ACCEPTED"
+        }
+        dispatchServerNotifications(config, activeSession, unreadNotifications)
 
-            val scopedReports = if (activeSession.role.isAdminOrAbove) {
-                fetchedReports
+        val signal = signalDeferred.await()
+        val needReportFetch = forceFull ||
+            currentSnapshot.reports.isEmpty() ||
+            hasReportNotification ||
+            signal == null ||
+            signal.fingerprint != lastReportFingerprint
+
+        val reportsDeferred = viewModelScope.async {
+            if (needReportFetch) remoteRepo.fetchReports(config, activeSession)
+            else Result.success(currentSnapshot.reports)
+        }
+        val settingsDeferred = viewModelScope.async {
+            if (needCatalogSync) remoteRepo.fetchSettings(config, activeSession.accessToken)
+            else currentSnapshot.systemSettings
+        }
+        val staffDeferred = viewModelScope.async {
+            if (needCatalogSync) remoteRepo.fetchStaff(config, activeSession.accessToken)
+            else currentSnapshot.staffList
+        }
+        val classesDeferred = viewModelScope.async {
+            if (needCatalogSync) remoteRepo.fetchClasses(config, activeSession.accessToken)
+            else currentSnapshot.classes
+        }
+        val subjectsDeferred = viewModelScope.async {
+            if (needCatalogSync) remoteRepo.fetchSubjects(config, activeSession.accessToken)
+            else currentSnapshot.subjects
+        }
+        val checksDeferred = viewModelScope.async {
+            if (needCatalogSync) remoteRepo.fetchComplianceChecks(config, activeSession.accessToken)
+            else currentSnapshot.serverCustomChecks
+        }
+        val profileDeferred = viewModelScope.async {
+            remoteRepo.fetchCurrentUserProfile(config, activeSession)
+        }
+        val usersDeferred = viewModelScope.async {
+            if (!activeSession.role.isAdminOrAbove) {
+                emptyList()
+            } else if (needCatalogSync || currentSnapshot.directorateUsers.isEmpty()) {
+                remoteRepo.fetchDirectorateUsers(config, activeSession.accessToken, activeSession)
             } else {
-                fetchedReports.filter { it.reportedBy.equals(activeSession.userId, ignoreCase = true) }
+                currentSnapshot.directorateUsers
             }
+        }
+        val storageProviderDeferred = viewModelScope.async {
+            if (needCatalogSync || currentSnapshot.storageProviderConfig == null) {
+                runCatching { remoteRepo.fetchStorageProviderConfig(config, activeSession.accessToken) }.getOrNull()
+            } else {
+                currentSnapshot.storageProviderConfig
+            }
+        }
+        val mobileAppConfigDeferred = viewModelScope.async {
+            if (needCatalogSync || currentSnapshot.mobileAppConfig == null) {
+                runCatching { remoteRepo.fetchMobileAppConfig(config, activeSession.accessToken) }.getOrNull()
+            } else {
+                currentSnapshot.mobileAppConfig
+            }
+        }
+        val snapshotsDeferred = viewModelScope.async {
+            if (needCatalogSync || currentSnapshot.termSnapshots.isEmpty()) {
+                runCatching { remoteRepo.fetchTermSnapshots(config, activeSession.accessToken) }.getOrDefault(emptyList())
+            } else {
+                currentSnapshot.termSnapshots
+            }
+        }
 
-            processReportDiffNotifications(activeSession, scopedReports)
+        val settings = settingsDeferred.await()
+        val reportsRes = reportsDeferred.await()
+        val staff = staffDeferred.await()
+        val classes = classesDeferred.await()
+        val subjects = subjectsDeferred.await()
+        val checks = checksDeferred.await()
+        val fetchedProfile = profileDeferred.await()
+        val users = usersDeferred.await()
+        val storageProviderCfg = storageProviderDeferred.await()
+        val mobileAppCfg = mobileAppConfigDeferred.await()
+        val fetchedSnapshots = snapshotsDeferred.await()
 
-            // Check evening 6 PM reminder lazily when active after 6 PM
-            val currentDrafts = draftRepo.listAllDraftsOnce(activeSession.userId, materializeMedia = false)
-            val composerDraft = draftRepo.loadComposerFormDraft(activeSession.userId)?.takeIf { it.hasContent }
-            val (lastDate, firstDate) = prefs.getReportTrackingSnapshot(activeSession.userId, AcademicWeekEngine.todayIso())
-            ComplianceNotificationHelper.notifyEveningStandardReminderIfDue(
-                context = getApplication(),
-                userId = activeSession.userId,
-                role = activeSession.role,
-                hasAnyDraft = currentDrafts.isNotEmpty() || composerDraft != null,
-                lastSubmittedDateIso = lastDate,
-                firstTrackingDateIso = firstDate,
-                forceHourCheck = true
-            )
-
-            _uiState.update { current ->
-                val newTerm = if (current.selectedTerm.isBlank()) settings.activeTerm else current.selectedTerm
-                val pendingId = current.pendingNavigationReportId
-                val targetDetail = if (!pendingId.isNullOrBlank()) {
-                    scopedReports.firstOrNull { it.id == pendingId } ?: current.selectedReportForDetail
-                } else {
-                    current.selectedReportForDetail
-                }
-                current.copy(
-                    isRefreshing = false,
-                    isLoading = false,
-                    systemSettings = settings,
-                    selectedTerm = if (current.reports.isEmpty()) settings.activeTerm else newTerm,
-                    reports = scopedReports,
-                    staffList = staff,
-                    classes = classes,
-                    subjects = subjects,
-                    serverCustomChecks = checks,
-                    directorateUsers = users,
-                    selectedReportForDetail = targetDetail,
-                    pendingNavigationReportId = if (targetDetail?.id == pendingId) null else pendingId,
-                    storageProviderConfig = storageProviderCfg ?: current.storageProviderConfig,
-                    mobileAppConfig = mobileAppCfg ?: current.mobileAppConfig,
-                    termSnapshots = fetchedSnapshots.ifEmpty { current.termSnapshots }
+        fetchedProfile.onSuccess { (serverName, serverAvatar) ->
+            val resolvedName = serverName.ifBlank { activeSession.displayName }
+            val avatarChanged = serverAvatar != state.avatarUri || serverAvatar != activeSession.avatarUrl
+            val nameChanged = serverName.isNotBlank() && serverName != state.customDisplayName
+            if (avatarChanged || nameChanged) {
+                prefs.saveProfileCustomization(
+                    displayName = if (serverName.isNotBlank()) serverName else null,
+                    avatarUri = serverAvatar
+                )
+                prefs.saveSession(
+                    activeSession.copy(
+                        displayName = resolvedName,
+                        avatarUrl = serverAvatar
+                    )
                 )
             }
+        }
+
+        val fetchedReports = reportsRes.getOrElse { currentSnapshot.reports }
+        val myServerDates = fetchedReports
+            .filter { it.reportedBy.equals(activeSession.userId, ignoreCase = true) }
+            .flatMap { r -> listOf(r.createdAt.take(10), r.incidentDate.take(10)) }
+        prefs.syncReportActivityDates(activeSession.userId, myServerDates, AcademicWeekEngine.todayIso())
+
+        val scopedReports = if (activeSession.role.isAdminOrAbove) {
+            fetchedReports
+        } else {
+            fetchedReports.filter { it.reportedBy.equals(activeSession.userId, ignoreCase = true) }
+        }
+
+        processReportDiffNotifications(activeSession, scopedReports)
+        evaluateLocalOfflineNotifications(activeSession)
+
+        val effectiveFingerprint = signal?.fingerprint ?: lastReportFingerprint
+        lastReportFingerprint = effectiveFingerprint
+        if (needCatalogSync) {
+            lastCatalogSyncAtMs = nowMs
+        }
+        val finalSnapshots = fetchedSnapshots.ifEmpty { currentSnapshot.termSnapshots }
+        val finalStorageCfg = storageProviderCfg ?: currentSnapshot.storageProviderConfig
+        val finalMobileCfg = mobileAppCfg ?: currentSnapshot.mobileAppConfig
+        val finalStaff = staff.ifEmpty { currentSnapshot.staffList }
+        val finalUsers = users.ifEmpty { currentSnapshot.directorateUsers }
+
+        offlineCacheRepo.saveFullWorkspace(
+            userId = activeSession.userId,
+            reports = scopedReports,
+            staffList = finalStaff,
+            classes = classes,
+            subjects = subjects,
+            serverCustomChecks = checks,
+            directorateUsers = finalUsers,
+            systemSettings = settings,
+            termSnapshots = finalSnapshots,
+            storageProviderConfig = finalStorageCfg,
+            mobileAppConfig = finalMobileCfg,
+            lastFullSyncAtMs = nowMs,
+            lastReportsSyncAtMs = if (needReportFetch) nowMs else currentSnapshot.lastSyncedAtMillis.coerceAtLeast(nowMs),
+            lastCatalogSyncAtMs = lastCatalogSyncAtMs,
+            lastReportFingerprint = effectiveFingerprint
+        )
+
+        hasPerformedSessionLiveSync = true
+        _uiState.update { current ->
+            val newTerm = if (current.selectedTerm.isBlank()) settings.activeTerm else current.selectedTerm
+            val pendingId = current.pendingNavigationReportId
+            val targetDetail = if (!pendingId.isNullOrBlank()) {
+                scopedReports.firstOrNull { it.id == pendingId } ?: current.selectedReportForDetail
+            } else {
+                current.selectedReportForDetail
+            }
+            current.copy(
+                isRefreshing = false,
+                isLoading = false,
+                systemSettings = settings,
+                selectedTerm = if (current.reports.isEmpty()) settings.activeTerm else newTerm,
+                reports = scopedReports,
+                staffList = finalStaff,
+                classes = classes,
+                subjects = subjects,
+                serverCustomChecks = checks,
+                directorateUsers = finalUsers,
+                selectedReportForDetail = targetDetail,
+                pendingNavigationReportId = if (targetDetail?.id == pendingId) null else pendingId,
+                storageProviderConfig = finalStorageCfg,
+                mobileAppConfig = finalMobileCfg,
+                termSnapshots = finalSnapshots,
+                lastSyncedAtMillis = nowMs,
+                hasLoadedCache = true
+            )
         }
     }
 
@@ -1281,6 +1617,8 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         effectText: String,
         attachments: List<ReportEvidenceAttachment>,
         sourceDraft: OfflineDraft?,
+        isGroupReport: Boolean = false,
+        groupMembers: List<GroupReportMember> = emptyList(),
         onComplete: () -> Unit = {}
     ) {
         val userId = preferencesState.value.session?.userId.orEmpty()
@@ -1298,7 +1636,19 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         }
 
         val uiSnapshot = _uiState.value
+        val isGroupSubmission = division == ComplianceDivision.ACADEMIC && isGroupReport && groupMembers.isNotEmpty()
+        val normalizedMembers = if (isGroupSubmission) {
+            GroupReportHelpers.normalizeMembers(
+                members = groupMembers,
+                staffRoster = uiSnapshot.staffList,
+                classes = uiSnapshot.classes,
+                subjects = uiSnapshot.subjects
+            )
+        } else {
+            emptyList()
+        }
         val resolvedStaff = when {
+            isGroupSubmission -> null
             division == ComplianceDivision.CDS -> null
             staff != null && isUuid(staff.id) -> staff
             staff != null -> uiSnapshot.staffList.firstOrNull {
@@ -1309,23 +1659,25 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             } ?: staff
             else -> null
         }
-        val resolvedClass = classroom?.let { cls ->
-            if (isUuid(cls.id)) cls else uiSnapshot.classes.firstOrNull { isUuid(it.id) && it.name.equals(cls.name, true) } ?: cls
+        val resolvedClass = if (isGroupSubmission) null else classroom?.let { cls ->
+            if (cls.id.equals("NONE", true) || cls.name.equals("None", true)) ComplianceTaxonomy.noneClassroom
+            else if (isUuid(cls.id)) cls
+            else uiSnapshot.classes.firstOrNull { isUuid(it.id) && it.name.equals(cls.name, true) } ?: cls
         }
-        val resolvedSubject = subject?.let { subj ->
+        val resolvedSubject = if (isGroupSubmission) null else subject?.let { subj ->
             if (isUuid(subj.id)) subj else uiSnapshot.subjects.firstOrNull { isUuid(it.id) && it.name.equals(subj.name, true) } ?: subj
         }
 
         val draftPayload = ReportFormDraft(
             divisionKey = division.key,
-            targetType = targetType,
+            targetType = if (isGroupSubmission) "division" else targetType,
             staffId = resolvedStaff?.id,
-            staffCode = resolvedStaff?.staffCode,
-            staffName = resolvedStaff?.name,
+            staffCode = if (isGroupSubmission) "GROUP (${normalizedMembers.size})" else resolvedStaff?.staffCode,
+            staffName = if (isGroupSubmission) normalizedMembers.joinToString(", ") { it.staffName } else resolvedStaff?.name,
             classId = resolvedClass?.id,
-            className = resolvedClass?.name,
+            className = if (isGroupSubmission) normalizedMembers.joinToString(", ") { it.className } else resolvedClass?.name,
             subjectId = resolvedSubject?.id,
-            subjectName = resolvedSubject?.name,
+            subjectName = if (isGroupSubmission) normalizedMembers.joinToString(", ") { it.subjectName.ifBlank { "—" } } else resolvedSubject?.name,
             operationScope = operationScope,
             opPersonOrLocation = assignedLocation.ifBlank { specificSubjectText },
             studentNamesArm = if (division == ComplianceDivision.DISCIPLINE) specificSubjectText else "",
@@ -1336,7 +1688,9 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             effectText = effectText.trim(),
             sourceDraftId = sourceDraft?.id,
             hasUserEdited = true,
-            updatedAtMillis = System.currentTimeMillis()
+            updatedAtMillis = System.currentTimeMillis(),
+            isGroupReport = isGroupSubmission,
+            groupMembers = normalizedMembers
         )
 
         viewModelScope.launch {
@@ -1470,6 +1824,8 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         sourceDraft: OfflineDraft? = null,
         cleanDraftMediaOnComplete: Boolean = true,
         draftMediaItems: List<DraftMediaItem> = emptyList(),
+        isGroupReport: Boolean = false,
+        groupMembers: List<GroupReportMember> = emptyList(),
         onComplete: () -> Unit = {}
     ) {
         val state = preferencesState.value
@@ -1644,7 +2000,19 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             _uiState.update { it.copy(compressionLabel = "Saving compliance report...", compressionProgress = 0.98f) }
 
             val uiSnapshot = _uiState.value
+            val isGroupSubmission = division == ComplianceDivision.ACADEMIC && isGroupReport && groupMembers.isNotEmpty()
+            val normalizedGroupMembers = if (isGroupSubmission) {
+                GroupReportHelpers.normalizeMembers(
+                    members = groupMembers,
+                    staffRoster = uiSnapshot.staffList,
+                    classes = uiSnapshot.classes,
+                    subjects = uiSnapshot.subjects
+                )
+            } else {
+                emptyList()
+            }
             val resolvedStaff = when {
+                isGroupSubmission -> null
                 division == ComplianceDivision.CDS -> null
                 staff != null && isUuid(staff.id) -> staff
                 staff != null -> uiSnapshot.staffList.firstOrNull {
@@ -1657,24 +2025,32 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             }
             val resolvedStaffId = resolvedStaff?.id?.takeIf { isUuid(it) }
             val effectiveTargetType = when {
+                isGroupSubmission -> "division"
                 division == ComplianceDivision.CDS -> "division"
                 division == ComplianceDivision.OPERATIONS && resolvedStaffId == null -> "division"
                 division == ComplianceDivision.DISCIPLINE && (targetType == "division" || resolvedStaffId == null) -> "division"
                 else -> "staff"
             }
 
-            val resolvedClassId = classroom?.id?.takeIf { isUuid(it) }
-                ?: classroom?.name?.let { cName ->
-                    uiSnapshot.classes.firstOrNull { isUuid(it.id) && it.name.equals(cName, true) }?.id
-                }
-            val resolvedSubjectId = subject?.id?.takeIf { isUuid(it) }
-                ?: subject?.name?.let { sName ->
-                    uiSnapshot.subjects.firstOrNull { isUuid(it.id) && it.name.equals(sName, true) }?.id
-                }
+            val isNoneClass = classroom?.id.equals("NONE", true) || classroom?.name.equals("None", true)
+            val resolvedClassId = when {
+                isGroupSubmission || isNoneClass -> null
+                else -> classroom?.id?.takeIf { isUuid(it) }
+                    ?: classroom?.name?.let { cName ->
+                        uiSnapshot.classes.firstOrNull { isUuid(it.id) && it.name.equals(cName, true) }?.id
+                    }
+            }
+            val resolvedSubjectId = if (isGroupSubmission) null else {
+                subject?.id?.takeIf { isUuid(it) }
+                    ?: subject?.name?.let { sName ->
+                        uiSnapshot.subjects.firstOrNull { isUuid(it.id) && it.name.equals(sName, true) }?.id
+                    }
+            }
             val resolvedCheckId = check?.id?.trim()
                 ?.takeIf { it.isNotBlank() && !it.equals("CUSTOM", ignoreCase = true) }
 
             val staffNameVal = when {
+                isGroupSubmission -> normalizedGroupMembers.joinToString(", ") { it.staffName }
                 resolvedStaff != null -> resolvedStaff.name
                 division == ComplianceDivision.OPERATIONS && specificSubjectText.isNotBlank() -> specificSubjectText.trim()
                 division == ComplianceDivision.OPERATIONS -> operationScope.ifBlank { "Operation" }
@@ -1733,6 +2109,13 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                     put("is_edited", true)
                     put("edited_at", java.time.Instant.now().toString())
                 }
+                if (isGroupSubmission) {
+                    GroupReportHelpers.applyGroupFieldsToPayload(this, normalizedGroupMembers)
+                } else if (existingReport?.isGroupReport == true) {
+                    put("is_group_report", false)
+                    put("group_members", JSONArray())
+                    put("exception_tags", JSONArray())
+                }
             }
 
             val result = if (existingReport != null) {
@@ -1773,12 +2156,12 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                     }
                     knownReportSnapshots = (knownReportSnapshots.orEmpty()) + (saved.id to saved.status)
                 }
+                val updatedList = if (existingReport != null) {
+                    _uiState.value.reports.map { if (it.id == saved.id) saved else it }
+                } else {
+                    listOf(saved) + _uiState.value.reports
+                }
                 _uiState.update { current ->
-                    val updatedList = if (existingReport != null) {
-                        current.reports.map { if (it.id == saved.id) saved else it }
-                    } else {
-                        listOf(saved) + current.reports
-                    }
                     current.copy(
                         isLoading = false,
                         compressionLabel = null,
@@ -1792,8 +2175,8 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                         showResumeReportPrompt = if (existingReport == null) false else current.showResumeReportPrompt
                     )
                 }
+                persistReportsWriteThrough(activeSession, updatedList, config)
                 notifyMessage(if (existingReport != null) "Exception report updated." else "Compliance exception submitted.")
-                refreshAllData(silent = true)
                 onComplete()
             }.onFailure { err ->
                 _uiState.update { it.copy(isLoading = false, compressionLabel = null, compressionProgress = null) }
@@ -1834,13 +2217,15 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             }
             remoteRepo.updateReport(state.supabaseConfig, activeSession.accessToken, report.id, updates)
                 .onSuccess { updated ->
+                    val updatedList = _uiState.value.reports.map { if (it.id == updated.id) updated else it }
                     _uiState.update { current ->
                         current.copy(
                             isLoading = false,
-                            reports = current.reports.map { if (it.id == updated.id) updated else it },
+                            reports = updatedList,
                             selectedReportForDetail = if (current.selectedReportForDetail?.id == updated.id) updated else current.selectedReportForDetail
                         )
                     }
+                    persistReportsWriteThrough(activeSession, updatedList, state.supabaseConfig)
                     notifyMessage("Exception updated.")
                 }
                 .onFailure { err ->
@@ -1858,8 +2243,8 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
     ) {
         val state = preferencesState.value
         val session = state.session ?: return
-        if (!session.role.isAdminOrAbove) {
-            notifyMessage("Only Directorate reviewers can submit evidence feedback.", isError = true)
+        if (!session.role.isSuperAdmin) {
+            notifyMessage("Only Super Admins can submit evidence moderation feedback.", isError = true)
             return
         }
         viewModelScope.launch {
@@ -1934,12 +2319,14 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                             actorName = adminActor
                         )
                     }
+                    val updatedList = _uiState.value.reports.map { if (it.id == updated.id) updated else it }
                     _uiState.update { current ->
                         current.copy(
-                            reports = current.reports.map { if (it.id == updated.id) updated else it },
+                            reports = updatedList,
                             selectedReportForDetail = if (current.selectedReportForDetail?.id == updated.id) updated else current.selectedReportForDetail
                         )
                     }
+                    persistReportsWriteThrough(activeSession, updatedList, state.supabaseConfig)
                     notifyMessage(
                         if (verdict == EvidenceVerdict.NOTE) "Evidence note saved & marked Pending."
                         else "Evidence feedback saved (${nextStatus.label})."
@@ -1954,6 +2341,10 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
     fun toggleSeenStatus(report: ComplianceReport) {
         val state = preferencesState.value
         val session = state.session ?: return
+        if (!session.role.isSuperAdmin) {
+            notifyMessage("Only Super Admins can change report review status.", isError = true)
+            return
+        }
         val targetSeen = !report.isSeen || report.isPending
         val clearPending = report.isPending
         viewModelScope.launch {
@@ -1966,12 +2357,14 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             )
                 .onSuccess { updated ->
                     knownReportSnapshots = (knownReportSnapshots.orEmpty()) + (updated.id to updated.status)
+                    val updatedList = _uiState.value.reports.map { if (it.id == updated.id) updated else it }
                     _uiState.update { current ->
                         current.copy(
-                            reports = current.reports.map { if (it.id == updated.id) updated else it },
+                            reports = updatedList,
                             selectedReportForDetail = if (current.selectedReportForDetail?.id == updated.id) updated else current.selectedReportForDetail
                         )
                     }
+                    persistReportsWriteThrough(session, updatedList, state.supabaseConfig)
                     notifyMessage(if (updated.isSeen) "Marked as Reviewed (Seen)." else "Reverted to Open (Unseen).")
                 }
                 .onFailure { notifyMessage(it.message ?: "Unable to update review state.", isError = true) }
@@ -1981,6 +2374,10 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
     fun updateResolution(report: ComplianceReport, status: ReportResolutionStatus, notes: String) {
         val state = preferencesState.value
         val session = state.session ?: return
+        if (!session.role.isSuperAdmin) {
+            notifyMessage("Only Super Admins can update exception resolution status.", isError = true)
+            return
+        }
         viewModelScope.launch {
             val activeSession = ensureFreshSession(state.supabaseConfig, session)
             val adminActor = activeSession.displayName.ifBlank { activeSession.email }
@@ -2007,12 +2404,14 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                             actorName = adminActor
                         )
                     }
+                    val updatedList = _uiState.value.reports.map { if (it.id == updated.id) updated else it }
                     _uiState.update { current ->
                         current.copy(
-                            reports = current.reports.map { if (it.id == updated.id) updated else it },
+                            reports = updatedList,
                             selectedReportForDetail = updated
                         )
                     }
+                    persistReportsWriteThrough(activeSession, updatedList, state.supabaseConfig)
                     notifyMessage("Status updated to ${status.label}.")
                 }
                 .onFailure { notifyMessage(it.message ?: "Failed to update status.", isError = true) }
@@ -2022,6 +2421,10 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
     fun remapReportCheck(report: ComplianceReport, newCheck: ComplianceCheck) {
         val state = preferencesState.value
         val session = state.session ?: return
+        if (!session.role.isSuperAdmin) {
+            notifyMessage("Only Super Admins can remap compliance standards.", isError = true)
+            return
+        }
         viewModelScope.launch {
             val updates = JSONObject().apply {
                 put("check_id", newCheck.id)
@@ -2031,12 +2434,14 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             }
             remoteRepo.updateReport(state.supabaseConfig, session.accessToken, report.id, updates)
                 .onSuccess { updated ->
+                    val updatedList = _uiState.value.reports.map { if (it.id == updated.id) updated else it }
                     _uiState.update { current ->
                         current.copy(
-                            reports = current.reports.map { if (it.id == updated.id) updated else it },
+                            reports = updatedList,
                             selectedReportForDetail = updated
                         )
                     }
+                    persistReportsWriteThrough(session, updatedList, state.supabaseConfig)
                     notifyMessage("Remapped standard to ${newCheck.name}.")
                 }
                 .onFailure { notifyMessage(it.message ?: "Failed to remap check.", isError = true) }
@@ -2046,6 +2451,10 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
     fun deleteReport(report: ComplianceReport) {
         val state = preferencesState.value
         val session = state.session ?: return
+        if (!session.role.isSuperAdmin) {
+            notifyMessage("Only Super Admins can delete compliance reports.", isError = true)
+            return
+        }
         viewModelScope.launch {
             val activeSession = ensureFreshSession(state.supabaseConfig, session)
             remoteRepo.deleteReport(state.supabaseConfig, activeSession.accessToken, report.id)
@@ -2059,12 +2468,14 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                             remoteRepo.deleteEvidenceMedia(state.supabaseConfig, activeSession.accessToken, mediaPath)
                         }
                     }
+                    val updatedList = _uiState.value.reports.filterNot { it.id == report.id }
                     _uiState.update { current ->
                         current.copy(
-                            reports = current.reports.filterNot { it.id == report.id },
+                            reports = updatedList,
                             selectedReportForDetail = null
                         )
                     }
+                    persistReportsWriteThrough(activeSession, updatedList, state.supabaseConfig)
                     notifyMessage("Report permanently deleted.")
                 }
                 .onFailure { notifyMessage(it.message ?: "Unable to delete report.", isError = true) }
@@ -2134,9 +2545,11 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                 )
                 if (remoteRes.isSuccess) {
                     val created = remoteRes.getOrThrow()
+                    val updatedChecks = _uiState.value.serverCustomChecks + created
                     _uiState.update { current ->
-                        current.copy(serverCustomChecks = current.serverCustomChecks + created)
+                        current.copy(serverCustomChecks = updatedChecks)
                     }
+                    offlineCacheRepo.saveChecksOnly(activeSession.userId, updatedChecks)
                     notifyMessage("Custom compliance check saved to registry.")
                     return@launch
                 }
@@ -2163,14 +2576,15 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             _uiState.update { it.copy(isLoading = true) }
             remoteRepo.upsertStaff(state.supabaseConfig, session.accessToken, staff, isNew)
                 .onSuccess { saved ->
+                    val list = if (isNew) {
+                        (_uiState.value.staffList + saved).sortedBy { it.name }
+                    } else {
+                        _uiState.value.staffList.map { if (it.id == saved.id) saved else it }
+                    }
                     _uiState.update { current ->
-                        val list = if (isNew) {
-                            (current.staffList + saved).sortedBy { it.name }
-                        } else {
-                            current.staffList.map { if (it.id == saved.id) saved else it }
-                        }
                         current.copy(isLoading = false, staffList = list)
                     }
+                    offlineCacheRepo.saveStaffOnly(session.userId, list)
                     notifyMessage(if (isNew) "Staff member added." else "Staff details updated.")
                     onSuccess()
                 }
@@ -2188,13 +2602,13 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
             val newActive = !staff.isActive
             remoteRepo.setStaffActiveStatus(state.supabaseConfig, session.accessToken, staff.id, newActive)
                 .onSuccess {
-                    _uiState.update { current ->
-                        current.copy(
-                            staffList = current.staffList.map {
-                                if (it.id == staff.id) it.copy(isActive = newActive) else it
-                            }
-                        )
+                    val updatedStaff = _uiState.value.staffList.map {
+                        if (it.id == staff.id) it.copy(isActive = newActive) else it
                     }
+                    _uiState.update { current ->
+                        current.copy(staffList = updatedStaff)
+                    }
+                    offlineCacheRepo.saveStaffOnly(session.userId, updatedStaff)
                     notifyMessage(if (newActive) "${staff.name} restored." else "${staff.name} archived.")
                 }
                 .onFailure { notifyMessage(it.message ?: "Unable to update staff status.", isError = true) }
@@ -2216,15 +2630,28 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                 staffCode = newCodeForHolder.trim(),
                 staffNumber = newCodeForHolder.trim()
             )
-            remoteRepo.upsertStaff(state.supabaseConfig, session.accessToken, updatedHolder, isNew = false)
-                .onFailure { err ->
+            val savedHolder = remoteRepo.upsertStaff(state.supabaseConfig, session.accessToken, updatedHolder, isNew = false)
+                .getOrElse { err ->
                     _uiState.update { it.copy(isLoading = false) }
                     notifyMessage(err.message ?: "Failed to reassign conflicting code.", isError = true)
                     return@launch
                 }
             remoteRepo.upsertStaff(state.supabaseConfig, session.accessToken, newStaff, isNew = isNew)
-                .onSuccess {
-                    refreshAllData(silent = true)
+                .onSuccess { savedNew ->
+                    val mergedBase = _uiState.value.staffList.map { item ->
+                        when (item.id) {
+                            savedHolder.id -> savedHolder
+                            savedNew.id -> savedNew
+                            else -> item
+                        }
+                    }
+                    val updatedList = if (isNew && mergedBase.none { it.id == savedNew.id }) {
+                        (mergedBase + savedNew).sortedBy { it.name }
+                    } else {
+                        mergedBase.sortedBy { it.name }
+                    }
+                    _uiState.update { it.copy(isLoading = false, staffList = updatedList) }
+                    offlineCacheRepo.saveStaffOnly(session.userId, updatedList)
                     notifyMessage("Conflict resolved and staff record saved.")
                     onSuccess()
                 }
@@ -2246,15 +2673,29 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
             val clearedCode = "${conflictHolder.staffCode}-ARCHIVED-${System.currentTimeMillis() % 10000}"
-            remoteRepo.upsertStaff(
+            val archivedTarget = conflictHolder.copy(staffCode = clearedCode, staffNumber = clearedCode, isActive = false)
+            val savedArchived = remoteRepo.upsertStaff(
                 state.supabaseConfig,
                 session.accessToken,
-                conflictHolder.copy(staffCode = clearedCode, staffNumber = clearedCode, isActive = false),
+                archivedTarget,
                 isNew = false
-            )
+            ).getOrDefault(archivedTarget)
             remoteRepo.upsertStaff(state.supabaseConfig, session.accessToken, newStaff, isNew = isNew)
-                .onSuccess {
-                    refreshAllData(silent = true)
+                .onSuccess { savedNew ->
+                    val mergedBase = _uiState.value.staffList.map { item ->
+                        when (item.id) {
+                            savedArchived.id -> savedArchived
+                            savedNew.id -> savedNew
+                            else -> item
+                        }
+                    }
+                    val updatedList = if (isNew && mergedBase.none { it.id == savedNew.id }) {
+                        (mergedBase + savedNew).sortedBy { it.name }
+                    } else {
+                        mergedBase.sortedBy { it.name }
+                    }
+                    _uiState.update { it.copy(isLoading = false, staffList = updatedList) }
+                    offlineCacheRepo.saveStaffOnly(session.userId, updatedList)
                     notifyMessage("Former record archived and new staff record saved.")
                     onSuccess()
                 }
@@ -2271,13 +2712,13 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         viewModelScope.launch {
             remoteRepo.updateDirectorateUserRole(state.supabaseConfig, session.accessToken, user.userId, newRole)
                 .onSuccess {
-                    _uiState.update { cur ->
-                        cur.copy(
-                            directorateUsers = cur.directorateUsers.map {
-                                if (it.userId == user.userId) it.copy(role = newRole) else it
-                            }
-                        )
+                    val updatedUsers = _uiState.value.directorateUsers.map {
+                        if (it.userId == user.userId) it.copy(role = newRole) else it
                     }
+                    _uiState.update { cur ->
+                        cur.copy(directorateUsers = updatedUsers)
+                    }
+                    offlineCacheRepo.saveUsersOnly(session.userId, updatedUsers)
                     notifyMessage("Role updated to ${newRole.label}.")
                 }
                 .onFailure { notifyMessage(it.message ?: "Failed to update role.", isError = true) }
@@ -2291,35 +2732,45 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
         viewModelScope.launch {
             remoteRepo.updateDirectorateUserStatus(state.supabaseConfig, session.accessToken, user.userId, nextStatus)
                 .onSuccess {
-                    _uiState.update { cur ->
-                        cur.copy(
-                            directorateUsers = cur.directorateUsers.map {
-                                if (it.userId == user.userId) it.copy(status = nextStatus) else it
-                            }
-                        )
+                    val updatedUsers = _uiState.value.directorateUsers.map {
+                        if (it.userId == user.userId) it.copy(status = nextStatus) else it
                     }
+                    _uiState.update { cur ->
+                        cur.copy(directorateUsers = updatedUsers)
+                    }
+                    offlineCacheRepo.saveUsersOnly(session.userId, updatedUsers)
                     notifyMessage("User ${if (nextStatus == "active") "activated" else "suspended"}.")
                 }
                 .onFailure { notifyMessage(it.message ?: "Failed updating user status.", isError = true) }
         }
     }
 
-    fun updateUserEmail(user: DirectorateUser, newEmail: String) {
+    fun updateUserName(user: DirectorateUser, newName: String) {
         val state = preferencesState.value
         val session = state.session ?: return
+        val cleanName = newName.trim()
+        if (cleanName.isBlank()) {
+            notifyMessage("Officer name cannot be empty.", isError = true)
+            return
+        }
         viewModelScope.launch {
-            remoteRepo.updateDirectorateUserEmail(state.supabaseConfig, session.accessToken, user.userId, newEmail)
+            val activeSession = ensureFreshSession(state.supabaseConfig, session)
+            remoteRepo.updateDirectorateUserName(state.supabaseConfig, activeSession.accessToken, user.userId, cleanName)
                 .onSuccess {
-                    _uiState.update { cur ->
-                        cur.copy(
-                            directorateUsers = cur.directorateUsers.map {
-                                if (it.userId == user.userId) it.copy(email = newEmail.trim()) else it
-                            }
-                        )
+                    val updatedUsers = _uiState.value.directorateUsers.map {
+                        if (it.userId == user.userId) it.copy(displayName = cleanName) else it
                     }
-                    notifyMessage("User email updated.")
+                    _uiState.update { cur ->
+                        cur.copy(directorateUsers = updatedUsers)
+                    }
+                    offlineCacheRepo.saveUsersOnly(activeSession.userId, updatedUsers)
+                    if (user.userId.equals(activeSession.userId, ignoreCase = true)) {
+                        prefs.saveProfileCustomization(cleanName, null)
+                        prefs.saveSession(activeSession.copy(displayName = cleanName))
+                    }
+                    notifyMessage("Officer name updated.")
                 }
-                .onFailure { notifyMessage(it.message ?: "Failed updating user email.", isError = true) }
+                .onFailure { notifyMessage(it.message ?: "Failed updating officer name.", isError = true) }
         }
     }
 
@@ -2355,13 +2806,13 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                 staffNumber,
                 role
             ).onSuccess { newUser ->
+                val merged = (listOf(newUser) + _uiState.value.directorateUsers.filterNot {
+                    it.userId.equals(newUser.userId, true) || it.email.equals(newUser.email, true)
+                })
                 _uiState.update { current ->
-                    val merged = (listOf(newUser) + current.directorateUsers.filterNot {
-                        it.userId.equals(newUser.userId, true) || it.email.equals(newUser.email, true)
-                    })
                     current.copy(isLoading = false, directorateUsers = merged)
                 }
-                refreshAllData(silent = true)
+                offlineCacheRepo.saveUsersOnly(activeSession.userId, merged)
                 notifyMessage("New officer account provisioned.")
                 onSuccess()
             }.onFailure { err ->
@@ -2374,6 +2825,10 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
     fun saveSystemSettings(newSettings: SystemSettings) {
         val state = preferencesState.value
         val session = state.session ?: return
+        if (!session.role.isSuperAdmin) {
+            notifyMessage("Only Super Admins can modify Academic Configuration.", isError = true)
+            return
+        }
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
             remoteRepo.updateSettings(state.supabaseConfig, session.accessToken, newSettings)
@@ -2385,6 +2840,7 @@ class ComplianceViewModel(application: Application) : AndroidViewModel(applicati
                             selectedTerm = saved.activeTerm
                         )
                     }
+                    offlineCacheRepo.saveSettingsOnly(session.userId, saved)
                     notifyMessage("System academic settings saved.")
                 }
                 .onFailure { err ->

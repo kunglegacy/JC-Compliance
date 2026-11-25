@@ -133,6 +133,20 @@ object ComplianceTaxonomy {
         "Hostel / Kitchen"
     )
 
+    val academicDepartments = listOf(
+        "All Departments",
+        "Languages",
+        "Life Sciences",
+        "Physical Sciences",
+        "Social Sciences"
+    )
+
+    val noneClassroom = Classroom(
+        id = "NONE",
+        name = "None",
+        section = "All Tiers"
+    )
+
     val academicClassTiers = listOf(
         "All Tiers",
         "Nursery & KG",

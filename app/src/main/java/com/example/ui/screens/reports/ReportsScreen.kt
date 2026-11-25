@@ -81,6 +81,7 @@ import com.example.ui.components.SeverityBadge
 import com.example.ui.components.StatusGlassChip
 import com.example.ui.components.complianceGlassCard
 import com.example.ui.screens.dashboard.RecentReportCard
+import com.example.ui.theme.LocalBottomFooterClearance
 import com.example.ui.theme.LocalCompliancePalette
 import java.util.Calendar
 import java.util.Locale
@@ -314,7 +315,7 @@ fun ReportsScreen(
                         }
                     }
 
-                    // Term Selector Pills
+                    // 1. Term Selector Pills
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -330,24 +331,52 @@ fun ReportsScreen(
                         }
                     }
 
-                    // Divisions / Scope Pills
+                    // 2. Top-Level Division Pills (All Divisions, Academic, Operation, Discipline, CDS)
+                    val activeDivision = remember(selectedScope) { divisionKeyForScope(selectedScope) }
+                    val divisionSubScopes = remember(activeDivision) { subScopesForDivision(activeDivision) }
+
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        ReportScope.entries.forEach { scope ->
+                        REPORTS_DIVISION_OPTIONS.forEach { div ->
                             GlassFilterChip(
-                                label = scope.label,
-                                selected = selectedScope == scope,
+                                label = div.label,
+                                selected = activeDivision == div.key,
                                 activeColor = p.emerald,
-                                onClick = { selectedScope = scope }
+                                onClick = {
+                                    selectedScope = div.defaultScope
+                                }
                             )
                         }
                     }
 
-                    // Seen / Unseen + Swipe-Up Collapse Handle
+                    // 3. Dynamic Sub-Division Pills (shown only when Academic or Operation is selected)
+                    AnimatedVisibility(
+                        visible = divisionSubScopes.isNotEmpty(),
+                        enter = fadeIn() + expandVertically(animationSpec = spring(stiffness = Spring.StiffnessMediumLow)),
+                        exit = fadeOut() + shrinkVertically(animationSpec = spring(stiffness = Spring.StiffnessMediumLow))
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            divisionSubScopes.forEach { subScope ->
+                                GlassFilterChip(
+                                    label = subScope.label,
+                                    selected = selectedScope == subScope,
+                                    activeColor = p.tangerine,
+                                    onClick = { selectedScope = subScope }
+                                )
+                            }
+                        }
+                    }
+
+                    // 4. Seen / Unseen / Resolution Status + Swipe-Up Collapse Handle
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
@@ -446,7 +475,7 @@ fun ReportsScreen(
                         val summaryText = buildString {
                             append(if (selectedTerm == "ALL") "All Terms" else selectedTerm)
                             append(" • ")
-                            append(selectedScope.label)
+                            append(scopeBreadcrumbLabel(selectedScope))
                             if (seenFilter != "ALL") {
                                 val niceLabel = when (seenFilter) {
                                     "UNSEEN" -> "Unseen"
@@ -500,7 +529,7 @@ fun ReportsScreen(
             LazyColumn(
                 state = listState,
                 modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 112.dp),
+                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = LocalBottomFooterClearance.current),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 item(key = "download_reports_card") {
@@ -649,6 +678,81 @@ fun ReportsScreen(
             }
         }
     }
+}
+
+private data class ReportsDivisionOption(
+    val key: String,
+    val label: String,
+    val defaultScope: ReportScope
+)
+
+private val REPORTS_DIVISION_OPTIONS = listOf(
+    ReportsDivisionOption("ALL", "All Divisions", ReportScope.ALL),
+    ReportsDivisionOption("ACADEMIC", "Academic", ReportScope.ACADEMIC),
+    ReportsDivisionOption("OPERATIONS", "Operation", ReportScope.OPERATIONS),
+    ReportsDivisionOption("DISCIPLINE", "Discipline", ReportScope.DISCIPLINE),
+    ReportsDivisionOption("CDS", "CDS", ReportScope.CDS)
+)
+
+private val ACADEMIC_SUB_SCOPES = listOf(
+    ReportScope.ACADEMIC,
+    ReportScope.NURSERY,
+    ReportScope.JUNIOR_PRIMARY,
+    ReportScope.SENIOR_PRIMARY,
+    ReportScope.JUNIOR_SECONDARY,
+    ReportScope.SENIOR_SECONDARY,
+    ReportScope.MENTORSHIP
+)
+
+private val OPERATION_SUB_SCOPES = listOf(
+    ReportScope.OPERATIONS,
+    ReportScope.MAINTENANCE,
+    ReportScope.TRANSPORT,
+    ReportScope.MINDERS,
+    ReportScope.SECURITY,
+    ReportScope.HOSTEL_KITCHEN
+)
+
+private fun divisionKeyForScope(scope: ReportScope): String = when (scope) {
+    ReportScope.ALL -> "ALL"
+    ReportScope.ACADEMIC,
+    ReportScope.NURSERY,
+    ReportScope.JUNIOR_PRIMARY,
+    ReportScope.SENIOR_PRIMARY,
+    ReportScope.JUNIOR_SECONDARY,
+    ReportScope.SENIOR_SECONDARY,
+    ReportScope.MENTORSHIP -> "ACADEMIC"
+    ReportScope.OPERATIONS,
+    ReportScope.MAINTENANCE,
+    ReportScope.TRANSPORT,
+    ReportScope.MINDERS,
+    ReportScope.SECURITY,
+    ReportScope.HOSTEL_KITCHEN -> "OPERATIONS"
+    ReportScope.DISCIPLINE -> "DISCIPLINE"
+    ReportScope.CDS -> "CDS"
+}
+
+private fun subScopesForDivision(divisionKey: String): List<ReportScope> = when (divisionKey) {
+    "ACADEMIC" -> ACADEMIC_SUB_SCOPES
+    "OPERATIONS" -> OPERATION_SUB_SCOPES
+    else -> emptyList()
+}
+
+private fun scopeBreadcrumbLabel(scope: ReportScope): String = when (scope) {
+    ReportScope.NURSERY,
+    ReportScope.JUNIOR_PRIMARY,
+    ReportScope.SENIOR_PRIMARY,
+    ReportScope.JUNIOR_SECONDARY,
+    ReportScope.SENIOR_SECONDARY,
+    ReportScope.MENTORSHIP -> "Academic • ${scope.label}"
+    ReportScope.MAINTENANCE,
+    ReportScope.TRANSPORT,
+    ReportScope.MINDERS,
+    ReportScope.SECURITY,
+    ReportScope.HOSTEL_KITCHEN -> "Operation • ${scope.label}"
+    ReportScope.ACADEMIC -> "Academic"
+    ReportScope.OPERATIONS -> "Operation"
+    else -> scope.label
 }
 
 @Composable

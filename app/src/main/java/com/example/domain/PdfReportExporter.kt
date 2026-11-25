@@ -64,16 +64,10 @@ object PdfReportExporter {
         var document: PdfDocument? = null
         var crestBitmap: Bitmap? = null
         try {
-            val staffMap = AnalysisEngine.buildStaffLookup(staffRoster)
-            val filteredInput = if (dateLabel.isNotBlank() && startDate.isBlank() && endDate.isBlank()) {
-                reports
-            } else {
-                reports
-            }
             val prepared = ReportExportData.prepareDataset(
                 scope = scope,
                 format = "PDF",
-                records = filteredInput,
+                records = reports,
                 staffRoster = staffRoster,
                 startDate = startDate,
                 endDate = endDate,
@@ -318,61 +312,286 @@ object PdfReportExporter {
                 currentY = drawTableHeader(canvas, currentY)
 
                 var rowsWritten = 0
-                prepared.rows.forEachIndexed { index, row ->
-                    val values = listOf(
-                        row.date,
-                        if (isTransport) row.driverName else row.name,
-                        if (isTransport) row.busNumber else row.className,
-                        if (isTransport) row.complianceCheck else row.subject,
-                        row.exception,
-                        row.effect
+                val maxBodyBottom = PAGE_HEIGHT - 34f
+
+                fun startNewPdfPage() {
+                    drawFooter(canvas, pageNum)
+                    document.finishPage(page)
+                    finishedPagesInfo.add(pageNum)
+                    pageNum++
+                    pageInfo = PdfDocument.PageInfo.Builder(PAGE_WIDTH, PAGE_HEIGHT, pageNum).create()
+                    page = document.startPage(pageInfo)
+                    canvas = page.canvas
+                    currentY = drawContinuedPageHeader(canvas)
+                }
+
+                fun buildStaticLayout(
+                    text: String,
+                    paint: TextPaint,
+                    widthPx: Int,
+                    alignment: Layout.Alignment
+                ): StaticLayout {
+                    return StaticLayout.Builder.obtain(
+                        text,
+                        0,
+                        text.length,
+                        paint,
+                        widthPx.coerceAtLeast(24)
                     )
+                        .setAlignment(alignment)
+                        .setLineSpacing(1.5f, 1.05f)
+                        .build()
+                }
 
-                    val layouts = values.mapIndexed { idx, text ->
-                        val paint = if (idx == 1) nameCellPaint else cellPaint
-                        val alignment = if (idx == 0 || idx == 2) Layout.Alignment.ALIGN_CENTER else Layout.Alignment.ALIGN_NORMAL
-                        StaticLayout.Builder.obtain(
-                            text,
-                            0,
-                            text.length,
-                            paint,
-                            (colWidths[idx] - 10f).toInt().coerceAtLeast(24)
+                prepared.rows.forEachIndexed { index, row ->
+                    if (!isTransport && row.isGroup && row.subRows.isNotEmpty()) {
+                        val dateLayout = buildStaticLayout(
+                            row.date,
+                            cellPaint,
+                            (colWidths[0] - 10f).toInt(),
+                            Layout.Alignment.ALIGN_CENTER
                         )
-                            .setAlignment(alignment)
-                            .setLineSpacing(1.5f, 1.05f)
-                            .build()
-                    }
-                    val rowHeight = (layouts.maxOf { it.height } + 12f).coerceAtLeast(22f)
+                        val exLayout = buildStaticLayout(
+                            row.exception,
+                            cellPaint,
+                            (colWidths[4] - 10f).toInt(),
+                            Layout.Alignment.ALIGN_NORMAL
+                        )
+                        val effLayout = buildStaticLayout(
+                            row.effect,
+                            cellPaint,
+                            (colWidths[5] - 10f).toInt(),
+                            Layout.Alignment.ALIGN_NORMAL
+                        )
 
-                    if (currentY + rowHeight > PAGE_HEIGHT - 34f) {
-                        drawFooter(canvas, pageNum)
-                        document.finishPage(page)
-                        finishedPagesInfo.add(pageNum)
-                        pageNum++
-                        pageInfo = PdfDocument.PageInfo.Builder(PAGE_WIDTH, PAGE_HEIGHT, pageNum).create()
-                        page = document.startPage(pageInfo)
-                        canvas = page.canvas
-                        currentY = drawContinuedPageHeader(canvas)
-                    }
-
-                    if (index % 2 == 1) {
-                        canvas.drawRect(MARGIN, currentY, MARGIN + tableWidth, currentY + rowHeight, stripePaint)
-                    }
-                    canvas.drawRect(MARGIN, currentY, MARGIN + tableWidth, currentY + rowHeight, borderPaint)
-
-                    var x = MARGIN
-                    layouts.forEachIndexed { idx, layout ->
-                        canvas.save()
-                        canvas.translate(x + 5f, currentY + 6f)
-                        layout.draw(canvas)
-                        canvas.restore()
-                        x += colWidths[idx]
-                        if (idx < layouts.lastIndex) {
-                            canvas.drawLine(x, currentY, x, currentY + rowHeight, borderPaint)
+                        val subLayouts = row.subRows.map { sub ->
+                            Triple(
+                                buildStaticLayout(
+                                    sub.name,
+                                    nameCellPaint,
+                                    (colWidths[1] - 10f).toInt(),
+                                    Layout.Alignment.ALIGN_NORMAL
+                                ),
+                                buildStaticLayout(
+                                    sub.className,
+                                    cellPaint,
+                                    (colWidths[2] - 10f).toInt(),
+                                    Layout.Alignment.ALIGN_CENTER
+                                ),
+                                buildStaticLayout(
+                                    sub.subject,
+                                    cellPaint,
+                                    (colWidths[3] - 10f).toInt(),
+                                    Layout.Alignment.ALIGN_NORMAL
+                                )
+                            )
                         }
+
+                        val subHeights = subLayouts.map { (nL, cL, sL) ->
+                            (maxOf(nL.height, cL.height, sL.height) + 12f).coerceAtLeast(22f)
+                        }.toMutableList()
+
+                        val minSpannedHeight = (maxOf(dateLayout.height, exLayout.height, effLayout.height) + 12f)
+                            .coerceAtLeast(22f)
+                        val rawTotalHeight = subHeights.sum()
+                        if (rawTotalHeight < minSpannedHeight) {
+                            val extraEach = (minSpannedHeight - rawTotalHeight) / subHeights.size
+                            for (i in subHeights.indices) {
+                                subHeights[i] += extraEach
+                            }
+                        }
+                        val totalGroupHeight = subHeights.sum()
+                        val fullFreshPageCapacity = maxBodyBottom - 59f
+
+                        if (totalGroupHeight <= fullFreshPageCapacity) {
+                            if (currentY + totalGroupHeight > maxBodyBottom) {
+                                startNewPdfPage()
+                            }
+
+                            val blockTop = currentY
+                            if (index % 2 == 1) {
+                                canvas.drawRect(
+                                    MARGIN,
+                                    blockTop,
+                                    MARGIN + tableWidth,
+                                    blockTop + totalGroupHeight,
+                                    stripePaint
+                                )
+                            }
+                            canvas.drawRect(
+                                MARGIN,
+                                blockTop,
+                                MARGIN + tableWidth,
+                                blockTop + totalGroupHeight,
+                                borderPaint
+                            )
+
+                            // Full-height vertical column borders
+                            var vx = MARGIN
+                            for (colIdx in 0 until colWidths.lastIndex) {
+                                vx += colWidths[colIdx]
+                                canvas.drawLine(vx, blockTop, vx, blockTop + totalGroupHeight, borderPaint)
+                            }
+
+                            // Horizontal sub-dividers ONLY across Name (col 1), Class (col 2), Subject (col 3)
+                            val col1X = MARGIN + colWidths[0]
+                            val col2X = col1X + colWidths[1]
+                            val col3X = col2X + colWidths[2]
+                            val col4X = col3X + colWidths[3]
+                            val col5X = col4X + colWidths[4]
+                            var divY = blockTop
+                            for (subIdx in 0 until subHeights.lastIndex) {
+                                divY += subHeights[subIdx]
+                                canvas.drawLine(col1X, divY, col4X, divY, borderPaint)
+                            }
+
+                            // Col 0 (Date - vertically centered in spanned cell)
+                            val dateTopOffset = ((totalGroupHeight - dateLayout.height) / 2f).coerceAtLeast(6f)
+                            canvas.save()
+                            canvas.translate(MARGIN + 5f, blockTop + dateTopOffset)
+                            dateLayout.draw(canvas)
+                            canvas.restore()
+
+                            // Col 4 (Exceptions) & Col 5 (Effects) - top-aligned in spanned cell
+                            canvas.save()
+                            canvas.translate(col4X + 5f, blockTop + 6f)
+                            exLayout.draw(canvas)
+                            canvas.restore()
+
+                            canvas.save()
+                            canvas.translate(col5X + 5f, blockTop + 6f)
+                            effLayout.draw(canvas)
+                            canvas.restore()
+
+                            // Sub-rows Col 1 (Name), Col 2 (Class), Col 3 (Subject)
+                            var subY = blockTop
+                            subLayouts.forEachIndexed { subIdx, (nLayout, cLayout, sLayout) ->
+                                canvas.save()
+                                canvas.translate(col1X + 5f, subY + 6f)
+                                nLayout.draw(canvas)
+                                canvas.restore()
+
+                                canvas.save()
+                                canvas.translate(col2X + 5f, subY + 6f)
+                                cLayout.draw(canvas)
+                                canvas.restore()
+
+                                canvas.save()
+                                canvas.translate(col3X + 5f, subY + 6f)
+                                sLayout.draw(canvas)
+                                canvas.restore()
+
+                                subY += subHeights[subIdx]
+                            }
+
+                            currentY += totalGroupHeight
+                        } else {
+                            // Oversized group safety fallback: split across pages by sub-row slice
+                            var startIdx = 0
+                            while (startIdx < subLayouts.size) {
+                                if (currentY + subHeights[startIdx] > maxBodyBottom) {
+                                    startNewPdfPage()
+                                }
+                                val avail = maxBodyBottom - currentY
+                                var endIdx = startIdx
+                                var sliceHeight = 0f
+                                while (endIdx < subLayouts.size &&
+                                    (endIdx == startIdx || sliceHeight + subHeights[endIdx] <= avail)
+                                ) {
+                                    sliceHeight += subHeights[endIdx]
+                                    endIdx++
+                                }
+
+                                val blockTop = currentY
+                                if (index % 2 == 1) {
+                                    canvas.drawRect(MARGIN, blockTop, MARGIN + tableWidth, blockTop + sliceHeight, stripePaint)
+                                }
+                                canvas.drawRect(MARGIN, blockTop, MARGIN + tableWidth, blockTop + sliceHeight, borderPaint)
+
+                                var vx = MARGIN
+                                for (colIdx in 0 until colWidths.lastIndex) {
+                                    vx += colWidths[colIdx]
+                                    canvas.drawLine(vx, blockTop, vx, blockTop + sliceHeight, borderPaint)
+                                }
+
+                                val col1X = MARGIN + colWidths[0]
+                                val col2X = col1X + colWidths[1]
+                                val col3X = col2X + colWidths[2]
+                                val col4X = col3X + colWidths[3]
+                                val col5X = col4X + colWidths[4]
+
+                                var divY = blockTop
+                                for (subIdx in startIdx until endIdx - 1) {
+                                    divY += subHeights[subIdx]
+                                    canvas.drawLine(col1X, divY, col4X, divY, borderPaint)
+                                }
+
+                                if (startIdx == 0) {
+                                    val dateTopOffset = ((sliceHeight - dateLayout.height) / 2f).coerceAtLeast(6f)
+                                    canvas.save(); canvas.translate(MARGIN + 5f, blockTop + dateTopOffset); dateLayout.draw(canvas); canvas.restore()
+                                    if (exLayout.height + 12f <= sliceHeight) {
+                                        canvas.save(); canvas.translate(col4X + 5f, blockTop + 6f); exLayout.draw(canvas); canvas.restore()
+                                    }
+                                    if (effLayout.height + 12f <= sliceHeight) {
+                                        canvas.save(); canvas.translate(col5X + 5f, blockTop + 6f); effLayout.draw(canvas); canvas.restore()
+                                    }
+                                }
+
+                                var subY = blockTop
+                                for (subIdx in startIdx until endIdx) {
+                                    val (nLayout, cLayout, sLayout) = subLayouts[subIdx]
+                                    canvas.save(); canvas.translate(col1X + 5f, subY + 6f); nLayout.draw(canvas); canvas.restore()
+                                    canvas.save(); canvas.translate(col2X + 5f, subY + 6f); cLayout.draw(canvas); canvas.restore()
+                                    canvas.save(); canvas.translate(col3X + 5f, subY + 6f); sLayout.draw(canvas); canvas.restore()
+                                    subY += subHeights[subIdx]
+                                }
+
+                                currentY += sliceHeight
+                                startIdx = endIdx
+                            }
+                        }
+
+                        rowsWritten++
+                    } else {
+                        val values = listOf(
+                            row.date,
+                            if (isTransport) row.driverName else row.name,
+                            if (isTransport) row.busNumber else row.className,
+                            if (isTransport) row.complianceCheck else row.subject,
+                            row.exception,
+                            row.effect
+                        )
+
+                        val layouts = values.mapIndexed { idx, text ->
+                            val paint = if (idx == 1) nameCellPaint else cellPaint
+                            val alignment = if (idx == 0 || idx == 2) Layout.Alignment.ALIGN_CENTER else Layout.Alignment.ALIGN_NORMAL
+                            buildStaticLayout(text, paint, (colWidths[idx] - 10f).toInt(), alignment)
+                        }
+                        val rowHeight = (layouts.maxOf { it.height } + 12f).coerceAtLeast(22f)
+
+                        if (currentY + rowHeight > maxBodyBottom) {
+                            startNewPdfPage()
+                        }
+
+                        if (index % 2 == 1) {
+                            canvas.drawRect(MARGIN, currentY, MARGIN + tableWidth, currentY + rowHeight, stripePaint)
+                        }
+                        canvas.drawRect(MARGIN, currentY, MARGIN + tableWidth, currentY + rowHeight, borderPaint)
+
+                        var x = MARGIN
+                        layouts.forEachIndexed { idx, layout ->
+                            canvas.save()
+                            canvas.translate(x + 5f, currentY + 6f)
+                            layout.draw(canvas)
+                            canvas.restore()
+                            x += colWidths[idx]
+                            if (idx < layouts.lastIndex) {
+                                canvas.drawLine(x, currentY, x, currentY + rowHeight, borderPaint)
+                            }
+                        }
+                        currentY += rowHeight
+                        rowsWritten++
                     }
-                    currentY += rowHeight
-                    rowsWritten++
                 }
 
                 if (rowsWritten != prepared.records.size) {

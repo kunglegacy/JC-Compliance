@@ -50,7 +50,9 @@ object OfflineAutoSubmitEngine {
             prefs.saveSession(it)
         } ?: initialSession
 
-        val settings = runCatching {
+        val cacheRepo = com.example.data.local.OfflineCacheRepository(appContext)
+        val cachedPayload = cacheRepo.loadWorkspaceCache(activeSession.userId)
+        val settings = cachedPayload?.systemSettings ?: runCatching {
             remoteRepo.fetchSettings(config, activeSession.accessToken)
         }.getOrDefault(com.example.data.model.SystemSettings())
         val activeWeek = AcademicWeekEngine.calculateAcademicWeek(settings).weekNumber
@@ -162,15 +164,30 @@ object OfflineAutoSubmitEngine {
                 else -> "${finalUrls.size} attached items"
             }
 
-            val resolvedStaffId = form.staffId?.takeIf { division != ComplianceDivision.CDS && isUuid(it) }
+            val isGroupSubmission = division == ComplianceDivision.ACADEMIC &&
+                form.isGroupReport &&
+                form.groupMembers.isNotEmpty()
+            val normalizedGroupMembers = if (isGroupSubmission) {
+                GroupReportHelpers.normalizeMembers(
+                    members = form.groupMembers,
+                    staffRoster = cachedPayload?.staffList.orEmpty(),
+                    classes = cachedPayload?.classes.orEmpty(),
+                    subjects = cachedPayload?.subjects.orEmpty()
+                )
+            } else {
+                emptyList()
+            }
+
+            val resolvedStaffId = if (isGroupSubmission) null else form.staffId?.takeIf { division != ComplianceDivision.CDS && isUuid(it) }
             val effectiveTargetType = when {
+                isGroupSubmission -> "division"
                 division == ComplianceDivision.CDS -> "division"
                 division == ComplianceDivision.OPERATIONS && resolvedStaffId == null -> "division"
                 division == ComplianceDivision.DISCIPLINE && (form.targetType == "division" || resolvedStaffId == null) -> "division"
                 else -> "staff"
             }
-            val resolvedClassId = form.classId?.takeIf { isUuid(it) }
-            val resolvedSubjectId = form.subjectId?.takeIf { isUuid(it) }
+            val resolvedClassId = if (isGroupSubmission || form.classId.equals("NONE", true)) null else form.classId?.takeIf { isUuid(it) }
+            val resolvedSubjectId = if (isGroupSubmission) null else form.subjectId?.takeIf { isUuid(it) }
             val resolvedCheckId = form.checkId?.trim()?.takeIf { it.isNotBlank() && !it.equals("CUSTOM", ignoreCase = true) }
 
             val specificText = when {
@@ -181,6 +198,7 @@ object OfflineAutoSubmitEngine {
             }.trim()
 
             val staffNameVal = when {
+                isGroupSubmission -> normalizedGroupMembers.joinToString(", ") { it.staffName }
                 !form.staffName.isNullOrBlank() && division != ComplianceDivision.CDS -> form.staffName
                 division == ComplianceDivision.OPERATIONS && specificText.isNotBlank() -> specificText
                 division == ComplianceDivision.OPERATIONS -> form.operationScope.ifBlank { "Operation" }
@@ -236,6 +254,9 @@ object OfflineAutoSubmitEngine {
                 put("review_status", "UNSEEN")
                 put("is_seen", false)
                 put("is_edited", false)
+                if (isGroupSubmission) {
+                    GroupReportHelpers.applyGroupFieldsToPayload(this, normalizedGroupMembers)
+                }
             }
 
             val createRes = remoteRepo.createReport(config, activeSession, payload)
@@ -260,6 +281,17 @@ object OfflineAutoSubmitEngine {
             } else {
                 failures++
             }
+        }
+
+        if (submitted.isNotEmpty()) {
+            val existingReports = cachedPayload?.reports.orEmpty()
+            val submittedIds = submitted.map { it.id }.toSet()
+            val merged = submitted + existingReports.filterNot { it.id in submittedIds }
+            cacheRepo.saveReportsOnly(
+                userId = activeSession.userId,
+                reports = merged,
+                syncedAtMs = System.currentTimeMillis()
+            )
         }
 
         if (submitted.size == 1 && firstSubmittedDraftId != null) {

@@ -62,7 +62,7 @@ fun AdminScreen(
     onSelectReport: (ComplianceReport) -> Unit,
     onUpdateUserRole: (DirectorateUser, UserRole) -> Unit,
     onToggleUserStatus: (DirectorateUser) -> Unit,
-    onUpdateUserEmail: (DirectorateUser, String) -> Unit,
+    onUpdateUserName: (DirectorateUser, String) -> Unit,
     onForceResetUserPassword: (DirectorateUser) -> Unit,
     onProvisionUser: (String, String, String, String, UserRole, () -> Unit) -> Unit,
     onSaveSystemSettings: (SystemSettings) -> Unit,
@@ -73,6 +73,7 @@ fun AdminScreen(
     when (subScreen) {
         "officer_stats" -> OfficerAnalyticsScreen(
             reports = reports,
+            onSelectReport = onSelectReport,
             onBack = { onNavigateSubScreen("hub") }
         )
 
@@ -92,7 +93,7 @@ fun AdminScreen(
             currentUserRole = userRole,
             onUpdateRole = onUpdateUserRole,
             onToggleStatus = onToggleUserStatus,
-            onUpdateEmail = onUpdateUserEmail,
+            onUpdateName = onUpdateUserName,
             onForceResetPassword = onForceResetUserPassword,
             onProvisionUser = onProvisionUser,
             onResolveSignedUrl = onResolveSignedUrl,
@@ -100,7 +101,7 @@ fun AdminScreen(
             onBack = { onNavigateSubScreen("hub") }
         )
 
-        "system_config" -> SystemConfigScreen(
+        "system_config" if userRole.isSuperAdmin -> SystemConfigScreen(
             settings = settings,
             userRole = userRole,
             isLoading = isLoading,
@@ -112,8 +113,11 @@ fun AdminScreen(
         else -> {
             BackHandler { onBackToAccount() }
             val ext = ComplianceTheme.extended
-            val activeAcademicCount = staffList.count { it.isActive && it.department.contains("academ", true) }
-            val totalStaffRatio = if (staffList.isNotEmpty()) activeAcademicCount.toFloat() / staffList.size else 0.7f
+            val academicStaff = staffList.filter {
+                !it.department.contains("oper", true) && !it.category.equals("Non-Academic", true)
+            }
+            val activeAcademicCount = academicStaff.count { it.isActive }
+            val totalStaffRatio = if (academicStaff.isNotEmpty()) activeAcademicCount.toFloat() / academicStaff.size else 0.7f
 
             AtmosphericGlassBackground {
                 Column(
@@ -175,7 +179,7 @@ fun AdminScreen(
                             AdminHubRow(
                                 icon = Icons.Default.Badge,
                                 title = "Staff Register",
-                                subtitle = "Manage Academic & Operational staff, codes, and dossiers",
+                                subtitle = "Manage Academic staff, codes, roles, and dossiers",
                                 tint = MaterialTheme.colorScheme.primary,
                                 onClick = { onNavigateSubScreen("staff_register") },
                                 testTag = "admin_staff_register_card"
@@ -193,15 +197,17 @@ fun AdminScreen(
                             )
                         }
 
-                        item {
-                            AdminHubRow(
-                                icon = Icons.Default.CalendarMonth,
-                                title = "Academic Configuration",
-                                subtitle = "${settings.activeTerm} • ${settings.academicSession} • Week Anchor",
-                                tint = ext.amber,
-                                onClick = { onNavigateSubScreen("system_config") },
-                                testTag = "admin_system_config_card"
-                            )
+                        if (userRole.isSuperAdmin) {
+                            item {
+                                AdminHubRow(
+                                    icon = Icons.Default.CalendarMonth,
+                                    title = "Academic Configuration",
+                                    subtitle = "${settings.activeTerm} • ${settings.academicSession} • Week Anchor",
+                                    tint = ext.amber,
+                                    onClick = { onNavigateSubScreen("system_config") },
+                                    testTag = "admin_system_config_card"
+                                )
+                            }
                         }
                     }
                 }

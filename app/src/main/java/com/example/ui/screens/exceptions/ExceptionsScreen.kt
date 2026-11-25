@@ -116,6 +116,7 @@ import com.example.ui.components.complianceGlassCard
 import com.example.ui.screens.dashboard.RecentReportCard
 import com.example.ui.screens.reports.EvidencePreviewItem
 import com.example.ui.screens.reports.EvidencePreviewerScaffold
+import com.example.ui.theme.LocalBottomFooterClearance
 import com.example.ui.theme.LocalCompliancePalette
 import java.io.File
 import java.text.SimpleDateFormat
@@ -550,7 +551,7 @@ fun ExceptionsScreen(
                 val hasQueuedDrafts = drafts.any { it.isQueuedForSubmit }
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 112.dp),
+                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = LocalBottomFooterClearance.current),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     if (hasQueuedDrafts && bgRestrictionStatus.hasAnyRestriction) {
@@ -1252,7 +1253,7 @@ fun ExceptionsScreen(
                     LazyColumn(
                         state = submittedListState,
                         modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 112.dp),
+                        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 6.dp, bottom = LocalBottomFooterClearance.current),
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
                         if (mySubmitted.isEmpty()) {
